@@ -1,0 +1,9 @@
+*.iml
+.gradle/
+**/build/
+**/.cxx/
+local.properties
+llama.cpp/
+.kotlin/
+out/
+*.keystore
