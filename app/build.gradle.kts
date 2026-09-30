@@ -5,6 +5,7 @@ plugins {
 android {
     namespace = "com.pocketai.app"
     compileSdk = 36
+    ndkVersion = "29.0.13113456"
     defaultConfig {
         applicationId = "com.pocketai.app"
         minSdk = 33

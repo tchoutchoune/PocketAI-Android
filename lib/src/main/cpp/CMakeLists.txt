@@ -8,9 +8,6 @@ set(CMAKE_C_STANDARD_REQUIRED true)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED true)
 
-set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}"   CACHE STRING "" FORCE)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}" CACHE STRING "" FORCE)
-
 # --------------------------------------------------------------------------
 # AI Chat library
 # --------------------------------------------------------------------------
@@ -41,7 +38,20 @@ if(GGML_VULKAN)
         message(FATAL_ERROR "Vulkan needs host glslc and Vulkan-Headers in -PvulkanToolsDir (or set -PenableVulkan=false)")
     endif()
     set(Vulkan_GLSLC_EXECUTABLE "${VULKAN_TOOLS_DIR}/bin/glslc" CACHE FILEPATH "Host glslc" FORCE)
-    set(Vulkan_INCLUDE_DIR "${VULKAN_TOOLS_DIR}/include" CACHE PATH "Vulkan headers" FORCE)
+    # /usr/include is a host implicit include path: CMake can omit it from the
+    # Android compiler command. Stage only Vulkan's portable API headers so the
+    # cross compiler gets Vulkan-Hpp without importing the host C library.
+    set(VULKAN_HEADER_STAGE "${CMAKE_CURRENT_BINARY_DIR}/vulkan-headers")
+    file(MAKE_DIRECTORY "${VULKAN_HEADER_STAGE}")
+    if(NOT EXISTS "${VULKAN_TOOLS_DIR}/include/spirv/unified1/spirv.hpp")
+        message(FATAL_ERROR "Vulkan requires portable SPIRV-Headers in -PvulkanToolsDir")
+    endif()
+    file(COPY "${VULKAN_TOOLS_DIR}/include/vulkan" "${VULKAN_TOOLS_DIR}/include/spirv"
+         DESTINATION "${VULKAN_HEADER_STAGE}")
+    if(EXISTS "${VULKAN_TOOLS_DIR}/include/vk_video")
+        file(COPY "${VULKAN_TOOLS_DIR}/include/vk_video" DESTINATION "${VULKAN_HEADER_STAGE}")
+    endif()
+    set(Vulkan_INCLUDE_DIR "${VULKAN_HEADER_STAGE}" CACHE PATH "Vulkan headers" FORCE)
     list(PREPEND CMAKE_PREFIX_PATH "${VULKAN_TOOLS_DIR}")
     set(SPIRV-Headers_DIR "${VULKAN_TOOLS_DIR}/share/cmake/SPIRV-Headers" CACHE PATH "SPIRV header package")
 endif()
