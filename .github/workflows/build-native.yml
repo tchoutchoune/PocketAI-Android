@@ -1,1 +1,103 @@
+name: Build PocketAI 3 Native
 
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-native.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout wrapper repository
+        uses: actions/checkout@v6
+
+      - name: Checkout llama.cpp
+        uses: actions/checkout@v6
+        with:
+          repository: ggml-org/llama.cpp
+          ref: db00347a4b33393bf53986e976fe8505bbf92665
+          path: llama.cpp
+          fetch-depth: 1
+          lfs: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          log-accepted-android-sdk-licenses: false
+
+      - name: Install SDK, NDK and CMake
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            'platforms;android-36' \
+            'build-tools;36.0.0' \
+            'ndk;29.0.13113456' \
+            'cmake;3.31.6'
+
+      - name: Patch PocketAI identity and ARM64 target
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path('llama.cpp/examples/llama.android')
+
+          p = root / 'app/build.gradle.kts'
+          s = p.read_text()
+          s = s.replace('applicationId = "com.example.llama.aichat"', 'applicationId = "com.pocketai.native"')
+          s = s.replace('versionCode = 1', 'versionCode = 300')
+          s = s.replace('versionName = "1.0"', 'versionName = "3.0-native"')
+          p.write_text(s)
+
+          p = root / 'lib/build.gradle.kts'
+          s = p.read_text()
+          s = s.replace('abiFilters += listOf("arm64-v8a", "x86_64")', 'abiFilters += listOf("arm64-v8a")')
+          p.write_text(s)
+
+          p = root / 'app/src/main/res/values/strings.xml'
+          s = p.read_text().replace('AI Chat basic sample', 'PocketAI Native')
+          p.write_text(s)
+          PY
+
+      - name: Build native ARM64 APK
+        working-directory: llama.cpp/examples/llama.android
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456
+          GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx6g
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Verify and collect APK
+        shell: bash
+        run: |
+          set -euxo pipefail
+          APK=$(find llama.cpp/examples/llama.android/app/build/outputs/apk/debug -type f -name '*.apk' | head -1)
+          test -s "$APK"
+          mkdir -p out
+          cp "$APK" out/PocketAI-3.0-Native-arm64-debug.apk
+          sha256sum out/PocketAI-3.0-Native-arm64-debug.apk | tee out/SHA256.txt
+          unzip -l out/PocketAI-3.0-Native-arm64-debug.apk | grep 'lib/arm64-v8a/.*\.so' | tee out/NATIVE-LIBS.txt
+
+      - name: Upload PocketAI APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-3.0-Native-arm64-debug
+          path: out/*
+          retention-days: 14
+          if-no-files-found: error
+          
