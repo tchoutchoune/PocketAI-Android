@@ -1,9 +1,15 @@
-name: Build PocketAI 3 Native
+name: Build PocketAI 4
 
 on:
   workflow_dispatch:
   push:
     paths:
+      - 'app/**'
+      - 'lib/**'
+      - 'gradle/**'
+      - '*.gradle.kts'
+      - 'gradle.properties'
+      - 'scripts/**'
       - '.github/workflows/build-native.yml'
 
 permissions:
@@ -12,13 +18,18 @@ permissions:
 jobs:
   android:
     runs-on: ubuntu-24.04
+    container: debian:trixie
     timeout-minutes: 90
-
+    env:
+      DEBIAN_FRONTEND: noninteractive
     steps:
-      - name: Checkout wrapper repository
+      - name: Install verified build prerequisites
+        run: |
+          apt-get update
+          apt-get install -y ca-certificates curl git unzip python3 gcc g++ make glslc libshaderc1 libvulkan-dev spirv-headers
+      - name: Checkout PocketAI
         uses: actions/checkout@v6
-
-      - name: Checkout llama.cpp
+      - name: Checkout pinned llama.cpp
         uses: actions/checkout@v6
         with:
           repository: ggml-org/llama.cpp
@@ -26,78 +37,43 @@ jobs:
           path: llama.cpp
           fetch-depth: 1
           lfs: false
-
       - name: Set up JDK 17
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
-
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
         with:
           log-accepted-android-sdk-licenses: false
-
-      - name: Install SDK, NDK and CMake
+      - name: Install pinned Android packages
         shell: bash
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager \
-            'platforms;android-36' \
-            'build-tools;36.0.0' \
-            'ndk;29.0.13113456' \
-            'cmake;3.31.6'
-
-      - name: Patch PocketAI identity and ARM64 target
+          set -e
+          set +o pipefail
+          yes | sdkmanager --licenses >/dev/null
+          set -o pipefail
+          sdkmanager 'platforms;android-36' 'build-tools;35.0.0' 'build-tools;36.0.0' 'ndk;29.0.13113456' 'cmake;3.31.6'
+      - name: Build and test ARM64 CPU + Vulkan
         shell: bash
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          root = Path('llama.cpp/examples/llama.android')
-
-          p = root / 'app/build.gradle.kts'
-          s = p.read_text()
-          s = s.replace('applicationId = "com.example.llama.aichat"', 'applicationId = "com.pocketai.native"')
-          s = s.replace('versionCode = 1', 'versionCode = 300')
-          s = s.replace('versionName = "1.0"', 'versionName = "3.0-native"')
-          p.write_text(s)
-
-          p = root / 'lib/build.gradle.kts'
-          s = p.read_text()
-          s = s.replace('abiFilters += listOf("arm64-v8a", "x86_64")', 'abiFilters += listOf("arm64-v8a")')
-          p.write_text(s)
-
-          p = root / 'app/src/main/res/values/strings.xml'
-          s = p.read_text().replace('AI Chat basic sample', 'PocketAI Native')
-          p.write_text(s)
-          PY
-
-      - name: Build native ARM64 APK
-        working-directory: llama.cpp/examples/llama.android
         env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456
-          GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx6g
-        run: |
-          chmod +x gradlew
-          ./gradlew :app:assembleDebug --no-daemon --stacktrace
-
-      - name: Verify and collect APK
-        shell: bash
-        run: |
-          set -euxo pipefail
-          APK=$(find llama.cpp/examples/llama.android/app/build/outputs/apk/debug -type f -name '*.apk' | head -1)
-          test -s "$APK"
-          mkdir -p out
-          cp "$APK" out/PocketAI-3.0-Native-arm64-debug.apk
-          sha256sum out/PocketAI-3.0-Native-arm64-debug.apk | tee out/SHA256.txt
-          unzip -l out/PocketAI-3.0-Native-arm64-debug.apk | grep 'lib/arm64-v8a/.*\.so' | tee out/NATIVE-LIBS.txt
-
-      - name: Upload PocketAI APK
+          POCKETAI_LLAMA_DIR: ${{ github.workspace }}/llama.cpp
+          POCKETAI_VULKAN_DIR: /usr
+          CMAKE_BUILD_PARALLEL_LEVEL: '4'
+        run: bash scripts/build.sh
+      - name: Upload APK and verification evidence
         uses: actions/upload-artifact@v6
         with:
-          name: PocketAI-3.0-Native-arm64-debug
+          name: PocketAI-4.0-arm64-debug
           path: out/*
           retention-days: 14
           if-no-files-found: error
-          
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-4-test-results
+          path: |
+            app/build/reports/tests/
+            lib/build/reports/tests/
+          retention-days: 14
