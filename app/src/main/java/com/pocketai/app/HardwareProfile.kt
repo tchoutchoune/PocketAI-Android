@@ -60,7 +60,9 @@ data class HardwareProfile(
             eco -> minOf(2, cpuCores)
             cpuPerformance -> minOf(6, cpuCores)
             vulkanExperimental -> minOf(4, cpuCores)
-            powerSave -> minOf(2, cpuCores)
+            // Android battery saver should reduce load without making a 4B model
+            // practically unusable. The explicit Autonomy profile remains 2 threads.
+            powerSave -> minOf(3, cpuCores)
             warm -> minOf(3, cpuCores)
             else -> minOf(4, cpuCores)
         }.coerceAtLeast(1)
@@ -80,7 +82,7 @@ data class HardwareProfile(
             batchSize = when {
                 context <= 1024 || eco -> 64
                 cpuPerformance || vulkanExperimental -> 256
-                powerSave -> 64
+                powerSave -> 128
                 else -> 128
             },
             gpuLayers = gpuLayers,
