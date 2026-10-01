@@ -39,38 +39,47 @@ data class HardwareProfile(
         val hot = thermalStatus >= PowerManager.THERMAL_STATUS_SEVERE
         val warm = thermalStatus >= PowerManager.THERMAL_STATUS_MODERATE
         val eco = normalizedMode == "eco" || hot
-        val performant = normalizedMode == "performance"
+        val cpuPerformance = normalizedMode == "cpu-performance"
+        val vulkanExperimental = normalizedMode == "performance" || normalizedMode == "vulkan"
         val available = availableRamBytes.coerceAtLeast(0)
         val hugeModel = modelBytes > totalRamBytes * 55 / 100
+
         val context = when {
             eco || hugeModel || available < 768 * MIB -> 1024
-            performant && totalRamBytes >= 10 * GIB && available >= 2 * GIB -> 8192
+            vulkanExperimental && totalRamBytes >= 10 * GIB && available >= 2 * GIB -> 8192
             totalRamBytes >= 8 * GIB && available >= 1536 * MIB -> 4096
             totalRamBytes >= 6 * GIB && available >= 1024 * MIB -> 2048
             else -> 1024
         }
+
+        // Do not equate "performance cores" with the only useful llama.cpp workers.
+        // On modern ARM SoCs the additional cores materially accelerate prompt
+        // prefill. Explicit CPU Performance is allowed to override battery saver;
+        // the thermal listener still reduces concurrency if the device heats up.
         val threads = when {
             eco -> minOf(2, cpuCores)
-            powerSave && !performant -> minOf(2, cpuCores)
-            warm -> minOf(3, bigCores.coerceAtLeast(1))
-            performant -> minOf(8, bigCores.coerceAtLeast(1))
-            else -> minOf(4, bigCores.coerceAtLeast(1))
+            cpuPerformance -> minOf(6, cpuCores)
+            vulkanExperimental -> minOf(4, cpuCores)
+            powerSave -> minOf(2, cpuCores)
+            warm -> minOf(3, cpuCores)
+            else -> minOf(4, cpuCores)
         }.coerceAtLeast(1)
+
         val gpuLayers = when {
-            // Vulkan on some Android/Adreno stacks can return valid-looking but
-            // corrupted logits. Keep the default profiles CPU-safe; GPU offload
-            // is opt-in through the explicit Performance profile.
-            !performant || eco || hot || vulkanVersion == null -> 0
+            // Vulkan remains explicit/experimental because Adreno 840 has produced
+            // corrupted logits in real-device testing. CPU modes never offload.
+            !vulkanExperimental || eco || hot || vulkanVersion == null -> 0
             available < 1024 * MIB || totalRamBytes < 6 * GIB -> 0
             totalRamBytes >= 10 * GIB -> 16
             else -> 8
         }
+
         return InferenceOptions(
             threads = threads,
             contextSize = context,
             batchSize = when {
                 context <= 1024 || eco -> 64
-                performant -> 256
+                cpuPerformance || vulkanExperimental -> 256
                 powerSave -> 64
                 else -> 128
             },
