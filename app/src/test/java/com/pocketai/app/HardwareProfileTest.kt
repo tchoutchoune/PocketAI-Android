@@ -19,10 +19,16 @@ class HardwareProfileTest {
         assertEquals(8192, capable.recommend(gib, "performance").contextSize)
     }
 
-    @Test fun batterySaverLimitsCpuButKeepsSafeVulkanOffload() {
+    @Test fun balancedModeStaysCpuSafeEvenWithVulkanAvailable() {
+        val balanced = capable.recommend(gib, "balanced")
+        assertEquals(0, balanced.gpuLayers)
+        assertEquals(4096, balanced.contextSize)
+    }
+
+    @Test fun batterySaverLimitsCpuAndKeepsBalancedModeOnCpu() {
         val saving = capable.copy(powerSave = true).recommend(gib, "balanced")
         assertTrue(saving.threads <= 2)
-        assertEquals(4, saving.gpuLayers)
+        assertEquals(0, saving.gpuLayers)
         assertEquals(4096, saving.contextSize)
         assertEquals(64, saving.batchSize)
     }
