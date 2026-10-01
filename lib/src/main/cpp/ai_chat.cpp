@@ -805,8 +805,31 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_nativeDiagnostics(JNIEnv *env, 
     out << "Reasoning template: " << (template_supports_thinking ? "detected; thinking disabled" : "not detected") << '\n';
     out << "Degenerate output guard: " << (generation_degenerate ? "triggered" : "clear")
         << "; repeated-token streak: " << repeated_token_streak << '\n';
+
+    const auto visible_text = pocketai::strip_thinking(assistant_text);
+    int visible_tokens_estimate = 0;
+    if (context && !visible_text.empty()) {
+        try {
+            visible_tokens_estimate = static_cast<int>(common_tokenize(context, visible_text, false, false).size());
+        } catch (...) { visible_tokens_estimate = 0; }
+    }
+    const int hidden_thinking_tokens_estimate =
+        std::max(0, budget.produced - visible_tokens_estimate);
+
     const int64_t duration = generation_start ? (generation_end ? generation_end : ggml_time_us()) - generation_start : 0;
-    out << "Generation: " << (duration > 0 ? budget.produced * 1e6 / duration : 0.0) << " tokens/s; prompt: " << (prompt_us > 0 ? prompt_tokens * 1e6 / prompt_us : 0.0) << " tokens/s\n";
+    out << "Load timing: model " << model_load_us / 1000.0
+        << " ms; context " << context_prepare_us / 1000.0
+        << " ms; system-prompt " << system_prompt_us / 1000.0
+        << " ms; fallback-events " << fallback_events << '\n';
+    out << "Prompt timing: " << prompt_tokens << " tokens; " << prompt_us / 1000.0
+        << " ms; " << (prompt_us > 0 ? prompt_tokens * 1e6 / prompt_us : 0.0) << " tokens/s\n";
+    out << "Output metrics: raw-tokens " << budget.produced
+        << "; visible-tokens-est " << visible_tokens_estimate
+        << "; hidden-thinking-tokens-est " << hidden_thinking_tokens_estimate
+        << "; raw-chars " << pocketai::utf8_codepoints(assistant_text)
+        << "; visible-chars " << pocketai::utf8_codepoints(visible_text) << '\n';
+    out << "Generation: " << (duration > 0 ? budget.produced * 1e6 / duration : 0.0)
+        << " tokens/s; generation-time " << duration / 1000.0 << " ms\n";
     out << "Backend warnings: " << backend_warnings.load() << "; errors: " << backend_errors.load() << '\n';
     out << "Prompt/content logging: disabled\n" << llama_print_system_info();
     return android_text(env, out.str());
