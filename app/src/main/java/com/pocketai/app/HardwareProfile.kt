@@ -47,10 +47,12 @@ data class HardwareProfile(
             else -> minOf(4, bigCores.coerceAtLeast(1))
         }.coerceAtLeast(1)
         val gpuLayers = when {
-            normalizedMode == "cpu" || eco || hot || vulkanVersion == null -> 0
+            // Vulkan on some Android/Adreno stacks can return valid-looking but
+            // corrupted logits. Keep the default profiles CPU-safe; GPU offload
+            // is opt-in through the explicit Performance profile.
+            !performant || eco || hot || vulkanVersion == null -> 0
             available < 1024 * MIB || totalRamBytes < 6 * GIB -> 0
-            performant && totalRamBytes >= 10 * GIB -> 16
-            powerSave || warm -> 4
+            totalRamBytes >= 10 * GIB -> 16
             else -> 8
         }
         return InferenceOptions(
