@@ -384,7 +384,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         logs.event(
                             "generation_progress elapsed_ms=$elapsedNow emitted_tokens=$chunks " +
                                 "backend=" + (if (activeOptions.gpuLayers > 0) "cpu+vulkan" else "cpu") +
+                                " gpu_layers=${activeOptions.gpuLayers}" +
                                 " threads=$currentThreadLimit/${activeOptions.threads}" +
+                                " context=${activeOptions.contextSize}" +
+                                " batch=${activeOptions.batchSize}" +
+                                " max_tokens=$maxTokens" +
                                 " thermal=$currentThermalStatus(" + thermalLabel(currentThermalStatus) + ")" +
                                 " headroom=" + thermalHeadroom() +
                                 " ram_avail_mib=" + memoryAvailableMiB() +
