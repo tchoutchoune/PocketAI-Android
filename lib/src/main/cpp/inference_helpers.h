@@ -58,6 +58,25 @@ inline std::string strip_thinking(const std::string &text) {
     return result;
 }
 
+inline std::string thinking_content(const std::string &text) {
+    std::string result;
+    size_t cursor = 0;
+    while (cursor < text.size()) {
+        const auto open = text.find("<think>", cursor);
+        if (open == std::string::npos) break;
+        const auto content_start = open + 7;
+        const auto close = text.find("</think>", content_start);
+        if (close == std::string::npos) {
+            result.append(text, content_start, std::string::npos);
+            break;
+        }
+        if (!result.empty()) result.push_back('\n');
+        result.append(text, content_start, close - content_start);
+        cursor = close + 8;
+    }
+    return result;
+}
+
 inline size_t utf8_codepoints(const std::string &text) {
     size_t count = 0;
     for (size_t i = 0; i < text.size();) {
