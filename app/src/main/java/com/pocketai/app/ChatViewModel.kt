@@ -1,7 +1,12 @@
 package com.pocketai.app
 
+import android.app.ActivityManager
 import android.app.Application
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.BatteryManager
 import android.os.PowerManager
+import android.os.Process
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.arm.aichat.AiChat
@@ -29,6 +34,7 @@ internal data class ChatUiState(
     val error: String? = null,
     val artifacts: List<GeneratedArtifact> = emptyList(),
     val diagnostics: String = "",
+    val liveMetrics: String = "",
 )
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
@@ -52,15 +58,24 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var lastCpuFallbackReloadMs = 0L
     private var gpuFallbackCount = 0
     private val power = application.getSystemService(PowerManager::class.java)
+    private val activityManager = application.getSystemService(ActivityManager::class.java)
+    @Volatile private var currentThermalStatus = runCatching { power.currentThermalStatus }.getOrDefault(PowerManager.THERMAL_STATUS_NONE)
+    @Volatile private var currentThreadLimit = 1
+    private var lastMetricWallMs = android.os.SystemClock.elapsedRealtime()
+    private var lastProcessCpuMs = Process.getElapsedCpuTime()
     private var thermalRegistered = false
     private val thermalListener = PowerManager.OnThermalStatusChangedListener { status ->
+        currentThermalStatus = status
+        val requested = activeOptions.threads.coerceAtLeast(1)
         val limit = when {
-            status >= PowerManager.THERMAL_STATUS_SEVERE -> 1
-            status >= PowerManager.THERMAL_STATUS_MODERATE -> minOf(2, activeOptions.threads)
-            else -> activeOptions.threads
-        }
+            status >= PowerManager.THERMAL_STATUS_CRITICAL -> 1
+            status >= PowerManager.THERMAL_STATUS_SEVERE -> minOf(2, requested)
+            status >= PowerManager.THERMAL_STATUS_MODERATE -> minOf(if (performanceMode == "cpu-performance") 4 else 3, requested)
+            else -> requested
+        }.coerceAtLeast(1)
+        currentThreadLimit = limit
         engine?.setThreadLimit(limit)
-        logs.event("thermal=$status thread_limit=$limit")
+        logs.event("thermal=$status(" + thermalLabel(status) + ") thread_limit=$limit requested_threads=$requested headroom=" + thermalHeadroom())
     }
 
     var performanceMode: String
@@ -88,6 +103,55 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun update(transform: (ChatUiState) -> ChatUiState) {
         mutableState.update(transform)
+    }
+
+    private fun thermalLabel(status: Int): String = when (status) {
+        PowerManager.THERMAL_STATUS_NONE -> "aucun"
+        PowerManager.THERMAL_STATUS_LIGHT -> "léger"
+        PowerManager.THERMAL_STATUS_MODERATE -> "modéré"
+        PowerManager.THERMAL_STATUS_SEVERE -> "sévère"
+        PowerManager.THERMAL_STATUS_CRITICAL -> "critique"
+        PowerManager.THERMAL_STATUS_EMERGENCY -> "urgence"
+        PowerManager.THERMAL_STATUS_SHUTDOWN -> "arrêt"
+        else -> "inconnu"
+    }
+
+    private fun thermalHeadroom(): Float? = runCatching {
+        power.getThermalHeadroom(0).takeIf { it.isFinite() && it >= 0f }
+    }.getOrNull()
+
+    private fun batteryTemperatureC(): Float? = runCatching {
+        val intent = getApplication<Application>().registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val tenths = intent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE) ?: Int.MIN_VALUE
+        if (tenths == Int.MIN_VALUE) null else tenths / 10f
+    }.getOrNull()
+
+    private fun memoryAvailableMiB(): Long {
+        val info = ActivityManager.MemoryInfo()
+        activityManager.getMemoryInfo(info)
+        return info.availMem / (1024 * 1024)
+    }
+
+    private fun processCpuEquivalentCores(nowWallMs: Long): Double {
+        val cpuMs = Process.getElapsedCpuTime()
+        val wallDelta = (nowWallMs - lastMetricWallMs).coerceAtLeast(1)
+        val cpuDelta = (cpuMs - lastProcessCpuMs).coerceAtLeast(0)
+        lastMetricWallMs = nowWallMs
+        lastProcessCpuMs = cpuMs
+        return cpuDelta.toDouble() / wallDelta.toDouble()
+    }
+
+    private fun liveMetrics(elapsedMs: Long, emittedTokens: Int): String {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val cpuCoresUsed = processCpuEquivalentCores(now)
+        val tps = if (elapsedMs > 0) emittedTokens * 1000.0 / elapsedMs else 0.0
+        val backend = if (activeOptions.gpuLayers > 0) "CPU+Vulkan" else "CPU"
+        val headroom = thermalHeadroom()?.let { " · marge %.2f".format(it) }.orEmpty()
+        val battery = batteryTemperatureC()?.let { " · batt. %.1f°C".format(it) }.orEmpty()
+        return ("%s · threads %d/%d · %.2f tok/s\nCPU proc. %.1f cœurs · RAM %d Mio · thermique %s%s%s").format(
+            backend, currentThreadLimit, activeOptions.threads, tps, cpuCoresUsed,
+            memoryAvailableMiB(), thermalLabel(currentThermalStatus), headroom, battery
+        )
     }
 
     private fun diagnosticsWithSessionNote(raw: String): String = buildString {
