@@ -347,8 +347,22 @@ class MainActivity : AppCompatActivity() {
         settingsPanel.addView(button("Profil : ${modeLabels[selectedMode]}") {
             MaterialAlertDialogBuilder(this).setTitle("Profil matériel")
                 .setSingleChoiceItems(modeLabels, selectedMode) { dialog, index ->
-                    model.performanceMode = modes[index]; dialog.dismiss(); renderSettings()
-                    toast("Profil appliqué au prochain chargement du modèle")
+                    dialog.dismiss()
+                    if (modes[index] == "performance") {
+                        MaterialAlertDialogBuilder(this)
+                            .setTitle("Vulkan expérimental")
+                            .setMessage("Vulkan a déjà produit des sorties corrompues sur certains pilotes Adreno. PocketAI ne le reteste qu’après une action explicite et repasse automatiquement en CPU performance si une corruption est détectée.")
+                            .setNegativeButton("Annuler", null)
+                            .setPositiveButton("Tester Vulkan une fois") { _, _ ->
+                                model.performanceMode = "performance"
+                                renderSettings()
+                                toast("Vulkan sera essayé au prochain chargement du modèle")
+                            }.show()
+                    } else {
+                        model.performanceMode = modes[index]
+                        renderSettings()
+                        toast("Profil appliqué au prochain chargement du modèle")
+                    }
                 }.setNegativeButton("Fermer", null).show()
         })
         settingsPanel.addView(text("CPU · performance utilise davantage de cœurs et un batch plus grand pour accélérer surtout l’historique et les prompts longs. Vulkan reste expérimental sur Android et peut basculer automatiquement sur CPU si la sortie devient incohérente. La chauffe réduit toujours les threads.", 14f))
@@ -362,12 +376,25 @@ class MainActivity : AppCompatActivity() {
             val values = intArrayOf(0, 256, 512, 1024, 2048, 4096, 8192)
             MaterialAlertDialogBuilder(this).setTitle("Longueur des réponses")
                 .setItems(labels) { _, index ->
-                    if (values[index] == 0) model.autoLength = true
-                    else {
-                        model.maxTokens = values[index]
+                    val selected = values[index]
+                    if (selected == 0) {
+                        model.autoLength = true
+                        renderSettings()
+                    } else if (selected >= 4096) {
+                        MaterialAlertDialogBuilder(this)
+                            .setTitle("Réponse potentiellement très longue")
+                            .setMessage("$selected tokens peuvent représenter plusieurs minutes sur un modèle 4B local et augmenter fortement la chauffe. Le mode Auto est recommandé.")
+                            .setNegativeButton("Garder Auto") { _, _ -> model.autoLength = true; renderSettings() }
+                            .setPositiveButton("Utiliser $selected") { _, _ ->
+                                model.maxTokens = selected
+                                model.autoLength = false
+                                renderSettings()
+                            }.show()
+                    } else {
+                        model.maxTokens = selected
                         model.autoLength = false
+                        renderSettings()
                     }
-                    renderSettings()
                 }.show()
         })
         settingsPanel.addView(text("En mode Auto, PocketAI adapte la longueur au contexte, au profil et à la pression thermique pour éviter les générations de plusieurs minutes. Une valeur manuelle reste disponible pour les réponses volontairement très longues.", 13f))
@@ -377,6 +404,14 @@ class MainActivity : AppCompatActivity() {
         settingsPanel.addView(button("Images · ${if (model.settings.hasImageKey) "configurées" else "à configurer"}") { onlineDialog("image") })
         settingsPanel.addView(button("Vidéos · ${if (model.settings.hasFalKey) "configurées" else "à configurer"}") { onlineDialog("video") })
         settingsPanel.addView(text("Diagnostics", 18f, true))
+        if (model.gpuBlacklistCount > 0) {
+            settingsPanel.addView(text("Vulkan désactivé automatiquement pour ${model.gpuBlacklistCount} combinaison(s) appareil/modèle après corruption détectée.", 13f))
+            settingsPanel.addView(button("Réautoriser Vulkan pour les modèles bloqués") {
+                val count = model.clearGpuBlacklist()
+                toast("$count blocage(s) Vulkan effacé(s). Sélectionne ensuite Vulkan expérimental pour un nouveau test.")
+                renderSettings()
+            })
+        }
         settingsPanel.addView(button("Voir le matériel et le moteur") {
             MaterialAlertDialogBuilder(this).setTitle("Diagnostic matériel")
                 .setMessage(HardwareProfile.detect(this).summary + "\n\n" + model.state.value.diagnostics.ifBlank { "Charge un modèle pour confirmer le moteur utilisé." })
