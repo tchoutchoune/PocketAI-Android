@@ -57,8 +57,12 @@ bool context_dirty = false;
 int history_resets = 0;
 int64_t generation_start = 0;
 int64_t generation_end = 0;
+int64_t model_load_us = 0;
+int64_t context_prepare_us = 0;
+int64_t system_prompt_us = 0;
 int64_t prompt_us = 0;
 int prompt_tokens = 0;
+int fallback_events = 0;
 llama_token last_generated_token = -1;
 int repeated_token_streak = 0;
 bool generation_degenerate = false;
@@ -157,6 +161,12 @@ void free_model() {
     model_path.clear();
     system_prompt.clear();
     gpu_layers = 0;
+    model_load_us = 0;
+    context_prepare_us = 0;
+    system_prompt_us = 0;
+    prompt_us = 0;
+    prompt_tokens = 0;
+    fallback_events = 0;
 }
 
 bool load_selected_model(bool use_gpu) {
