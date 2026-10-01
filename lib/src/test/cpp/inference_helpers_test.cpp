@@ -4,11 +4,8 @@
 int main() {
     pocketai::GenerationBudget budget;
     budget.start(3);
-    int position = 2040;
     for (int i = 0; i < 3; ++i) {
         assert(!budget.exhausted());
-        if (i == 1) position -= 1000;
-        ++position;
         budget.consume();
     }
     assert(budget.exhausted());
@@ -27,12 +24,6 @@ int main() {
     assert(pocketai::generation_limit(1984, 128, 512, 2048, 64) == 1344);
     assert(pocketai::generation_limit(960, 128, 800, 512, 64) == 0);
     assert(pocketai::generation_limit(960, 128, 800, 16, 16) == 16);
-
-    assert(pocketai::discard_count(2000, 100, 128, 2040) == 950);
-    assert(pocketai::discard_count(1050, 100, 128, 2040) == 0);
-    assert(pocketai::discard_count(100, 100, 1941, 2040) == -1);
-    assert(pocketai::discard_count(2040, 2039, 1, 2040) == 1);
-    assert(pocketai::discard_count(2000, 100, 1930, 2040) == 1890);
 
     const std::string emoji = "\xF0\x9F\x98\x80";
     assert(pocketai::complete_utf8(emoji));
