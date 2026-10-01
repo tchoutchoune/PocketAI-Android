@@ -31,10 +31,10 @@ with ZipFile(apk) as z:
     (out/'NATIVE-LIBS.txt').write_text('\n'.join(libs)+'\n')
     (out/'PAGE-ALIGNMENT.txt').write_text(f'All {len(libs)} ARM64 native libraries support 16 KB page alignment.\n')
 badging=(out/'PACKAGE.txt').read_text()
-assert "name='io.github.tchoutchoune.pocketai.kv409'" in badging
-assert "versionCode='409'" in badging
+assert "name='io.github.tchoutchoune.pocketai.perf410'" in badging
+assert "versionCode='410'" in badging
 print(f'Validated {len(libs)} ARM64 native libraries, including Vulkan')
 PY
-cp "$TASK_APK" "$TASK_REPO/out/PocketAI-4.0.9-kv-align-arm64-debug.apk"
+cp "$TASK_APK" "$TASK_REPO/out/PocketAI-4.1.0-performance-arm64-debug.apk"
 cd "$TASK_REPO/out"
-sha256sum PocketAI-4.0.9-kv-align-arm64-debug.apk > SHA256.txt
+sha256sum PocketAI-4.1.0-performance-arm64-debug.apk > SHA256.txt
