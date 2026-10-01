@@ -460,13 +460,24 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(JNIEnv *env, 
     try {
         if (context_dirty && install_system_prompt()) return 2;
         if (needs_end_of_turn) {
-            const auto vocab = llama_model_get_vocab(model);
-            auto eot = llama_vocab_eot(vocab);
-            if (eot < 0) eot = llama_vocab_eos(vocab);
-            if (eot < 0) { context_dirty = true; return 2; }
-            const int result = decode_prompt({eot}, false);
-            if (result) return result;
-            needs_end_of_turn = false;
+            const int capacity = static_cast<int>(llama_n_ctx(context)) - HEADROOM;
+            if (position + 1 > capacity) {
+                // The previous assistant turn ended on its output budget. If even its
+                // terminator no longer fits, discard old history cleanly instead of
+                // shifting a partial message and carrying mismatched template state.
+                const int shifts_before = shifts;
+                if (!make_turn_room(1)) { context_dirty = true; return 2; }
+                if (shifts == shifts_before) { context_dirty = true; return 2; }
+                needs_end_of_turn = false;
+            } else {
+                const auto vocab = llama_model_get_vocab(model);
+                auto eot = llama_vocab_eot(vocab);
+                if (eot < 0) eot = llama_vocab_eos(vocab);
+                if (eot < 0) { context_dirty = true; return 2; }
+                const int result = decode_prompt({eot}, false);
+                if (result) return result;
+                needs_end_of_turn = false;
+            }
         }
         const auto user = java_text(env, text);
         const bool chat_template = common_chat_templates_was_explicit(templates.get());
