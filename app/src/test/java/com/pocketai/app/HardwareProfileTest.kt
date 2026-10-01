@@ -11,11 +11,13 @@ class HardwareProfileTest {
 
     @Test fun cpuSelectionDisablesGpuEvenWhenVulkanIsDeclared() {
         assertEquals(0, capable.recommend(gib, "cpu").gpuLayers)
+        assertEquals(0, capable.recommend(gib, "cpu-performance").gpuLayers)
         assertTrue(capable.recommend(gib, "performance").gpuLayers > 0)
     }
 
     @Test fun ampleMemoryScalesContextWithoutIgnoringMode() {
         assertEquals(4096, capable.recommend(gib, "balanced").contextSize)
+        assertEquals(4096, capable.recommend(gib, "cpu-performance").contextSize)
         assertEquals(8192, capable.recommend(gib, "performance").contextSize)
     }
 
@@ -25,12 +27,17 @@ class HardwareProfileTest {
         assertEquals(4096, balanced.contextSize)
     }
 
-    @Test fun batterySaverLimitsCpuAndKeepsBalancedModeOnCpu() {
-        val saving = capable.copy(powerSave = true).recommend(gib, "balanced")
+    @Test fun batterySaverLimitsBalancedButExplicitCpuPerformanceCanUseMoreCores() {
+        val phone = capable.copy(powerSave = true)
+        val saving = phone.recommend(gib, "balanced")
+        val fastCpu = phone.recommend(gib, "cpu-performance")
         assertTrue(saving.threads <= 2)
         assertEquals(0, saving.gpuLayers)
-        assertEquals(4096, saving.contextSize)
         assertEquals(64, saving.batchSize)
+        assertEquals(6, fastCpu.threads)
+        assertEquals(0, fastCpu.gpuLayers)
+        assertEquals(256, fastCpu.batchSize)
+        assertEquals(4096, fastCpu.contextSize)
     }
 
     @Test fun severeThermalStateForcesConservativeCpuProfile() {
@@ -56,6 +63,14 @@ class HardwareProfileTest {
     @Test fun modelLoadAdmissionRejectsOnlyClearlyUnsafeCases() {
         assertEquals(false, capable.copy(availableRamBytes = 300L * 1024 * 1024).canAttemptModelLoad(gib))
         assertEquals(false, capable.canAttemptModelLoad(9 * gib))
+    }
+
+    @Test fun cpuPerformanceUsesAvailableCoresNotOnlyHighestFrequencyCluster() {
+        val phone = capable.copy(cpuCores = 8, bigCores = 2)
+        val options = phone.recommend(gib, "cpu-performance")
+        assertEquals(6, options.threads)
+        assertEquals(256, options.batchSize)
+        assertEquals(0, options.gpuLayers)
     }
 
     @Test fun inaccessibleCoreFrequenciesStillProduceValidThreadCount() {
