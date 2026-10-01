@@ -19,19 +19,24 @@ class HardwareProfileTest {
         assertEquals(8192, capable.recommend(gib, "performance").contextSize)
     }
 
-    @Test fun powerSavingAndOverheatingReducePerformanceProfile() {
-        val saving = capable.copy(powerSave = true).recommend(gib, "performance")
+    @Test fun batterySaverLimitsCpuButKeepsSafeVulkanOffload() {
+        val saving = capable.copy(powerSave = true).recommend(gib, "balanced")
+        assertTrue(saving.threads <= 2)
+        assertEquals(4, saving.gpuLayers)
+        assertEquals(4096, saving.contextSize)
+        assertEquals(64, saving.batchSize)
+    }
+
+    @Test fun severeThermalStateForcesConservativeCpuProfile() {
         val hot = capable.copy(thermalStatus = PowerManager.THERMAL_STATUS_SEVERE).recommend(gib, "performance")
-        listOf(saving, hot).forEach {
-            assertTrue(it.threads <= 2)
-            assertEquals(0, it.gpuLayers)
-            assertEquals(1024, it.contextSize)
-            assertEquals(64, it.batchSize)
-        }
+        assertTrue(hot.threads <= 2)
+        assertEquals(0, hot.gpuLayers)
+        assertEquals(1024, hot.contextSize)
+        assertEquals(64, hot.batchSize)
     }
 
     @Test fun lowAvailableMemoryUsesConservativeContextAndCpu() {
-        val options = capable.copy(availableRamBytes = gib).recommend(gib, "performance")
+        val options = capable.copy(availableRamBytes = 700L * 1024 * 1024).recommend(gib, "performance")
         assertEquals(1024, options.contextSize)
         assertEquals(64, options.batchSize)
         assertEquals(0, options.gpuLayers)
