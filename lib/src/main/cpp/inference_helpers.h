@@ -32,13 +32,6 @@ inline int generation_limit(int capacity, int system, int prompt_tokens, int req
     return std::min(requested, available);
 }
 
-inline int discard_count(int position, int system, int required, int capacity) {
-    if (position + required <= capacity) return 0;
-    const int history = position - system;
-    if (history < 1 || system + required > capacity) return -1;
-    return std::min(history, std::max(position + required - capacity, std::max(1, history / 2)));
-}
-
 // Complete UTF-8 prefixes only; an unfinished multibyte token waits for the next token.
 inline bool complete_utf8(const std::string &text) {
     for (size_t i = 0; i < text.size();) {
