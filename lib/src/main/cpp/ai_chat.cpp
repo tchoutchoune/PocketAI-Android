@@ -67,6 +67,9 @@ int64_t prompt_us = 0;
 int prompt_tokens = 0;
 int prompt_reused_tokens = 0;
 int prompt_decoded_tokens = 0;
+int history_alignment_tokens = 0;
+int history_alignment_rendered_tokens = 0;
+std::string history_alignment_mode = "none";
 int fallback_events = 0;
 llama_token last_generated_token = -1;
 int repeated_token_streak = 0;
@@ -177,6 +180,9 @@ void free_model() {
     prompt_tokens = 0;
     prompt_reused_tokens = 0;
     prompt_decoded_tokens = 0;
+    history_alignment_tokens = 0;
+    history_alignment_rendered_tokens = 0;
+    history_alignment_mode = "none";
     fallback_events = 0;
 }
 
@@ -363,16 +369,20 @@ std::string format_message(const std::string &role, const std::string &content, 
     return result.str();
 }
 
-void add_message(const std::string &role, const std::string &content) {
-    common_chat_msg message;
-    message.role = role;
-    message.content = content;
+void add_message(common_chat_msg message) {
     messages.push_back(std::move(message));
     // Templates need recent role ordering; keep native bookkeeping bounded.
     if (messages.size() > 64) {
         const size_t first = messages.front().role == "system" ? 1 : 0;
         messages.erase(messages.begin() + first, messages.begin() + first + 2);
     }
+}
+
+void add_message(const std::string &role, const std::string &content) {
+    common_chat_msg message;
+    message.role = role;
+    message.content = content;
+    add_message(std::move(message));
 }
 
 llama_tokens tokenize_input(const std::string &text, bool parse_special) {
@@ -393,16 +403,79 @@ llama_tokens tokenize_from_start(const std::string &text, bool parse_special) {
     return tokens;
 }
 
-std::string render_full_reasoning_chat(const std::vector<common_chat_msg> &chat) {
+std::string render_reasoning_chat(
+    const std::vector<common_chat_msg> &chat,
+    bool add_generation_prompt
+) {
     const auto vocab = llama_model_get_vocab(model);
     common_chat_templates_inputs inputs;
     inputs.messages = chat;
     inputs.use_jinja = true;
     inputs.enable_thinking = false;
-    inputs.add_generation_prompt = true;
+    inputs.add_generation_prompt = add_generation_prompt;
     inputs.add_bos = llama_vocab_get_add_bos(vocab);
     inputs.add_eos = llama_vocab_get_add_eos(vocab);
     return common_chat_templates_apply(templates.get(), inputs).prompt;
+}
+
+std::string render_full_reasoning_chat(const std::vector<common_chat_msg> &chat) {
+    return render_reasoning_chat(chat, true);
+}
+
+/**
+ * Some reasoning templates emit an empty <think> block only in their generation
+ * prompt, but omit it when the completed assistant message is rendered again.
+ * That tiny rewrite invalidates the KV state of the whole assistant answer.
+ *
+ * Try representations that are semantically identical to PocketAI (no private
+ * reasoning) and keep the one whose rendered history matches the live KV for the
+ * longest exact token prefix. Qwen3 accepts a newline-only reasoning_content:
+ * it is truthy to the template but strips to empty inside the think block.
+ */
+common_chat_msg aligned_assistant_message(const std::string &content) {
+    common_chat_msg plain;
+    plain.role = "assistant";
+    plain.content = content;
+
+    history_alignment_tokens = 0;
+    history_alignment_rendered_tokens = 0;
+    history_alignment_mode = "plain";
+
+    if (!template_supports_thinking || !context || kv_tokens.empty()) return plain;
+
+    std::vector<common_chat_msg> variants;
+    variants.push_back(plain);
+    common_chat_msg empty_reasoning = plain;
+    empty_reasoning.reasoning_content = "\n";
+    variants.push_back(std::move(empty_reasoning));
+
+    common_chat_msg best = variants.front();
+    size_t best_prefix = 0;
+    size_t best_total = 0;
+    std::string best_mode = "plain";
+
+    for (size_t index = 0; index < variants.size(); ++index) {
+        try {
+            auto candidate = messages;
+            candidate.push_back(variants[index]);
+            const auto rendered = render_reasoning_chat(candidate, false);
+            const auto rendered_tokens = tokenize_from_start(rendered, true);
+            const size_t prefix = pocketai::token_prefix_length(rendered_tokens, kv_tokens);
+            if (prefix > best_prefix || (prefix == best_prefix && rendered_tokens.size() < best_total)) {
+                best = variants[index];
+                best_prefix = prefix;
+                best_total = rendered_tokens.size();
+                best_mode = index == 0 ? "plain" : "empty-reasoning";
+            }
+        } catch (...) {
+            // Keep the ordinary assistant representation if alignment probing fails.
+        }
+    }
+
+    history_alignment_tokens = static_cast<int>(best_prefix);
+    history_alignment_rendered_tokens = static_cast<int>(best_total);
+    history_alignment_mode = best_mode;
+    return best;
 }
 
 bool drop_oldest_history_turn(std::vector<common_chat_msg> &chat) {
@@ -511,7 +584,8 @@ void finish_generation() {
     if (!generating) return;
     generation_end = ggml_time_us();
     if (!context_dirty && common_chat_templates_was_explicit(templates.get())) {
-        add_message("assistant", assistant_text);
+        if (template_supports_thinking) add_message(aligned_assistant_message(assistant_text));
+        else add_message("assistant", assistant_text);
         needs_end_of_turn = !generation_eog;
     }
     generating = false;
@@ -916,6 +990,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_nativeDiagnostics(JNIEnv *env, 
         << " ms; decode " << prompt_us / 1000.0
         << " ms; " << (prompt_us > 0 ? prompt_decoded_tokens * 1e6 / prompt_us : 0.0)
         << " decoded tokens/s\n";
+    out << "History alignment: " << history_alignment_tokens << " / "
+        << history_alignment_rendered_tokens << " tokens; mode " << history_alignment_mode << '\n';
     out << "Output metrics: raw-tokens " << budget.produced
         << "; visible-tokens-est " << visible_tokens_estimate
         << "; hidden-thinking-tokens-est " << hidden_thinking_tokens_estimate
