@@ -54,7 +54,7 @@ bool generating = false;
 bool generation_eog = false;
 bool needs_end_of_turn = false;
 bool context_dirty = false;
-int shifts = 0;
+int history_resets = 0;
 int64_t generation_start = 0;
 int64_t generation_end = 0;
 int64_t prompt_us = 0;
@@ -215,18 +215,6 @@ void append_fallback(const std::string &message) {
     fallback += message;
 }
 
-bool make_room(int required) {
-    const int capacity = static_cast<int>(llama_n_ctx(context)) - HEADROOM;
-    const int discard = pocketai::discard_count(position, system_position, required, capacity);
-    if (!discard) return true;
-    if (discard < 0 || !llama_memory_can_shift(llama_get_memory(context))) return false;
-    if (!llama_memory_seq_rm(llama_get_memory(context), 0, system_position, system_position + discard)) return false;
-    llama_memory_seq_add(llama_get_memory(context), 0, system_position + discard, position, -discard);
-    position -= discard;
-    ++shifts;
-    return true;
-}
-
 /**
  * Reserve the whole current turn before decoding it. When the existing history
  * no longer leaves enough room, drop the old conversational KV tail at once
@@ -245,7 +233,7 @@ bool make_turn_room(int required) {
     if (!messages.empty() && messages.front().role == "system") messages.resize(1);
     else messages.clear();
 
-    ++shifts;
+    ++history_resets;
     return true;
 }
 
@@ -253,7 +241,8 @@ int decode_prompt(const llama_tokens &tokens, bool last_logit) {
     for (size_t offset = 0; offset < tokens.size();) {
         if (cancelled.load()) { context_dirty = true; return 3; }
         const int count = std::min(options.batch, static_cast<int>(tokens.size() - offset));
-        if (!make_room(count)) { context_dirty = true; return 1; }
+        const int capacity = static_cast<int>(llama_n_ctx(context)) - HEADROOM;
+        if (position + count > capacity) { context_dirty = true; return 1; }
         apply_threads();
         common_batch_clear(batch);
         for (int i = 0; i < count; ++i)
@@ -311,7 +300,7 @@ void add_message(const std::string &role, const std::string &content) {
     message.role = role;
     message.content = content;
     messages.push_back(std::move(message));
-    // Templates need recent role ordering; keep the native history bounded as the KV cache slides.
+    // Templates need recent role ordering; keep native bookkeeping bounded.
     if (messages.size() > 64) {
         const size_t first = messages.front().role == "system" ? 1 : 0;
         messages.erase(messages.begin() + first, messages.begin() + first + 2);
@@ -473,7 +462,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv *, jobject) {
         try { template_supports_thinking = common_chat_templates_support_enable_thinking(templates.get()); }
         catch (...) { template_supports_thinking = false; }
         clear_conversation();
-        shifts = 0;
+        history_resets = 0;
         budget.start(0);
         prompt_tokens = 0;
         prompt_us = 0;
@@ -502,9 +491,9 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(JNIEnv *env, 
                 // The previous assistant turn ended on its output budget. If even its
                 // terminator no longer fits, discard old history cleanly instead of
                 // shifting a partial message and carrying mismatched template state.
-                const int shifts_before = shifts;
+                const int resets_before = history_resets;
                 if (!make_turn_room(1)) { context_dirty = true; return 2; }
-                if (shifts == shifts_before) { context_dirty = true; return 2; }
+                if (history_resets == resets_before) { context_dirty = true; return 2; }
                 needs_end_of_turn = false;
             } else {
                 const auto vocab = llama_model_get_vocab(model);
@@ -539,10 +528,10 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(JNIEnv *env, 
         // Only when history leaves less than the minimum useful response window,
         // reset the old conversational KV tail while keeping the system prompt.
         if (!effective) {
-            const int shifts_before = shifts;
+            const int resets_before = history_resets;
             if (!make_turn_room(static_cast<int>(tokens.size()) + minimum)) return 1;
 
-            if (shifts != shifts_before) {
+            if (history_resets != resets_before) {
                 // A history reset changes template state (and can change BOS handling),
                 // so rebuild the exact model input against the retained system prompt.
                 formatted = chat_template ? format_message("user", user, true) : user;
@@ -641,7 +630,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_nativeDiagnostics(JNIEnv *env, 
     out << "Generated: " << budget.produced << " / " << budget.limit
         << "; requested: " << budget.requested
         << "; context-limited: " << (budget.context_limited() ? "yes" : "no")
-        << "; history resets: " << shifts << '\n';
+        << "; history resets: " << history_resets << '\n';
     out << "Reasoning template: " << (template_supports_thinking ? "detected; thinking disabled" : "not detected") << '\n';
     const int64_t duration = generation_start ? (generation_end ? generation_end : ggml_time_us()) - generation_start : 0;
     out << "Generation: " << (duration > 0 ? budget.produced * 1e6 / duration : 0.0) << " tokens/s; prompt: " << (prompt_us > 0 ? prompt_tokens * 1e6 / prompt_us : 0.0) << " tokens/s\n";
