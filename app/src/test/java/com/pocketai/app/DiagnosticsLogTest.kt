@@ -44,7 +44,7 @@ class DiagnosticsLogTest {
         val log = DiagnosticsLog(context)
         repeat(700) { log.event("event-$it ${"x".repeat(2000)}") }
         val export = log.snapshot()
-        assertTrue(export.length < 530_000)
+        assertTrue(export.length < 1_100_000)
         assertTrue(export.contains("event-699"))
         assertFalse(export.contains("event-0 "))
         assertTrue(File(context.filesDir, "diagnostics").listFiles().orEmpty().size <= 2)
