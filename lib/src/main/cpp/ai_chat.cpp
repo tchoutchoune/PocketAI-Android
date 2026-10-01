@@ -305,7 +305,10 @@ size_t common_token_prefix(const llama_tokens &left, const std::vector<llama_tok
  */
 size_t trim_kv_to_prefix(size_t requested_prefix) {
     if (!context || kv_tokens.size() != static_cast<size_t>(position)) {
-        llama_memory_clear(llama_get_memory(context), false);
+        if (context) {
+            auto memory = llama_get_memory(context);
+            if (memory) llama_memory_clear(memory, false);
+        }
         kv_tokens.clear();
         position = 0;
         return 0;
@@ -316,7 +319,7 @@ size_t trim_kv_to_prefix(size_t requested_prefix) {
 
     auto memory = llama_get_memory(context);
     if (!memory || !llama_memory_seq_rm(memory, 0, static_cast<llama_pos>(prefix), position)) {
-        llama_memory_clear(memory, false);
+        if (memory) llama_memory_clear(memory, false);
         kv_tokens.clear();
         position = 0;
         return 0;
@@ -704,9 +707,9 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(JNIEnv *env, 
         const auto user = java_text(env, text);
         const bool chat_template = common_chat_templates_was_explicit(templates.get());
 
-        // Reasoning-capable templates such as Qwen3 can change previously rendered
-        // bytes depending on template state. Re-render the structured conversation
-        // from scratch for each turn so the KV cache always matches the template.
+        // Reasoning-capable templates such as Qwen3 can rewrite their rendered tail
+        // between turns. The reasoning path renders the complete structured chat, then
+        // reuses only the exact token-identical KV prefix and decodes the changed suffix.
         if (chat_template && template_supports_thinking)
             return process_reasoning_user(user, static_cast<int>(maximum));
 
@@ -728,8 +731,18 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(JNIEnv *env, 
             }
         }
 
+        prompt_render_us = 0;
+        prompt_tokenize_us = 0;
+        prompt_reused_tokens = 0;
+        prompt_decoded_tokens = 0;
+
+        const auto render_start = ggml_time_us();
         auto formatted = chat_template ? format_message("user", user, true) : user;
+        prompt_render_us += ggml_time_us() - render_start;
+
+        const auto tokenize_start = ggml_time_us();
         auto tokens = tokenize_input(formatted, chat_template);
+        prompt_tokenize_us += ggml_time_us() - tokenize_start;
         if (tokens.empty()) return 1;
 
         const int capacity = static_cast<int>(llama_n_ctx(context)) - HEADROOM;
@@ -747,8 +760,12 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(JNIEnv *env, 
             if (!make_turn_room(static_cast<int>(tokens.size()) + minimum)) return 1;
 
             if (history_resets != resets_before) {
+                const auto rerender_start = ggml_time_us();
                 formatted = chat_template ? format_message("user", user, true) : user;
+                prompt_render_us += ggml_time_us() - rerender_start;
+                const auto retokenize_start = ggml_time_us();
                 tokens = tokenize_input(formatted, chat_template);
+                prompt_tokenize_us += ggml_time_us() - retokenize_start;
                 if (tokens.empty()) return 1;
             }
 
@@ -771,6 +788,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(JNIEnv *env, 
         const int result = decode_prompt(tokens, true);
         prompt_us = ggml_time_us() - start;
         prompt_tokens = static_cast<int>(tokens.size());
+        prompt_reused_tokens = 0;
+        prompt_decoded_tokens = static_cast<int>(tokens.size());
         if (result) return result;
         if (chat_template) add_message("user", user);
         budget.start(maximum, effective);
@@ -897,8 +916,14 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_nativeDiagnostics(JNIEnv *env, 
         << " ms; context " << context_prepare_us / 1000.0
         << " ms; system-prompt " << system_prompt_us / 1000.0
         << " ms; fallback-events " << fallback_events << '\n';
-    out << "Prompt timing: " << prompt_tokens << " tokens; " << prompt_us / 1000.0
-        << " ms; " << (prompt_us > 0 ? prompt_tokens * 1e6 / prompt_us : 0.0) << " tokens/s\n";
+    out << "Prompt timing: total " << prompt_tokens
+        << " tokens; reused " << prompt_reused_tokens
+        << "; decoded " << prompt_decoded_tokens
+        << "; render " << prompt_render_us / 1000.0
+        << " ms; tokenize " << prompt_tokenize_us / 1000.0
+        << " ms; decode " << prompt_us / 1000.0
+        << " ms; " << (prompt_us > 0 ? prompt_decoded_tokens * 1e6 / prompt_us : 0.0)
+        << " decoded tokens/s\n";
     out << "Output metrics: raw-tokens " << budget.produced
         << "; visible-tokens-est " << visible_tokens_estimate
         << "; hidden-thinking-tokens-est " << hidden_thinking_tokens_estimate
