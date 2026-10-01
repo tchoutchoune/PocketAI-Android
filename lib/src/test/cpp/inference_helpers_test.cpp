@@ -25,6 +25,12 @@ int main() {
     assert(pocketai::generation_limit(960, 128, 800, 512, 64) == 0);
     assert(pocketai::generation_limit(960, 128, 800, 16, 16) == 16);
 
+    assert(pocketai::reusable_token_prefix({1, 2, 3, 4}, {1, 2, 9}) == 2);
+    assert(pocketai::reusable_token_prefix({1, 2, 3}, {1, 2, 3, 4}) == 2);
+    assert(pocketai::reusable_token_prefix({1, 2, 3, 4}, {1, 2, 3}) == 3);
+    assert(pocketai::reusable_token_prefix({7}, {7}) == 0);
+    assert(pocketai::reusable_token_prefix({}, {1, 2}) == 0);
+
     assert(pocketai::strip_thinking("bonjour").compare("bonjour") == 0);
     assert(pocketai::strip_thinking("<think>secret</think>visible").compare("visible") == 0);
     assert(pocketai::strip_thinking("avant<think>secret</think>apres").compare("avantapres") == 0);
