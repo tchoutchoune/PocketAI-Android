@@ -68,7 +68,7 @@ int prompt_tokens = 0;
 int prompt_reused_tokens = 0;
 int prompt_decoded_tokens = 0;
 int history_alignment_tokens = 0;
-int history_alignment_rendered_tokens = 0;
+int history_alignment_kv_tokens = 0;
 std::string history_alignment_mode = "none";
 int fallback_events = 0;
 llama_token last_generated_token = -1;
@@ -181,7 +181,7 @@ void free_model() {
     prompt_reused_tokens = 0;
     prompt_decoded_tokens = 0;
     history_alignment_tokens = 0;
-    history_alignment_rendered_tokens = 0;
+    history_alignment_kv_tokens = 0;
     history_alignment_mode = "none";
     fallback_events = 0;
 }
@@ -438,7 +438,7 @@ common_chat_msg aligned_assistant_message(const std::string &content) {
     plain.content = content;
 
     history_alignment_tokens = 0;
-    history_alignment_rendered_tokens = 0;
+    history_alignment_kv_tokens = 0;
     history_alignment_mode = "plain";
 
     if (!template_supports_thinking || !context || kv_tokens.empty()) return plain;
@@ -458,13 +458,22 @@ common_chat_msg aligned_assistant_message(const std::string &content) {
         try {
             auto candidate = messages;
             candidate.push_back(variants[index]);
+
+            // Probe the representation as a *previous* assistant turn. Qwen3 renders
+            // the last assistant differently from an assistant followed by a new
+            // user message, which is exactly what caused the next-turn KV mismatch.
+            common_chat_msg probe_user;
+            probe_user.role = "user";
+            probe_user.content = "__pocketai_alignment_probe__";
+            candidate.push_back(std::move(probe_user));
+
             const auto rendered = render_reasoning_chat(candidate, false);
             const auto rendered_tokens = tokenize_from_start(rendered, true);
             const size_t prefix = pocketai::token_prefix_length(rendered_tokens, kv_tokens);
-            if (prefix > best_prefix || (prefix == best_prefix && rendered_tokens.size() < best_total)) {
+            if (prefix > best_prefix) {
                 best = variants[index];
                 best_prefix = prefix;
-                best_total = rendered_tokens.size();
+                best_total = kv_tokens.size();
                 best_mode = index == 0 ? "plain" : "empty-reasoning";
             }
         } catch (...) {
@@ -473,7 +482,7 @@ common_chat_msg aligned_assistant_message(const std::string &content) {
     }
 
     history_alignment_tokens = static_cast<int>(best_prefix);
-    history_alignment_rendered_tokens = static_cast<int>(best_total);
+    history_alignment_kv_tokens = static_cast<int>(best_total);
     history_alignment_mode = best_mode;
     return best;
 }
@@ -991,7 +1000,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_nativeDiagnostics(JNIEnv *env, 
         << " ms; " << (prompt_us > 0 ? prompt_decoded_tokens * 1e6 / prompt_us : 0.0)
         << " decoded tokens/s\n";
     out << "History alignment: " << history_alignment_tokens << " / "
-        << history_alignment_rendered_tokens << " tokens; mode " << history_alignment_mode << '\n';
+        << history_alignment_kv_tokens << " cached tokens; mode " << history_alignment_mode << '\n';
     out << "Output metrics: raw-tokens " << budget.produced
         << "; visible-tokens-est " << visible_tokens_estimate
         << "; hidden-thinking-tokens-est " << hidden_thinking_tokens_estimate
