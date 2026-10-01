@@ -291,13 +291,6 @@ int decode_prompt(const llama_tokens &tokens, bool last_logit) {
     return 0;
 }
 
-size_t common_token_prefix(const llama_tokens &left, const std::vector<llama_token> &right) {
-    const size_t limit = std::min(left.size(), right.size());
-    size_t prefix = 0;
-    while (prefix < limit && left[prefix] == right[prefix]) ++prefix;
-    return prefix;
-}
-
 /**
  * Keep an exact token-identical KV prefix. Re-evaluate at least the final prompt
  * token afterwards so llama.cpp exposes logits for the current prompt rather than
@@ -468,8 +461,7 @@ int process_reasoning_user(const std::string &user, int maximum) {
     // Reuse only a token-identical prefix. Qwen3 templates may rewrite the tail
     // between turns, so byte/string assumptions are unsafe. Exact token comparison
     // lets us keep the stable KV prefix and recompute only the changed/new suffix.
-    size_t reusable = common_token_prefix(tokens, kv_tokens);
-    if (!tokens.empty() && reusable >= tokens.size()) reusable = tokens.size() - 1;
+    size_t reusable = pocketai::reusable_token_prefix(tokens, kv_tokens);
     reusable = trim_kv_to_prefix(reusable);
 
     common_sampler_reset(sampler);
