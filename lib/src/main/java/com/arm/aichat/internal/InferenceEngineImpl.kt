@@ -3,6 +3,7 @@ package com.arm.aichat.internal
 import android.content.Context
 import android.util.Log
 import com.arm.aichat.InferenceEngine
+import com.arm.aichat.GpuOutputCorruptionException
 import com.arm.aichat.InferenceOptions
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -197,7 +198,14 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
                 _state.value = InferenceEngine.State.Generating
                 while (!cancelled) {
                     currentCoroutineContext().ensureActive()
-                    val token = generateNextToken() ?: break
+                    val token = try {
+                        generateNextToken()
+                    } catch (e: IOException) {
+                        if (e.message?.contains("Sortie GPU incoherente detectee") == true) {
+                            throw GpuOutputCorruptionException(e)
+                        }
+                        throw e
+                    } ?: break
                     if (token.isNotEmpty()) emit(token)
                 }
             } catch (e: CancellationException) {
