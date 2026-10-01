@@ -25,6 +25,14 @@ int main() {
     assert(pocketai::generation_limit(960, 128, 800, 512, 64) == 0);
     assert(pocketai::generation_limit(960, 128, 800, 16, 16) == 16);
 
+    assert(pocketai::strip_thinking("bonjour").compare("bonjour") == 0);
+    assert(pocketai::strip_thinking("<think>secret</think>visible").compare("visible") == 0);
+    assert(pocketai::strip_thinking("avant<think>secret</think>apres").compare("avantapres") == 0);
+    assert(pocketai::strip_thinking("<think>incomplet").empty());
+    assert(pocketai::utf8_codepoints("abc") == 3);
+    assert(pocketai::utf8_codepoints("\xC3\xA9") == 1);
+    assert(pocketai::utf8_codepoints("\xF0\x9F\x98\x80") == 1);
+
     const std::string emoji = "\xF0\x9F\x98\x80";
     assert(pocketai::complete_utf8(emoji));
     assert(!pocketai::complete_utf8(emoji.substr(0, 3)));
