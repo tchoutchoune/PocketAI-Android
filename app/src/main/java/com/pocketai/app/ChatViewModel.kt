@@ -5,6 +5,7 @@ import android.app.Application
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.BatteryManager
+import android.os.Build
 import android.os.PowerManager
 import android.os.Process
 import androidx.lifecycle.AndroidViewModel
@@ -52,7 +53,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var activeFile: File? = null
     private var activeOptions = InferenceOptions()
     private var needsHistoryRestore = true
-    private val gpuUnstableModels = mutableSetOf<String>()
+    private val gpuUnstableModels = prefs.getStringSet("gpu_blacklist_v1", emptySet()).orEmpty().toMutableSet()
     private var backendOverrideNote: String? = null
     private var lastModelLoadWallMs = 0L
     private var lastCpuFallbackReloadMs = 0L
@@ -81,7 +82,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     var performanceMode: String
         get() = prefs.getString("mode", "balanced") ?: "balanced"
-        set(value) { prefs.edit().putString("mode", value).apply() }
+        set(value) {
+            prefs.edit()
+                .putString("mode", value)
+                .putBoolean("vulkan_retry_once", value == "performance")
+                .apply()
+        }
 
     var maxTokens: Int
         get() = prefs.getInt("maxTokens", 1024).coerceIn(64, 8192)
@@ -105,7 +111,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     init {
-        logs.event("application_started")
+        // 4.1.1 migration: an old remembered Performance profile used Vulkan
+        // automatically. Vulkan is now an explicit one-shot retry after failures.
+        if (prefs.getString("mode", "balanced") == "performance" &&
+            !prefs.getBoolean("vulkan_retry_once", false)) {
+            prefs.edit().putString("mode", "cpu-performance").apply()
+        }
+        logs.event("application_started gpu_blacklist_entries=${gpuUnstableModels.size}")
         thermalRegistered = runCatching {
             power.addThermalStatusListener(application.mainExecutor, thermalListener)
             true
@@ -181,14 +193,51 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             .append(" ms; last-cpu-reload-wall ").append(lastCpuFallbackReloadMs)
             .append(" ms; gpu-fallbacks ").append(gpuFallbackCount)
     }
+    private fun gpuStabilityKey(file: File): String =
+        listOf(Build.MANUFACTURER, Build.MODEL, Build.DEVICE, file.name, file.length().toString()).joinToString("|")
+
+    private fun isGpuBlacklisted(file: File): Boolean =
+        gpuStabilityKey(file) in gpuUnstableModels
+
+    private fun persistGpuBlacklist(file: File, reason: String) {
+        val key = gpuStabilityKey(file)
+        if (gpuUnstableModels.add(key)) {
+            prefs.edit().putStringSet("gpu_blacklist_v1", gpuUnstableModels.toSet()).apply()
+        }
+        logs.event("gpu_blacklist_added key_hash=${key.hashCode()} reason=$reason entries=${gpuUnstableModels.size}")
+    }
+
+    fun clearGpuBlacklist(): Int {
+        val count = gpuUnstableModels.size
+        gpuUnstableModels.clear()
+        prefs.edit().remove("gpu_blacklist_v1").putBoolean("vulkan_retry_once", false).apply()
+        logs.event("gpu_blacklist_cleared entries=$count")
+        return count
+    }
+
+    val gpuBlacklistCount: Int
+        get() = gpuUnstableModels.size
+
+    private fun consumeVulkanRetryOnce(): Boolean {
+        val retry = prefs.getBoolean("vulkan_retry_once", false)
+        if (retry) prefs.edit().putBoolean("vulkan_retry_once", false).apply()
+        return retry
+    }
 
     private suspend fun reloadActiveModelOnCpu(file: File): String {
         val reloadStarted = android.os.SystemClock.elapsedRealtime()
         val inference = inference()
         val profile = HardwareProfile.detect(getApplication())
-        val cpuOptions = profile.recommend(file.length(), "cpu").copy(gpuLayers = 0)
+        val baseCpu = profile.recommend(file.length(), "cpu-performance")
+        val request4096 = profile.totalRamBytes >= 8L * 1024 * 1024 * 1024
+        val cpuOptions = baseCpu.copy(
+            gpuLayers = 0,
+            threads = minOf(6, profile.cpuCores).coerceAtLeast(1),
+            contextSize = if (request4096) maxOf(4096, baseCpu.contextSize) else baseCpu.contextSize,
+            batchSize = maxOf(256, baseCpu.batchSize),
+        )
 
-        update { it.copy(status = "GPU instable détecté · bascule automatique sur CPU…") }
+        update { it.copy(status = "GPU instable détecté · bascule automatique sur CPU performance…") }
         inference.cleanUp()
         activeOptions = cpuOptions
         inference.configure(cpuOptions)
@@ -202,8 +251,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         activeOptions = cpuOptions.copy(contextSize = actualContext)
         activeFile = file
         needsHistoryRestore = true
-        gpuUnstableModels += file.absolutePath
-        backendOverrideNote = "GPU corruption detected -> automatic CPU fallback; Vulkan disabled for this model until app restart"
+        persistGpuBlacklist(file, "corrupted_logits")
+        prefs.edit().putString("mode", "cpu-performance").putBoolean("vulkan_retry_once", false).apply()
+        backendOverrideNote = "GPU corruption detected -> CPU performance fallback; Vulkan persistently disabled for this device/model until manually reset"
         lastCpuFallbackReloadMs = android.os.SystemClock.elapsedRealtime() - reloadStarted
         gpuFallbackCount++
 
@@ -275,14 +325,25 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             require(profile.canAttemptModelLoad(file.length())) {
                 "Ce modèle est trop grand pour être chargé de façon sûre sur cet appareil, ou Android dispose de moins de 384 Mo de mémoire immédiatement disponible."
             }
-            val forceCpu = file.absolutePath in gpuUnstableModels
-            val selectedMode = if (forceCpu) "cpu" else performanceMode
-            backendOverrideNote = if (forceCpu) {
-                "Vulkan disabled for this model until app restart after a previous corrupted GPU generation"
-            } else null
+            val explicitVulkanRetry = performanceMode == "performance" && consumeVulkanRetryOnce()
+            val forceCpu = isGpuBlacklisted(file) && !explicitVulkanRetry
+            val selectedMode = if (forceCpu) "cpu-performance" else performanceMode
+            backendOverrideNote = when {
+                forceCpu -> "Vulkan persistently disabled for this device/model after a previous corrupted GPU generation"
+                explicitVulkanRetry -> "Explicit one-shot Vulkan retry requested by user"
+                else -> null
+            }
 
             val options = profile.recommend(file.length(), selectedMode).let {
-                if (forceCpu) it.copy(gpuLayers = 0) else it
+                if (forceCpu) {
+                    val requestedContext = if (profile.totalRamBytes >= 8L * 1024 * 1024 * 1024) maxOf(4096, it.contextSize) else it.contextSize
+                    it.copy(
+                        gpuLayers = 0,
+                        threads = minOf(6, profile.cpuCores).coerceAtLeast(1),
+                        contextSize = requestedContext,
+                        batchSize = maxOf(256, it.batchSize),
+                    )
+                } else it
             }
             activeOptions = options
             val loadWallStarted = android.os.SystemClock.elapsedRealtime()
