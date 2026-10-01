@@ -434,10 +434,19 @@ int process_reasoning_user(const std::string &user, int maximum) {
     llama_tokens tokens;
     int effective = 0;
     int dropped_turns = 0;
+    prompt_render_us = 0;
+    prompt_tokenize_us = 0;
+    prompt_reused_tokens = 0;
+    prompt_decoded_tokens = 0;
 
     for (;;) {
+        const auto render_start = ggml_time_us();
         formatted = render_full_reasoning_chat(candidate);
+        prompt_render_us += ggml_time_us() - render_start;
+
+        const auto tokenize_start = ggml_time_us();
         tokens = tokenize_from_start(formatted, true);
+        prompt_tokenize_us += ggml_time_us() - tokenize_start;
         if (tokens.empty()) return 1;
 
         effective = pocketai::generation_limit(
@@ -453,22 +462,27 @@ int process_reasoning_user(const std::string &user, int maximum) {
         ++dropped_turns;
     }
 
-    // Qwen3-style templates are not guaranteed to be prefix-stable between turns
-    // when enable_thinking changes template branches. Rebuild the full structured
-    // prompt for each turn instead of trying to append a textual delta to the KV.
-    llama_memory_clear(llama_get_memory(context), false);
+    // Reuse only a token-identical prefix. Qwen3 templates may rewrite the tail
+    // between turns, so byte/string assumptions are unsafe. Exact token comparison
+    // lets us keep the stable KV prefix and recompute only the changed/new suffix.
+    size_t reusable = common_token_prefix(tokens, kv_tokens);
+    if (!tokens.empty() && reusable >= tokens.size()) reusable = tokens.size() - 1;
+    reusable = trim_kv_to_prefix(reusable);
+
     common_sampler_reset(sampler);
-    position = 0;
-    system_position = 0;
+    system_position = 0; // reasoning turns are managed as complete templated prompts
     cached_bytes.clear();
     assistant_text.clear();
     needs_end_of_turn = false;
     context_dirty = false;
 
+    llama_tokens suffix(tokens.begin() + static_cast<std::ptrdiff_t>(reusable), tokens.end());
     const auto start = ggml_time_us();
-    const int result = decode_prompt(tokens, true);
+    const int result = decode_prompt(suffix, true);
     prompt_us = ggml_time_us() - start;
     prompt_tokens = static_cast<int>(tokens.size());
+    prompt_reused_tokens = static_cast<int>(reusable);
+    prompt_decoded_tokens = static_cast<int>(suffix.size());
     if (result) return result;
 
     messages = std::move(candidate);
