@@ -48,6 +48,16 @@ class HardwareProfileTest {
         assertEquals(0, options.gpuLayers)
     }
 
+    @Test fun mmapModelCanExceedCurrentFreeRamWithoutBeingRejected() {
+        val phone = capable.copy(availableRamBytes = 3 * gib)
+        assertTrue(phone.canAttemptModelLoad(4 * gib))
+    }
+
+    @Test fun modelLoadAdmissionRejectsOnlyClearlyUnsafeCases() {
+        assertEquals(false, capable.copy(availableRamBytes = 300L * 1024 * 1024).canAttemptModelLoad(gib))
+        assertEquals(false, capable.canAttemptModelLoad(9 * gib))
+    }
+
     @Test fun inaccessibleCoreFrequenciesStillProduceValidThreadCount() {
         val options = capable.copy(cpuCores = 1, bigCores = 0).recommend(mode = "balanced")
         assertEquals(1, options.threads)
