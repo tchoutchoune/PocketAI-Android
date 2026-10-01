@@ -807,14 +807,20 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_nativeDiagnostics(JNIEnv *env, 
         << "; repeated-token streak: " << repeated_token_streak << '\n';
 
     const auto visible_text = pocketai::strip_thinking(assistant_text);
+    const auto hidden_thinking_text = pocketai::thinking_content(assistant_text);
     int visible_tokens_estimate = 0;
-    if (context && !visible_text.empty()) {
+    int hidden_thinking_tokens_estimate = 0;
+    if (context) {
         try {
-            visible_tokens_estimate = static_cast<int>(common_tokenize(context, visible_text, false, false).size());
-        } catch (...) { visible_tokens_estimate = 0; }
+            if (!visible_text.empty())
+                visible_tokens_estimate = static_cast<int>(common_tokenize(context, visible_text, false, false).size());
+            if (!hidden_thinking_text.empty())
+                hidden_thinking_tokens_estimate = static_cast<int>(common_tokenize(context, hidden_thinking_text, false, false).size());
+        } catch (...) {
+            visible_tokens_estimate = 0;
+            hidden_thinking_tokens_estimate = 0;
+        }
     }
-    const int hidden_thinking_tokens_estimate =
-        std::max(0, budget.produced - visible_tokens_estimate);
 
     const int64_t duration = generation_start ? (generation_end ? generation_end : ggml_time_us()) - generation_start : 0;
     out << "Load timing: model " << model_load_us / 1000.0
