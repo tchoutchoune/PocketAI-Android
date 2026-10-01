@@ -28,32 +28,40 @@ data class HardwareProfile(
         val normalizedMode = mode.lowercase(Locale.ROOT)
         val hot = thermalStatus >= PowerManager.THERMAL_STATUS_SEVERE
         val warm = thermalStatus >= PowerManager.THERMAL_STATUS_MODERATE
-        val eco = normalizedMode == "eco" || powerSave || hot
+        val eco = normalizedMode == "eco" || hot
         val performant = normalizedMode == "performance"
         val usableRam = minOf(availableRamBytes.coerceAtLeast(0), totalRamBytes * 65 / 100)
         val afterWeights = (usableRam - modelBytes.coerceAtLeast(0) - 384 * MIB).coerceAtLeast(0)
         val context = when {
-            eco || afterWeights < 512 * MIB -> 1024
-            performant && totalRamBytes >= 10 * GIB && afterWeights >= 3 * GIB -> 8192
-            afterWeights >= 1536 * MIB -> 4096
-            else -> 2048
+            eco || hugeModel || available < 768 * MIB -> 1024
+            performant && totalRamBytes >= 10 * GIB && available >= 2 * GIB -> 8192
+            totalRamBytes >= 8 * GIB && available >= 1536 * MIB -> 4096
+            totalRamBytes >= 6 * GIB && available >= 1024 * MIB -> 2048
+            else -> 1024
         }
         val threads = when {
             eco -> minOf(2, cpuCores)
+            powerSave && !performant -> minOf(2, cpuCores)
             warm -> minOf(3, bigCores.coerceAtLeast(1))
             performant -> minOf(8, bigCores.coerceAtLeast(1))
             else -> minOf(4, bigCores.coerceAtLeast(1))
         }.coerceAtLeast(1)
         val gpuLayers = when {
-            normalizedMode == "cpu" || eco || warm || vulkanVersion == null -> 0
-            afterWeights < 768 * MIB -> 0
-            performant && afterWeights >= 1536 * MIB -> 16
+            normalizedMode == "cpu" || eco || hot || vulkanVersion == null -> 0
+            available < 1024 * MIB || totalRamBytes < 6 * GIB -> 0
+            performant && totalRamBytes >= 10 * GIB -> 16
+            powerSave || warm -> 4
             else -> 8
         }
         return InferenceOptions(
             threads = threads,
             contextSize = context,
-            batchSize = if (eco || afterWeights < 512 * MIB) 64 else if (performant) 256 else 128,
+            batchSize = when {
+                context <= 1024 || eco -> 64
+                performant -> 256
+                powerSave -> 64
+                else -> 128
+            },
             gpuLayers = gpuLayers,
             temperature = 0.6f,
         )
