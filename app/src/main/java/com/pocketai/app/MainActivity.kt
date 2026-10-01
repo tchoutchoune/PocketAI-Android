@@ -45,6 +45,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var status: TextView
     private lateinit var modelBadge: TextView
     private lateinit var progress: ProgressBar
+    private lateinit var liveMetricsView: TextView
     private lateinit var messageList: RecyclerView
     private lateinit var sendButton: MaterialButton
     private lateinit var input: TextInputEditText
@@ -63,6 +64,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var stopButton: MaterialButton
     private lateinit var newButton: MaterialButton
     private var selectedTab = 0
+    private var followStreaming = true
 
     private val importPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let(model::importModel)
@@ -117,6 +119,13 @@ class MainActivity : AppCompatActivity() {
         stopButton = button("Arrêter") { model.stop() }.apply { visibility = View.GONE }
         statusRow.addView(stopButton)
         root.addView(statusRow)
+        liveMetricsView = text("", 11f).apply {
+            setPadding(dp(16), 0, dp(16), dp(6))
+            setTextColor(Color.parseColor("#8FB6C9"))
+            visibility = View.GONE
+            maxLines = 3
+        }
+        root.addView(liveMetricsView)
         progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { isIndeterminate = true; visibility = View.GONE }
         root.addView(progress, LinearLayout.LayoutParams(-1, dp(3)))
         val content = android.widget.FrameLayout(this)
@@ -154,20 +163,27 @@ class MainActivity : AppCompatActivity() {
                 model.state.collect { state ->
                     status.text = state.status
                     modelBadge.text = state.modelName?.let { "Local · $it" } ?: "Choisis un modèle dans l’onglet Modèles"
+                    liveMetricsView.text = state.liveMetrics
+                    liveMetricsView.visibility = if (state.liveMetrics.isBlank()) View.GONE else View.VISIBLE
                     progress.visibility = if (state.busy) View.VISIBLE else View.GONE
                     stopButton.visibility = if (state.busy) View.VISIBLE else View.GONE
                     newButton.isEnabled = !state.busy
                     sendButton.text = if (state.busy) "Arrêter" else "Envoyer"
                     input.isEnabled = !state.busy
                     webToggle.isEnabled = !state.busy
-                    val wasAtBottom = !messageList.canScrollVertically(1)
                     val oldCount = shownMessages.size
                     if (shownMessages != state.messages) {
                         val changed = shownMessages.size == state.messages.size && shownMessages.dropLast(1) == state.messages.dropLast(1)
                         shownMessages.clear(); shownMessages.addAll(state.messages)
                         if (changed && shownMessages.isNotEmpty()) adapter.notifyItemChanged(shownMessages.lastIndex)
                         else adapter.notifyDataSetChanged()
-                        if (wasAtBottom || state.messages.size > oldCount) messageList.scrollToPosition((shownMessages.size - 1).coerceAtLeast(0))
+                        if (state.messages.size > oldCount) followStreaming = true
+                        if (followStreaming && shownMessages.isNotEmpty()) {
+                            messageList.post {
+                                messageList.scrollToPosition(shownMessages.lastIndex)
+                                messageList.scrollBy(0, Int.MAX_VALUE)
+                            }
+                        }
                     }
                     val key = state.busy to state.modelName
                     if (key != lastModelsKey) { renderModels(); lastModelsKey = key }
@@ -207,6 +223,16 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(4), dp(8), dp(4), dp(8))
             clipToPadding = false
             itemAnimator = null
+            addOnScrollListener(object : RecyclerView.OnScrollListener() {
+                override fun onScrollStateChanged(recyclerView: RecyclerView, newState: Int) {
+                    if (newState == RecyclerView.SCROLL_STATE_DRAGGING) followStreaming = false
+                    if (newState == RecyclerView.SCROLL_STATE_IDLE && !recyclerView.canScrollVertically(1)) followStreaming = true
+                }
+
+                override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
+                    if (!recyclerView.canScrollVertically(1)) followStreaming = true
+                }
+            })
         }
         chat.addView(messageList, LinearLayout.LayoutParams(-1, 0, 1f))
         val compose = row().apply { gravity = Gravity.BOTTOM; setPadding(dp(12), dp(6), dp(12), dp(8)) }
