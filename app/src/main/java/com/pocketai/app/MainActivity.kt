@@ -326,10 +326,11 @@ class MainActivity : AppCompatActivity() {
         })
         settingsPanel.addView(text("La RAM détermine la taille du contexte ; les cœurs CPU et Vulkan sont détectés automatiquement. La chauffe réduit les threads pendant la génération. Le GPU est activé seulement si le moteur le confirme.", 14f))
         settingsPanel.addView(button("Longueur maximale : ${model.maxTokens} tokens") {
-            val values = intArrayOf(256, 512, 1024, 2048)
+            val values = intArrayOf(256, 512, 1024, 2048, 4096, 8192)
             MaterialAlertDialogBuilder(this).setTitle("Longueur des réponses")
                 .setItems(values.map { "$it tokens" }.toTypedArray()) { _, index -> model.maxTokens = values[index]; renderSettings() }.show()
         })
+        settingsPanel.addView(text("La longueur choisie est un maximum. PocketAI calcule la limite réellement sûre avec le tokenizer du modèle et l’espace restant dans le contexte, sans supprimer la question en cours.", 13f))
         settingsPanel.addView(text("Services en ligne facultatifs", 18f, true))
         settingsPanel.addView(text("Aucun envoi en ligne sans action explicite. La recherche transmet la question à Brave. Les générations d’image/vidéo transmettent leur description au fournisseur. Les clés sont chiffrées sur ce téléphone et exclues des sauvegardes.", 14f))
         settingsPanel.addView(button("Recherche web · ${if (model.settings.hasBraveKey) "configurée" else "à configurer"}") { onlineDialog("web") })
