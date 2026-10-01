@@ -3,6 +3,7 @@ package com.arm.aichat
 import com.arm.aichat.InferenceEngine.State
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
+import java.io.IOException
 
 /**
  * Interface defining the core LLM inference operations.
@@ -99,3 +100,7 @@ val State.isModelLoaded: Boolean
         this is State.Generating
 
 class UnsupportedArchitectureException : Exception()
+
+/** Raised when native GPU inference returns a degenerate repeated-token stream. */
+class GpuOutputCorruptionException(cause: Throwable? = null) :
+    IOException("GPU output corruption detected", cause)
