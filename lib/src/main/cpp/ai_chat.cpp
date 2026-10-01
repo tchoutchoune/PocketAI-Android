@@ -259,6 +259,10 @@ bool make_turn_room(int required) {
     auto memory = llama_get_memory(context);
     if (!memory || !llama_memory_seq_rm(memory, 0, system_position, position)) return false;
     position = system_position;
+    if (kv_tokens.size() >= static_cast<size_t>(system_position))
+        kv_tokens.resize(static_cast<size_t>(system_position));
+    else
+        kv_tokens.clear();
 
     if (!messages.empty() && messages.front().role == "system") messages.resize(1);
     else messages.clear();
@@ -279,10 +283,48 @@ int decode_prompt(const llama_tokens &tokens, bool last_logit) {
             common_batch_add(batch, tokens[offset + i], position + i, {0}, last_logit && offset + i + 1 == tokens.size());
         const int result = llama_decode(context, batch);
         if (result) { context_dirty = true; return cancelled.load() ? 3 : 2; }
+        kv_tokens.insert(kv_tokens.end(), tokens.begin() + static_cast<std::ptrdiff_t>(offset),
+                         tokens.begin() + static_cast<std::ptrdiff_t>(offset + count));
         position += count;
         offset += count;
     }
     return 0;
+}
+
+size_t common_token_prefix(const llama_tokens &left, const std::vector<llama_token> &right) {
+    const size_t limit = std::min(left.size(), right.size());
+    size_t prefix = 0;
+    while (prefix < limit && left[prefix] == right[prefix]) ++prefix;
+    return prefix;
+}
+
+/**
+ * Keep an exact token-identical KV prefix. Re-evaluate at least the final prompt
+ * token afterwards so llama.cpp exposes logits for the current prompt rather than
+ * stale logits from an older, longer sequence.
+ */
+size_t trim_kv_to_prefix(size_t requested_prefix) {
+    if (!context || kv_tokens.size() != static_cast<size_t>(position)) {
+        llama_memory_clear(llama_get_memory(context), false);
+        kv_tokens.clear();
+        position = 0;
+        return 0;
+    }
+
+    const size_t prefix = std::min(requested_prefix, kv_tokens.size());
+    if (prefix == kv_tokens.size()) return prefix;
+
+    auto memory = llama_get_memory(context);
+    if (!memory || !llama_memory_seq_rm(memory, 0, static_cast<llama_pos>(prefix), position)) {
+        llama_memory_clear(memory, false);
+        kv_tokens.clear();
+        position = 0;
+        return 0;
+    }
+
+    position = static_cast<llama_pos>(prefix);
+    kv_tokens.resize(prefix);
+    return prefix;
 }
 
 std::string format_message(const std::string &role, const std::string &content, bool add_assistant) {
@@ -777,6 +819,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(JNIEnv *env, 
             return nullptr;
         }
         ++position;
+        kv_tokens.push_back(token);
         if (llama_vocab_is_eog(llama_model_get_vocab(model), token)) { generation_eog = true; finish_generation(); return nullptr; }
         budget.consume();
         cached_bytes += common_token_to_piece(context, token);
