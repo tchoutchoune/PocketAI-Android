@@ -148,8 +148,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val backend = if (activeOptions.gpuLayers > 0) "CPU+Vulkan" else "CPU"
         val headroom = thermalHeadroom()?.let { " · marge %.2f".format(it) }.orEmpty()
         val battery = batteryTemperatureC()?.let { " · batt. %.1f°C".format(it) }.orEmpty()
-        return ("%s · threads %d/%d · %.2f tok/s\nCPU proc. %.1f cœurs · RAM %d Mio · thermique %s%s%s").format(
-            backend, currentThreadLimit, activeOptions.threads, tps, cpuCoresUsed,
+        return ("%s · threads %d/%d · %.2f tok/s · ctx %d · batch %d · max %d\nCPU proc. %.1f cœurs · RAM %d Mio · thermique %s%s%s").format(
+            backend, currentThreadLimit, activeOptions.threads, tps,
+            activeOptions.contextSize, activeOptions.batchSize, maxTokens, cpuCoresUsed,
             memoryAvailableMiB(), thermalLabel(currentThermalStatus), headroom, battery
         )
     }
