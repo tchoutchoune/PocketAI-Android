@@ -6,12 +6,31 @@
 
 namespace pocketai {
 struct GenerationBudget {
+    int requested = 0;
     int limit = 0;
     int produced = 0;
-    void start(int maximum) { limit = maximum; produced = 0; }
+
+    void start(int maximum, int effective = -1) {
+        requested = std::max(0, maximum);
+        limit = effective < 0 ? requested : std::min(requested, std::max(0, effective));
+        produced = 0;
+    }
+
     bool exhausted() const { return produced >= limit; }
+    bool context_limited() const { return limit < requested; }
     void consume() { ++produced; }
 };
+
+/**
+ * Compute a safe generation budget from the real tokenized prompt.
+ * capacity is the usable context after native safety headroom.
+ */
+inline int generation_limit(int capacity, int system, int prompt_tokens, int requested, int minimum = 1) {
+    if (capacity <= 0 || system < 0 || prompt_tokens < 1 || requested < 1 || minimum < 1) return 0;
+    const int available = capacity - system - prompt_tokens;
+    if (available < minimum) return 0;
+    return std::min(requested, available);
+}
 
 inline int discard_count(int position, int system, int required, int capacity) {
     if (position + required <= capacity) return 0;
