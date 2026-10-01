@@ -5,6 +5,7 @@ import android.os.PowerManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.arm.aichat.AiChat
+import com.arm.aichat.GpuOutputCorruptionException
 import com.arm.aichat.InferenceEngine
 import com.arm.aichat.InferenceOptions
 import kotlinx.coroutines.CancellationException
@@ -45,6 +46,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var activeFile: File? = null
     private var activeOptions = InferenceOptions()
     private var needsHistoryRestore = true
+    private val gpuUnstableModels = mutableSetOf<String>()
+    private var backendOverrideNote: String? = null
     private val power = application.getSystemService(PowerManager::class.java)
     private var thermalRegistered = false
     private val thermalListener = PowerManager.OnThermalStatusChangedListener { status ->
@@ -82,6 +85,43 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun update(transform: (ChatUiState) -> ChatUiState) {
         mutableState.update(transform)
+    }
+
+    private fun diagnosticsWithSessionNote(raw: String): String =
+        backendOverrideNote?.let { "$raw\nApp fallback: $it" } ?: raw
+
+    private suspend fun reloadActiveModelOnCpu(file: File): String {
+        val inference = inference()
+        val profile = HardwareProfile.detect(getApplication())
+        val cpuOptions = profile.recommend(file.length(), "cpu").copy(gpuLayers = 0)
+
+        update { it.copy(status = "GPU instable détecté · bascule automatique sur CPU…") }
+        inference.cleanUp()
+        activeOptions = cpuOptions
+        inference.configure(cpuOptions)
+        inference.loadModel(file.absolutePath)
+        inference.setSystemPrompt(SYSTEM_PROMPT)
+        thermalListener.onThermalStatusChanged(runCatching { power.currentThermalStatus }.getOrDefault(0))
+
+        val raw = inference.diagnostics()
+        val actualContext = Regex("Context: (\\d+)").find(raw)?.groupValues?.getOrNull(1)?.toIntOrNull()
+            ?.coerceIn(512, cpuOptions.contextSize) ?: cpuOptions.contextSize
+        activeOptions = cpuOptions.copy(contextSize = actualContext)
+        activeFile = file
+        needsHistoryRestore = true
+        gpuUnstableModels += file.absolutePath
+        backendOverrideNote = "GPU corruption detected -> automatic CPU fallback; Vulkan disabled for this model until app restart"
+
+        val info = diagnosticsWithSessionNote(raw)
+        logs.event("gpu_corruption_cpu_fallback model=${file.name} options=$activeOptions diagnostics=$info")
+        update {
+            it.copy(
+                modelName = file.nameWithoutExtension,
+                status = "CPU de secours · ${activeOptions.threads} threads · ${activeOptions.contextSize} tokens",
+                diagnostics = info,
+            )
+        }
+        return info
     }
 
     private fun task(label: String, block: suspend () -> Unit) {
@@ -140,18 +180,27 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             require(profile.canAttemptModelLoad(file.length())) {
                 "Ce modèle est trop grand pour être chargé de façon sûre sur cet appareil, ou Android dispose de moins de 384 Mo de mémoire immédiatement disponible."
             }
-            val options = profile.recommend(file.length(), performanceMode)
+            val forceCpu = file.absolutePath in gpuUnstableModels
+            val selectedMode = if (forceCpu) "cpu" else performanceMode
+            backendOverrideNote = if (forceCpu) {
+                "Vulkan disabled for this model until app restart after a previous corrupted GPU generation"
+            } else null
+
+            val options = profile.recommend(file.length(), selectedMode).let {
+                if (forceCpu) it.copy(gpuLayers = 0) else it
+            }
             activeOptions = options
             inference.configure(options)
             inference.loadModel(file.absolutePath)
             inference.setSystemPrompt(SYSTEM_PROMPT)
             thermalListener.onThermalStatusChanged(runCatching { power.currentThermalStatus }.getOrDefault(0))
-            val info = inference.diagnostics()
-            val actualContext = Regex("Context: (\\d+)").find(info)?.groupValues?.getOrNull(1)?.toIntOrNull()
+            val rawInfo = inference.diagnostics()
+            val actualContext = Regex("Context: (\\d+)").find(rawInfo)?.groupValues?.getOrNull(1)?.toIntOrNull()
                 ?.coerceIn(512, options.contextSize) ?: options.contextSize
             activeOptions = options.copy(contextSize = actualContext)
             activeFile = file
             needsHistoryRestore = true
+            val info = diagnosticsWithSessionNote(rawInfo)
             logs.event("model_ready options=$activeOptions diagnostics=$info")
             prefs.edit().putString("lastModel", file.name).apply()
             update { it.copy(modelName = file.nameWithoutExtension, status = "Prêt · ${activeOptions.threads} threads · ${activeOptions.contextSize} tokens", diagnostics = info) }
