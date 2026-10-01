@@ -7,11 +7,11 @@ android {
     compileSdk = 36
     ndkVersion = "29.0.13113456"
     defaultConfig {
-        applicationId = "com.pocketai.app"
+        applicationId = "io.github.tchoutchoune.pocketai.contextfix"
         minSdk = 33
         targetSdk = 36
-        versionCode = 400
-        versionName = "4.0"
+        versionCode = 402
+        versionName = "4.0.2-contextfix"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk { abiFilters += "arm64-v8a" }
     }
