@@ -178,6 +178,41 @@ llama_context *new_context(int requested = 0) {
     return llama_init_from_model(model, params);
 }
 
+int desired_context_size() {
+    const int trained = llama_model_n_ctx_train(model);
+    return std::max(512, std::min(options.context, trained > 0 ? trained : options.context));
+}
+
+llama_context *new_context_with_fallback(int &selected) {
+    const int desired = desired_context_size();
+    std::vector<int> candidates{desired};
+    for (const int candidate : {16384, 8192, 4096, 2048, 1024, 512}) {
+        if (candidate < desired && std::find(candidates.begin(), candidates.end(), candidate) == candidates.end())
+            candidates.push_back(candidate);
+    }
+
+    for (const int candidate : candidates) {
+        if (cancelled.load()) break;
+        try {
+            auto *attempt = new_context(candidate);
+            if (attempt) {
+                selected = static_cast<int>(llama_n_ctx(attempt));
+                return attempt;
+            }
+        } catch (...) {
+            // Try the next conservative context size.
+        }
+    }
+    selected = 0;
+    return nullptr;
+}
+
+void append_fallback(const std::string &message) {
+    if (message.empty()) return;
+    if (!fallback.empty()) fallback += "; ";
+    fallback += message;
+}
+
 bool make_room(int required) {
     const int capacity = static_cast<int>(llama_n_ctx(context)) - HEADROOM;
     const int discard = pocketai::discard_count(position, system_position, required, capacity);
@@ -368,14 +403,28 @@ extern "C" JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv *, jobject) {
     if (!model) return 1;
     free_context();
-    try { context = new_context(); } catch (...) { context = nullptr; }
+
+    int selected_context = 0;
+    const int requested_context = desired_context_size();
+    context = new_context_with_fallback(selected_context);
+
     if (!context && gpu_layers > 0 && !cancelled.load()) {
         llama_model_free(model); model = nullptr;
         gpu_layers = 0;
         fallback = "GPU context allocation failed; CPU fallback";
         log_event(ANDROID_LOG_WARN, "Retrying context on CPU");
-        try { if (load_selected_model(false)) context = new_context(); } catch (...) { context = nullptr; }
+        try {
+            if (load_selected_model(false)) {
+                const int cpu_requested_context = desired_context_size();
+                context = new_context_with_fallback(selected_context);
+                if (context && selected_context < cpu_requested_context)
+                    append_fallback("context reduced to " + std::to_string(selected_context) + " tokens");
+            }
+        } catch (...) { context = nullptr; }
+    } else if (context && selected_context < requested_context) {
+        append_fallback("context reduced to " + std::to_string(selected_context) + " tokens");
     }
+
     if (!context || cancelled.load()) { free_context(); return 1; }
     try {
         batch = llama_batch_init(options.batch, 0, 1);
