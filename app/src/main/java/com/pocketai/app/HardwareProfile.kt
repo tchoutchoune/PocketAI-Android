@@ -33,8 +33,9 @@ data class HardwareProfile(
         val usableRam = minOf(availableRamBytes.coerceAtLeast(0), totalRamBytes * 65 / 100)
         val afterWeights = (usableRam - modelBytes.coerceAtLeast(0) - 384 * MIB).coerceAtLeast(0)
         val context = when {
-            eco || afterWeights < 384 * MIB -> 1024
-            performant && totalRamBytes >= 8 * GIB && afterWeights >= 1536 * MIB -> 4096
+            eco || afterWeights < 512 * MIB -> 1024
+            performant && totalRamBytes >= 10 * GIB && afterWeights >= 3 * GIB -> 8192
+            afterWeights >= 1536 * MIB -> 4096
             else -> 2048
         }
         val threads = when {
@@ -52,7 +53,7 @@ data class HardwareProfile(
         return InferenceOptions(
             threads = threads,
             contextSize = context,
-            batchSize = if (eco || afterWeights < 384 * MIB) 64 else if (performant) 256 else 128,
+            batchSize = if (eco || afterWeights < 512 * MIB) 64 else if (performant) 256 else 128,
             gpuLayers = gpuLayers,
             temperature = 0.6f,
         )
