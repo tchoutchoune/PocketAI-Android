@@ -23,6 +23,16 @@ data class HardwareProfile(
             "$cpuCores cœurs · ${if (vulkanVersion != null) "Vulkan $vulkanVersion disponible à vérifier" else "CPU"}" +
             if (powerSave) " · économie d’énergie" else ""
 
+    /**
+     * GGUF weights are memory-mapped by llama.cpp, so comparing the whole file size
+     * to ActivityManager.availMem is invalid and rejects usable models. Refuse only
+     * obviously unsafe cases; native context allocation provides the final fallback.
+     */
+    fun canAttemptModelLoad(modelBytes: Long): Boolean =
+        modelBytes > 0 &&
+            availableRamBytes >= 384 * MIB &&
+            modelBytes <= totalRamBytes * 70 / 100
+
     /** Keep memory for Android, weights, KV cache, and (when used) GPU allocations. */
     fun recommend(modelBytes: Long = 0, mode: String = "balanced"): InferenceOptions {
         val normalizedMode = mode.lowercase(Locale.ROOT)
