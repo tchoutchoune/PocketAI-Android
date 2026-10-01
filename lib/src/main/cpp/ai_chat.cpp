@@ -34,6 +34,7 @@ common_chat_templates_ptr templates;
 common_sampler *sampler = nullptr;
 bool template_supports_thinking = false;
 std::vector<common_chat_msg> messages;
+std::vector<llama_token> kv_tokens;
 std::string system_prompt;
 std::string model_path;
 std::string cached_bytes;
@@ -60,8 +61,12 @@ int64_t generation_end = 0;
 int64_t model_load_us = 0;
 int64_t context_prepare_us = 0;
 int64_t system_prompt_us = 0;
+int64_t prompt_render_us = 0;
+int64_t prompt_tokenize_us = 0;
 int64_t prompt_us = 0;
 int prompt_tokens = 0;
+int prompt_reused_tokens = 0;
+int prompt_decoded_tokens = 0;
 int fallback_events = 0;
 llama_token last_generated_token = -1;
 int repeated_token_streak = 0;
@@ -124,6 +129,7 @@ void clear_conversation() {
     if (context) llama_memory_clear(llama_get_memory(context), false);
     if (sampler) common_sampler_reset(sampler);
     messages.clear();
+    kv_tokens.clear();
     position = system_position = 0;
     cached_bytes.clear();
     assistant_text.clear();
@@ -146,6 +152,7 @@ void free_context() {
     if (batch_allocated) { llama_batch_free(batch); batch = {}; batch_allocated = false; }
     if (context) { llama_free(context); context = nullptr; }
     messages.clear();
+    kv_tokens.clear();
     position = system_position = 0;
     cached_bytes.clear();
     assistant_text.clear();
@@ -164,8 +171,12 @@ void free_model() {
     model_load_us = 0;
     context_prepare_us = 0;
     system_prompt_us = 0;
+    prompt_render_us = 0;
+    prompt_tokenize_us = 0;
     prompt_us = 0;
     prompt_tokens = 0;
+    prompt_reused_tokens = 0;
+    prompt_decoded_tokens = 0;
     fallback_events = 0;
 }
 
