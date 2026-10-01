@@ -521,26 +521,45 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_resetCancellation(JNIEnv *, job
 extern "C" JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstring path) {
     free_model();
+    const auto load_start = ggml_time_us();
     model_path = java_text(env, path);
     fallback.clear();
     const bool want_gpu = options.gpu_layers > 0 && gpu;
-    if (options.gpu_layers > 0 && !gpu) fallback = "Vulkan device unavailable; CPU selected";
-    try { if (load_selected_model(want_gpu)) return 0; }
-    catch (...) { log_event(ANDROID_LOG_WARN, "Model backend load failed"); }
-    if (cancelled.load()) return 3;
+    if (options.gpu_layers > 0 && !gpu) {
+        fallback = "Vulkan device unavailable; CPU selected";
+        ++fallback_events;
+    }
+    try {
+        if (load_selected_model(want_gpu)) {
+            model_load_us = ggml_time_us() - load_start;
+            return 0;
+        }
+    } catch (...) { log_event(ANDROID_LOG_WARN, "Model backend load failed"); }
+    if (cancelled.load()) {
+        model_load_us = ggml_time_us() - load_start;
+        return 3;
+    }
     if (want_gpu) {
         if (model) { llama_model_free(model); model = nullptr; }
         gpu_layers = 0;
         fallback = "GPU model allocation failed; CPU fallback";
+        ++fallback_events;
         log_event(ANDROID_LOG_WARN, "Retrying model on CPU");
-        try { if (load_selected_model(false)) return 0; } catch (...) { }
+        try {
+            if (load_selected_model(false)) {
+                model_load_us = ggml_time_us() - load_start;
+                return 0;
+            }
+        } catch (...) { }
     }
+    model_load_us = ggml_time_us() - load_start;
     return 1;
 }
 
 extern "C" JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv *, jobject) {
     if (!model) return 1;
+    const auto prepare_start = ggml_time_us();
     free_context();
 
     int selected_context = 0;
@@ -551,6 +570,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv *, jobject) {
         llama_model_free(model); model = nullptr;
         gpu_layers = 0;
         fallback = "GPU context allocation failed; CPU fallback";
+        ++fallback_events;
         log_event(ANDROID_LOG_WARN, "Retrying context on CPU");
         try {
             if (load_selected_model(false)) {
@@ -562,6 +582,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv *, jobject) {
         } catch (...) { context = nullptr; }
     } else if (context && selected_context < requested_context) {
         append_fallback("context reduced to " + std::to_string(selected_context) + " tokens");
+        ++fallback_events;
     }
 
     if (!context || cancelled.load()) { free_context(); return 1; }
@@ -582,6 +603,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv *, jobject) {
         prompt_tokens = 0;
         prompt_us = 0;
         generation_start = generation_end = 0;
+        context_prepare_us = ggml_time_us() - prepare_start;
         log_event(ANDROID_LOG_INFO, gpu_layers > 0 ? "Vulkan model ready" : "CPU model ready");
         return 0;
     } catch (...) { free_context(); return 1; }
@@ -590,8 +612,17 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv *, jobject) {
 extern "C" JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(JNIEnv *env, jobject, jstring text) {
     if (!context) return 2;
-    try { system_prompt = java_text(env, text); return install_system_prompt(); }
-    catch (...) { context_dirty = true; return 2; }
+    const auto start = ggml_time_us();
+    try {
+        system_prompt = java_text(env, text);
+        const int result = install_system_prompt();
+        system_prompt_us = ggml_time_us() - start;
+        return result;
+    } catch (...) {
+        system_prompt_us = ggml_time_us() - start;
+        context_dirty = true;
+        return 2;
+    }
 }
 
 extern "C" JNIEXPORT jint JNICALL
