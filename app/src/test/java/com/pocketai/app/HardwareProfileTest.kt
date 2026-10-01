@@ -27,13 +27,16 @@ class HardwareProfileTest {
         assertEquals(4096, balanced.contextSize)
     }
 
-    @Test fun batterySaverLimitsBalancedButExplicitCpuPerformanceCanUseMoreCores() {
+    @Test fun batterySaverModeratesBalancedButExplicitAutonomyIsStricter() {
         val phone = capable.copy(powerSave = true)
-        val saving = phone.recommend(gib, "balanced")
+        val balanced = phone.recommend(gib, "balanced")
+        val eco = phone.recommend(gib, "eco")
         val fastCpu = phone.recommend(gib, "cpu-performance")
-        assertTrue(saving.threads <= 2)
-        assertEquals(0, saving.gpuLayers)
-        assertEquals(64, saving.batchSize)
+        assertEquals(3, balanced.threads)
+        assertEquals(0, balanced.gpuLayers)
+        assertEquals(128, balanced.batchSize)
+        assertTrue(eco.threads <= 2)
+        assertEquals(64, eco.batchSize)
         assertEquals(6, fastCpu.threads)
         assertEquals(0, fastCpu.gpuLayers)
         assertEquals(256, fastCpu.batchSize)
