@@ -137,8 +137,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         try {
             inference.cleanUp()
             val profile = HardwareProfile.detect(getApplication())
-            require(file.length() <= profile.availableRamBytes * 75 / 100) {
-                "La mémoire disponible est trop faible pour ce modèle. Ferme les autres applications ou choisis un modèle plus petit."
+            require(profile.canAttemptModelLoad(file.length())) {
+                "Ce modèle est trop grand pour être chargé de façon sûre sur cet appareil, ou Android dispose de moins de 384 Mo de mémoire immédiatement disponible."
             }
             val options = profile.recommend(file.length(), performanceMode)
             activeOptions = options
