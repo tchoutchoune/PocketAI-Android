@@ -30,8 +30,8 @@ data class HardwareProfile(
         val warm = thermalStatus >= PowerManager.THERMAL_STATUS_MODERATE
         val eco = normalizedMode == "eco" || hot
         val performant = normalizedMode == "performance"
-        val usableRam = minOf(availableRamBytes.coerceAtLeast(0), totalRamBytes * 65 / 100)
-        val afterWeights = (usableRam - modelBytes.coerceAtLeast(0) - 384 * MIB).coerceAtLeast(0)
+        val available = availableRamBytes.coerceAtLeast(0)
+        val hugeModel = modelBytes > totalRamBytes * 55 / 100
         val context = when {
             eco || hugeModel || available < 768 * MIB -> 1024
             performant && totalRamBytes >= 10 * GIB && available >= 2 * GIB -> 8192
