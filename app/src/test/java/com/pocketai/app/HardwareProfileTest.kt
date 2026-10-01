@@ -14,6 +14,11 @@ class HardwareProfileTest {
         assertTrue(capable.recommend(gib, "performance").gpuLayers > 0)
     }
 
+    @Test fun ampleMemoryScalesContextWithoutIgnoringMode() {
+        assertEquals(4096, capable.recommend(gib, "balanced").contextSize)
+        assertEquals(8192, capable.recommend(gib, "performance").contextSize)
+    }
+
     @Test fun powerSavingAndOverheatingReducePerformanceProfile() {
         val saving = capable.copy(powerSave = true).recommend(gib, "performance")
         val hot = capable.copy(thermalStatus = PowerManager.THERMAL_STATUS_SEVERE).recommend(gib, "performance")
