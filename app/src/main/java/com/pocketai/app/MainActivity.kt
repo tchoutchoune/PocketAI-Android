@@ -352,12 +352,25 @@ class MainActivity : AppCompatActivity() {
                 }.setNegativeButton("Fermer", null).show()
         })
         settingsPanel.addView(text("CPU · performance utilise davantage de cœurs et un batch plus grand pour accélérer surtout l’historique et les prompts longs. Vulkan reste expérimental sur Android et peut basculer automatiquement sur CPU si la sortie devient incohérente. La chauffe réduit toujours les threads.", 14f))
-        settingsPanel.addView(button("Longueur maximale : ${model.maxTokens} tokens") {
-            val values = intArrayOf(256, 512, 1024, 2048, 4096, 8192)
+        val lengthLabel = if (model.autoLength) {
+            "Auto · jusqu’à ${model.effectiveMaxTokens()} tokens"
+        } else {
+            "${model.maxTokens} tokens"
+        }
+        settingsPanel.addView(button("Longueur : $lengthLabel") {
+            val labels = arrayOf("Auto · recommandé", "256 tokens", "512 tokens", "1024 tokens", "2048 tokens", "4096 tokens", "8192 tokens")
+            val values = intArrayOf(0, 256, 512, 1024, 2048, 4096, 8192)
             MaterialAlertDialogBuilder(this).setTitle("Longueur des réponses")
-                .setItems(values.map { "$it tokens" }.toTypedArray()) { _, index -> model.maxTokens = values[index]; renderSettings() }.show()
+                .setItems(labels) { _, index ->
+                    if (values[index] == 0) model.autoLength = true
+                    else {
+                        model.maxTokens = values[index]
+                        model.autoLength = false
+                    }
+                    renderSettings()
+                }.show()
         })
-        settingsPanel.addView(text("La longueur choisie est un maximum. PocketAI calcule la limite réellement sûre avec le tokenizer du modèle et l’espace restant dans le contexte, sans supprimer la question en cours.", 13f))
+        settingsPanel.addView(text("En mode Auto, PocketAI adapte la longueur au contexte, au profil et à la pression thermique pour éviter les générations de plusieurs minutes. Une valeur manuelle reste disponible pour les réponses volontairement très longues.", 13f))
         settingsPanel.addView(text("Services en ligne facultatifs", 18f, true))
         settingsPanel.addView(text("Aucun envoi en ligne sans action explicite. La recherche transmet la question à Brave. Les générations d’image/vidéo transmettent leur description au fournisseur. Les clés sont chiffrées sur ce téléphone et exclues des sauvegardes.", 14f))
         settingsPanel.addView(button("Recherche web · ${if (model.settings.hasBraveKey) "configurée" else "à configurer"}") { onlineDialog("web") })
