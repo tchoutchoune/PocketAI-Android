@@ -315,16 +315,17 @@ class MainActivity : AppCompatActivity() {
         settingsPanel.removeAllViews(); pad(settingsPanel)
         settingsPanel.addView(text("Ton PocketAI", 22f, true))
         settingsPanel.addView(text("Performances", 18f, true))
-        val modeLabels = arrayOf("Automatique · équilibré", "Performances", "Autonomie", "CPU uniquement")
-        val modes = arrayOf("balanced", "performance", "eco", "cpu")
-        settingsPanel.addView(button("Profil : ${modeLabels[modes.indexOf(model.performanceMode).coerceAtLeast(0)]}") {
+        val modeLabels = arrayOf("CPU · équilibré", "CPU · performance", "Autonomie", "Vulkan · expérimental")
+        val modes = arrayOf("balanced", "cpu-performance", "eco", "performance")
+        val selectedMode = modes.indexOf(model.performanceMode).coerceAtLeast(0)
+        settingsPanel.addView(button("Profil : ${modeLabels[selectedMode]}") {
             MaterialAlertDialogBuilder(this).setTitle("Profil matériel")
-                .setSingleChoiceItems(modeLabels, modes.indexOf(model.performanceMode).coerceAtLeast(0)) { dialog, index ->
+                .setSingleChoiceItems(modeLabels, selectedMode) { dialog, index ->
                     model.performanceMode = modes[index]; dialog.dismiss(); renderSettings()
                     toast("Profil appliqué au prochain chargement du modèle")
                 }.setNegativeButton("Fermer", null).show()
         })
-        settingsPanel.addView(text("La RAM détermine la taille du contexte ; les cœurs CPU et Vulkan sont détectés automatiquement. La chauffe réduit les threads pendant la génération. Le GPU est activé seulement si le moteur le confirme.", 14f))
+        settingsPanel.addView(text("CPU · performance utilise davantage de cœurs et un batch plus grand pour accélérer surtout l’historique et les prompts longs. Vulkan reste expérimental sur Android et peut basculer automatiquement sur CPU si la sortie devient incohérente. La chauffe réduit toujours les threads.", 14f))
         settingsPanel.addView(button("Longueur maximale : ${model.maxTokens} tokens") {
             val values = intArrayOf(256, 512, 1024, 2048, 4096, 8192)
             MaterialAlertDialogBuilder(this).setTitle("Longueur des réponses")
