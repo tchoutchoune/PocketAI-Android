@@ -100,14 +100,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun effectiveMaxTokens(): Int {
         if (!autoLength) return maxTokens
         val contextCap = (activeOptions.contextSize / 4).coerceIn(256, 1024)
+        val modelBytes = activeFile?.length() ?: 0L
+        val modelCap = when {
+            modelBytes >= 2L * 1024 * 1024 * 1024 -> 512
+            modelBytes >= 1L * 1024 * 1024 * 1024 -> 768
+            else -> 1024
+        }
         val profileCap = if (performanceMode == "eco") minOf(contextCap, 384) else contextCap
         val thermalCap = when {
             currentThermalStatus >= PowerManager.THERMAL_STATUS_CRITICAL -> 256
             currentThermalStatus >= PowerManager.THERMAL_STATUS_SEVERE -> 384
-            currentThermalStatus >= PowerManager.THERMAL_STATUS_MODERATE -> 768
+            currentThermalStatus >= PowerManager.THERMAL_STATUS_MODERATE -> 512
             else -> 1024
         }
-        return minOf(profileCap, thermalCap).coerceAtLeast(128)
+        return minOf(profileCap, modelCap, thermalCap).coerceAtLeast(128)
     }
 
     init {
@@ -192,6 +198,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         append("\nApp load timing: model-wall ").append(lastModelLoadWallMs)
             .append(" ms; last-cpu-reload-wall ").append(lastCpuFallbackReloadMs)
             .append(" ms; gpu-fallbacks ").append(gpuFallbackCount)
+            .append("; gpu-blacklist ").append(gpuBlacklistCount)
+            .append("; auto-length ").append(autoLength)
+            .append("; effective-max ").append(effectiveMaxTokens())
     }
     private fun gpuStabilityKey(file: File): String =
         listOf(Build.MANUFACTURER, Build.MODEL, Build.DEVICE, file.name, file.length().toString()).joinToString("|")
