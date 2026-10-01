@@ -13,8 +13,20 @@ int main() {
     }
     assert(budget.exhausted());
     assert(budget.produced == 3);
-    budget.start(1);
+    budget.start(10, 3);
+    assert(budget.requested == 10);
+    assert(budget.limit == 3);
+    assert(budget.context_limited());
     assert(!budget.exhausted() && budget.produced == 0);
+    budget.consume();
+    budget.consume();
+    budget.consume();
+    assert(budget.exhausted());
+
+    assert(pocketai::generation_limit(4032, 128, 512, 2048, 64) == 2048);
+    assert(pocketai::generation_limit(1984, 128, 512, 2048, 64) == 1344);
+    assert(pocketai::generation_limit(960, 128, 800, 512, 64) == 0);
+    assert(pocketai::generation_limit(960, 128, 800, 16, 16) == 16);
 
     assert(pocketai::discard_count(2000, 100, 128, 2040) == 950);
     assert(pocketai::discard_count(1050, 100, 128, 2040) == 0);
