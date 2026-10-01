@@ -576,8 +576,10 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv *, jobject) {
             if (load_selected_model(false)) {
                 const int cpu_requested_context = desired_context_size();
                 context = new_context_with_fallback(selected_context);
-                if (context && selected_context < cpu_requested_context)
+                if (context && selected_context < cpu_requested_context) {
                     append_fallback("context reduced to " + std::to_string(selected_context) + " tokens");
+                    ++fallback_events;
+                }
             }
         } catch (...) { context = nullptr; }
     } else if (context && selected_context < requested_context) {
