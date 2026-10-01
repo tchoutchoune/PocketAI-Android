@@ -1,17 +1,19 @@
-# PocketAI Android 4
+# PocketAI Android 4.0.1
 
 Assistant Android avec modèles de langage locaux, choix du modèle et réglages automatiques du matériel. Les réponses affichent le Markdown ; les métadonnées techniques et les blocs de raisonnement restent hors du chat.
 
 ## Installer et commencer
 
 - **Android 13 ou supérieur, téléphone ARM64** (`arm64-v8a`).
-- [Télécharger directement l’APK de la version 4](https://github.com/tchoutchoune/PocketAI-Android/releases/download/pocketai-4.0-preview/PocketAI-4.0-arm64-debug.apk) depuis la préversion GitHub.
-- Dans les [Actions GitHub](https://github.com/tchoutchoune/PocketAI-Android/actions), ouvrir un build réussi de **Build PocketAI 4**, télécharger l’artefact **PocketAI-4.0-arm64-debug**, extraire le ZIP et installer `PocketAI-4.0-arm64-debug.apk`. GitHub peut demander une connexion pour télécharger les artefacts.
+- [Télécharger directement l’APK 4.0.1](https://github.com/tchoutchoune/PocketAI-Android/releases/download/pocketai-4.0.1-preview/PocketAI-4.0.1-arm64-debug.apk) depuis la préversion GitHub.
+- Dans les [Actions GitHub](https://github.com/tchoutchoune/PocketAI-Android/actions), ouvrir un build réussi de **Build PocketAI 4**, télécharger l’artefact **PocketAI-4.0.1-arm64-debug**, extraire le ZIP et installer `PocketAI-4.0.1-arm64-debug.apk`. GitHub peut demander une connexion pour télécharger les artefacts.
 - Autoriser l’installation depuis la source choisie si Android le demande. Cet APK est un build de développement signé avec une clé de débogage.
 
-La version 4 utilise le paquet **`com.pocketai.app`** et peut cohabiter avec l’ancienne version 3. Ses modèles et conversations ne sont pas transférés automatiquement : **réimporter les fichiers GGUF** dans l’onglet **Modèles**, puis choisir **Charger**. Conserver la version 3 le temps de récupérer les données souhaitées.
+La version 4.0.1 utilise le paquet **`io.github.tchoutchoune.pocketai`** et le nom **PocketAI 4**. Elle s’installe à côté des versions existantes et conserve leurs données. L’ancien APK 4.0 utilisait `com.pocketai.app`, déjà occupé par une version 2.8 signée avec une autre clé : Android refusait son installation avec `INSTALL_FAILED_UPDATE_INCOMPATIBLE`. Le nouvel identifiant évite ce conflit.
 
-Si Android affiche seulement **« Appli non installée »**, le [diagnostic d’installation](installer-diagnostic/README.md) permet de récupérer la raison exacte (`INSTALL_FAILED_…`). [Télécharger son APK](https://github.com/tchoutchoune/PocketAI-Android/releases/download/pocketai-installation-diagnostic-1.0/PocketAI-installation-diagnostic.apk), l’ouvrir, sélectionner l’APK PocketAI 4 et confirmer l’installation Android. Revenir dans le diagnostic pour copier le résultat. Ce petit outil fonctionne sans Internet et conserve les données de PocketAI.
+Les modèles et conversations restent propres à chaque application : **réimporter les fichiers GGUF** dans l’onglet **Modèles**, puis choisir **Charger**. Conserver les anciennes applications pour retrouver leurs données.
+
+Pour diagnostiquer le refus de l’**ancien APK 4.0 (`com.pocketai.app`)**, le [diagnostic d’installation](installer-diagnostic/README.md) récupère la raison exacte (`INSTALL_FAILED_…`). [Télécharger son APK](https://github.com/tchoutchoune/PocketAI-Android/releases/download/pocketai-installation-diagnostic-1.0/PocketAI-installation-diagnostic.apk), l’ouvrir, sélectionner cet ancien APK et confirmer l’installation Android. Revenir dans le diagnostic pour copier le résultat. Ce petit outil fonctionne sans Internet et conserve les données de PocketAI ; il cible uniquement l’ancien identifiant.
 
 L’onglet **Chat** permet d’envoyer une question, d’arrêter une opération et de commencer une nouvelle conversation. Les conversations et créations sont conservées sur le téléphone. **Décharger** un modèle libère sa mémoire ; **Supprimer** retire son fichier local.
 
@@ -62,7 +64,7 @@ Le script de préparation installe dans le répertoire d’outils le **JDK 17**,
 
 `scripts/build.sh` construit l’APK ARM64 avec CPU et Vulkan, lance les tests unitaires de `app` et `lib`, puis contrôle le ZIP, la signature, le paquet et les bibliothèques natives. Résultats :
 
-- `out/PocketAI-4.0-arm64-debug.apk` et `out/SHA256.txt` ;
+- `out/PocketAI-4.0.1-arm64-debug.apk` et `out/SHA256.txt` ;
 - preuves de vérification dans `out/` ;
 - rapports dans `app/build/reports/tests/` et `lib/build/reports/tests/`.
 

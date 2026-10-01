@@ -64,7 +64,7 @@ jobs:
       - name: Upload APK and verification evidence
         uses: actions/upload-artifact@v6
         with:
-          name: PocketAI-4.0-arm64-debug
+          name: PocketAI-4.0.1-arm64-debug
           path: out/*
           retention-days: 14
           if-no-files-found: error
@@ -77,3 +77,119 @@ jobs:
             app/build/reports/tests/
             lib/build/reports/tests/
           retention-days: 14
+
+  publish:
+    needs: android
+    if: >-
+      ${{ needs.android.result == 'success' &&
+          github.repository == 'tchoutchoune/PocketAI-Android' &&
+          github.ref == 'refs/heads/codex/pocketai-4-models-vulkan-tools' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+    concurrency:
+      group: pocketai-4.0.1-preview-delivery
+      cancel-in-progress: false
+    steps:
+      - name: Download the APK from this successful run
+        uses: actions/download-artifact@v4
+        with:
+          name: PocketAI-4.0.1-arm64-debug
+          path: published-apk
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4
+        with:
+          log-accepted-android-sdk-licenses: false
+      - name: Verify the new APK identity and integrity
+        id: verified
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -x "$ANDROID_HOME/build-tools/36.0.0/apksigner" ]; then
+            sdkmanager 'build-tools;36.0.0'
+          fi
+          cd published-apk
+          sha256sum -c SHA256.txt
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs PocketAI-4.0.1-arm64-debug.apk
+          "$ANDROID_HOME/build-tools/36.0.0/zipalign" -c -P 16 4 PocketAI-4.0.1-arm64-debug.apk
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging PocketAI-4.0.1-arm64-debug.apk > PUBLISHED-PACKAGE.txt
+          python3 - <<'PY'
+          import hashlib, os, pathlib, re, zipfile
+          apk = pathlib.Path('PocketAI-4.0.1-arm64-debug.apk')
+          digest = hashlib.sha256(apk.read_bytes()).hexdigest()
+          checksum = pathlib.Path('SHA256.txt').read_text().split()
+          assert checksum == [digest, apk.name], 'Checksum must describe exactly the delivered APK'
+          with zipfile.ZipFile(apk) as archive:
+              assert archive.testzip() is None, 'Corrupt APK ZIP entry'
+          package = pathlib.Path('PUBLISHED-PACKAGE.txt').read_text()
+          identity = re.search(r"^package: name='([^']+)' versionCode='([^']+)' versionName='([^']+)'", package, re.M)
+          assert identity and identity.groups() == ('io.github.tchoutchoune.pocketai', '401', '4.0.1'), 'Unexpected APK identity'
+          assert "sdkVersion:'33'" in package, 'Unexpected minimum Android version'
+          assert "native-code: 'arm64-v8a'" in package, 'Unexpected APK architecture'
+          assert 'application-testonly' not in package.lower(), 'APK requires a test-only installer'
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'sha256={digest}\nsize={apk.stat().st_size}\n')
+          print(f'Verified {apk.name}: {apk.stat().st_size} bytes, SHA-256 {digest}')
+          PY
+      - name: Publish the new direct download and retain existing releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EXPECTED_APK_SHA: ${{ steps.verified.outputs.sha256 }}
+          EXPECTED_APK_SIZE: ${{ steps.verified.outputs.size }}
+        run: |
+          set -euo pipefail
+          RELEASE_TAG=pocketai-4.0.1-preview
+          printf '%s\n' \
+            'PocketAI 4.0.1 : installation distincte permettant de conserver PocketAI 2.8 et ses données.' \
+            'Identifiant Android : io.github.tchoutchoune.pocketai. Android 13 ou supérieur, ARM64.' \
+            'APK de développement, signé avec la clé de ce build. Cette publication est conservée lors des relances.' \
+            "Source : $GITHUB_SHA" \
+            "Build vérifié : https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            "SHA-256 APK : $EXPECTED_APK_SHA" > release-notes.md
+          if gh release view "$RELEASE_TAG" --json isDraft,targetCommitish > release-state.json 2>/dev/null; then
+            STATE=$(python3 - <<'PY'
+          import json, os
+          release = json.load(open('release-state.json'))
+          if not release['isDraft']:
+              print('published')
+          elif release['targetCommitish'] == os.environ['GITHUB_SHA']:
+              print('draft')
+          else:
+              raise SystemExit('An existing draft belongs to a different commit; nothing was overwritten.')
+          PY
+            )
+            if [ "$STATE" = published ]; then
+              echo 'This release is already published; its APK and signing identity are retained.'
+              gh release view "$RELEASE_TAG" --json url --jq .url
+              exit 0
+            fi
+          else
+            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --draft --prerelease --latest=false \
+              --title 'PocketAI 4.0.1 — installation distincte' --notes-file release-notes.md
+          fi
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+          gh release upload "$RELEASE_TAG" \
+            published-apk/PocketAI-4.0.1-arm64-debug.apk published-apk/SHA256.txt --clobber
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > release-assets.json
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+          release = json.load(open('release-assets.json'))
+          assert release['draft'] and release['target_commitish'] == os.environ['GITHUB_SHA'], 'Release source changed'
+          assets = {asset['name']: asset for asset in release['assets']}
+          apk = assets['PocketAI-4.0.1-arm64-debug.apk']
+          assert apk['state'] == 'uploaded' and apk['size'] == int(os.environ['EXPECTED_APK_SIZE'])
+          assert apk['digest'] == 'sha256:' + os.environ['EXPECTED_APK_SHA'], 'Uploaded APK digest differs'
+          checksum = assets['SHA256.txt']
+          expected = hashlib.sha256(pathlib.Path('published-apk/SHA256.txt').read_bytes()).hexdigest()
+          assert checksum['state'] == 'uploaded' and checksum['digest'] == 'sha256:' + expected, 'Uploaded checksum differs'
+          PY
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false
+          gh release view "$RELEASE_TAG" --json url --jq .url
