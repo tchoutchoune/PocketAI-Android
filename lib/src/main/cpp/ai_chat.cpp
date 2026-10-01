@@ -32,6 +32,7 @@ llama_batch batch{};
 bool batch_allocated = false;
 common_chat_templates_ptr templates;
 common_sampler *sampler = nullptr;
+bool template_supports_thinking = false;
 std::vector<common_chat_msg> messages;
 std::string system_prompt;
 std::string model_path;
@@ -131,6 +132,7 @@ void free_context() {
     needs_end_of_turn = false;
     if (sampler) { common_sampler_free(sampler); sampler = nullptr; }
     templates.reset();
+    template_supports_thinking = false;
     if (batch_allocated) { llama_batch_free(batch); batch = {}; batch_allocated = false; }
     if (context) { llama_free(context); context = nullptr; }
     messages.clear();
@@ -268,7 +270,40 @@ std::string format_message(const std::string &role, const std::string &content, 
     common_chat_msg message;
     message.role = role;
     message.content = content;
-    return common_chat_format_single(templates.get(), messages, message, add_assistant, false);
+
+    // Keep legacy formatting for ordinary instruct models. Reasoning-capable
+    // templates (for example Qwen3) are rendered through Jinja with thinking
+    // explicitly disabled because PocketAI intentionally hides private reasoning.
+    if (!template_supports_thinking)
+        return common_chat_format_single(templates.get(), messages, message, add_assistant, false);
+
+    const auto vocab = llama_model_get_vocab(model);
+    common_chat_templates_inputs inputs;
+    inputs.use_jinja = true;
+    inputs.enable_thinking = false;
+    inputs.add_bos = llama_vocab_get_add_bos(vocab);
+    inputs.add_eos = llama_vocab_get_add_eos(vocab);
+
+    std::string formatted_past;
+    if (!messages.empty()) {
+        inputs.messages = messages;
+        inputs.add_generation_prompt = false;
+        formatted_past = common_chat_templates_apply(templates.get(), inputs).prompt;
+    }
+
+    std::ostringstream result;
+    if (add_assistant && !formatted_past.empty() && formatted_past.back() == '\n')
+        result << '\n';
+
+    inputs.messages.push_back(message);
+    inputs.add_generation_prompt = add_assistant;
+    const auto formatted = common_chat_templates_apply(templates.get(), inputs).prompt;
+    if (formatted.size() < formatted_past.size() ||
+        formatted.compare(0, formatted_past.size(), formatted_past) != 0)
+        throw std::runtime_error("Chat template did not preserve history prefix");
+
+    result << formatted.substr(formatted_past.size());
+    return result.str();
 }
 
 void add_message(const std::string &role, const std::string &content) {
@@ -435,6 +470,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv *, jobject) {
         sampling.temp = options.temperature;
         sampler = common_sampler_init(model, sampling);
         if (!sampler || !templates) { free_context(); return 1; }
+        try { template_supports_thinking = common_chat_templates_support_enable_thinking(templates.get()); }
+        catch (...) { template_supports_thinking = false; }
         clear_conversation();
         shifts = 0;
         budget.start(0);
@@ -605,6 +642,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_nativeDiagnostics(JNIEnv *env, 
         << "; requested: " << budget.requested
         << "; context-limited: " << (budget.context_limited() ? "yes" : "no")
         << "; history resets: " << shifts << '\n';
+    out << "Reasoning template: " << (template_supports_thinking ? "detected; thinking disabled" : "not detected") << '\n';
     const int64_t duration = generation_start ? (generation_end ? generation_end : ggml_time_us()) - generation_start : 0;
     out << "Generation: " << (duration > 0 ? budget.produced * 1e6 / duration : 0.0) << " tokens/s; prompt: " << (prompt_us > 0 ? prompt_tokens * 1e6 / prompt_us : 0.0) << " tokens/s\n";
     out << "Backend warnings: " << backend_warnings.load() << "; errors: " << backend_errors.load() << '\n';
