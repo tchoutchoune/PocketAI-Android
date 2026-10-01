@@ -59,6 +59,9 @@ int64_t generation_start = 0;
 int64_t generation_end = 0;
 int64_t prompt_us = 0;
 int prompt_tokens = 0;
+llama_token last_generated_token = -1;
+int repeated_token_streak = 0;
+bool generation_degenerate = false;
 
 void log_event(int priority, const char *message) {
     __android_log_write(priority, "PocketAI.Native", message);
@@ -124,6 +127,9 @@ void clear_conversation() {
     generation_eog = false;
     needs_end_of_turn = false;
     context_dirty = false;
+    last_generated_token = -1;
+    repeated_token_streak = 0;
+    generation_degenerate = false;
 }
 
 void free_context() {
@@ -140,6 +146,9 @@ void free_context() {
     cached_bytes.clear();
     assistant_text.clear();
     context_dirty = false;
+    last_generated_token = -1;
+    repeated_token_streak = 0;
+    generation_degenerate = false;
 }
 
 void free_model() {
@@ -402,6 +411,9 @@ int process_reasoning_user(const std::string &user, int maximum) {
     messages = std::move(candidate);
     history_resets += dropped_turns;
     budget.start(maximum, effective);
+    last_generated_token = -1;
+    repeated_token_streak = 0;
+    generation_degenerate = false;
     generation_start = ggml_time_us();
     generation_end = 0;
     generation_eog = false;
@@ -677,6 +689,30 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(JNIEnv *env, 
         }
         apply_threads();
         const auto token = common_sampler_sample(sampler, context, -1);
+
+        if (token == last_generated_token) ++repeated_token_streak;
+        else {
+            last_generated_token = token;
+            repeated_token_streak = 1;
+        }
+
+        // Identical-token runs of this length are practically never intentional in
+        // normal chat, but are a known symptom of corrupted GPU logits on some
+        // Android Vulkan/Adreno stacks. Stop before filling the UI with garbage.
+        if (repeated_token_streak >= 32) {
+            generation_degenerate = true;
+            context_dirty = true;
+            log_event(ANDROID_LOG_ERROR, "Degenerate repeated-token output detected");
+            finish_generation();
+            throw_io(
+                env,
+                gpu_layers > 0
+                    ? "Sortie GPU incoherente detectee; recharge le modele en profil Equilibre ou CPU"
+                    : "Boucle de tokens detectee; reinitialise la conversation ou change de modele"
+            );
+            return nullptr;
+        }
+
         common_sampler_accept(sampler, token, true);
         common_batch_clear(batch);
         common_batch_add(batch, token, position, {0}, true);
@@ -726,6 +762,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_nativeDiagnostics(JNIEnv *env, 
         << "; context-limited: " << (budget.context_limited() ? "yes" : "no")
         << "; history resets: " << history_resets << '\n';
     out << "Reasoning template: " << (template_supports_thinking ? "detected; thinking disabled" : "not detected") << '\n';
+    out << "Degenerate output guard: " << (generation_degenerate ? "triggered" : "clear")
+        << "; repeated-token streak: " << repeated_token_streak << '\n';
     const int64_t duration = generation_start ? (generation_end ? generation_end : ggml_time_us()) - generation_start : 0;
     out << "Generation: " << (duration > 0 ? budget.produced * 1e6 / duration : 0.0) << " tokens/s; prompt: " << (prompt_us > 0 ? prompt_tokens * 1e6 / prompt_us : 0.0) << " tokens/s\n";
     out << "Backend warnings: " << backend_warnings.load() << "; errors: " << backend_errors.load() << '\n';
