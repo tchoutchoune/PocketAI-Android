@@ -63,6 +63,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     @Volatile private var currentThreadLimit = 1
     private var lastMetricWallMs = android.os.SystemClock.elapsedRealtime()
     private var lastProcessCpuMs = Process.getElapsedCpuTime()
+    @Volatile private var latestProcessCpuCores = 0.0
     private var thermalRegistered = false
     private val thermalListener = PowerManager.OnThermalStatusChangedListener { status ->
         currentThermalStatus = status
@@ -138,7 +139,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val cpuDelta = (cpuMs - lastProcessCpuMs).coerceAtLeast(0)
         lastMetricWallMs = nowWallMs
         lastProcessCpuMs = cpuMs
-        return cpuDelta.toDouble() / wallDelta.toDouble()
+        latestProcessCpuCores = cpuDelta.toDouble() / wallDelta.toDouble()
+        return latestProcessCpuCores
     }
 
     private fun liveMetrics(elapsedMs: Long, emittedTokens: Int): String {
@@ -386,6 +388,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 " thermal=$currentThermalStatus(" + thermalLabel(currentThermalStatus) + ")" +
                                 " headroom=" + thermalHeadroom() +
                                 " ram_avail_mib=" + memoryAvailableMiB() +
+                                " cpu_equiv_cores=" + "%.2f".format(latestProcessCpuCores) +
+                                " live_tps=" + "%.2f".format(if (elapsedNow > 0) chunks * 1000.0 / elapsedNow else 0.0) +
                                 " battery_c=" + batteryTemperatureC()
                         )
                     }
