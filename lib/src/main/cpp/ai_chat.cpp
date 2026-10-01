@@ -427,31 +427,42 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(JNIEnv *env, 
 
         const int capacity = static_cast<int>(llama_n_ctx(context)) - HEADROOM;
         const int minimum = std::min(static_cast<int>(maximum), MIN_GENERATION_TOKENS);
-        auto effective_budget = [&]() {
-            return pocketai::generation_limit(
+
+        // First preserve the existing conversation. If it still leaves a useful
+        // response window, cap this answer to that exact window rather than
+        // evicting history merely because the user selected a very large maximum.
+        int effective = pocketai::generation_limit(
+            capacity,
+            static_cast<int>(position),
+            static_cast<int>(tokens.size()),
+            static_cast<int>(maximum),
+            minimum
+        );
+
+        // Only when history leaves less than the minimum useful response window,
+        // reset the old conversational KV tail while keeping the system prompt.
+        if (!effective) {
+            const int shifts_before = shifts;
+            if (!make_turn_room(static_cast<int>(tokens.size()) + minimum)) return 1;
+
+            if (shifts != shifts_before) {
+                // A history reset changes template state (and can change BOS handling),
+                // so rebuild the exact model input against the retained system prompt.
+                formatted = chat_template ? format_message("user", user, true) : user;
+                tokens = tokenize_input(formatted, chat_template);
+                if (tokens.empty()) return 1;
+            }
+
+            effective = pocketai::generation_limit(
                 capacity,
                 system_position,
                 static_cast<int>(tokens.size()),
                 static_cast<int>(maximum),
                 minimum
             );
-        };
-
-        int effective = effective_budget();
-        if (!effective) return 1;
-
-        // Reserve prompt + complete output budget before the first token is decoded.
-        const int shifts_before = shifts;
-        if (!make_turn_room(static_cast<int>(tokens.size()) + effective)) return 1;
-
-        // A history reset changes the template state (and can change BOS handling),
-        // so rebuild the exact model input and budget against the retained system prompt.
-        if (shifts != shifts_before) {
-            formatted = chat_template ? format_message("user", user, true) : user;
-            tokens = tokenize_input(formatted, chat_template);
-            if (tokens.empty()) return 1;
-            effective = effective_budget();
             if (!effective || !make_turn_room(static_cast<int>(tokens.size()) + effective)) return 1;
+        } else if (!make_turn_room(static_cast<int>(tokens.size()) + effective)) {
+            return 1;
         }
 
         cached_bytes.clear();
