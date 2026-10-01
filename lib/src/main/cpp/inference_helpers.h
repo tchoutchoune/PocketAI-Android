@@ -32,6 +32,22 @@ inline int generation_limit(int capacity, int system, int prompt_tokens, int req
     return std::min(requested, available);
 }
 
+/**
+ * Return an exact token-identical prefix safe for KV reuse. If the entire new
+ * prompt is already cached, leave its final token to be decoded again so logits
+ * correspond to the current prompt end.
+ */
+inline size_t reusable_token_prefix(
+    const std::vector<int32_t> &prompt,
+    const std::vector<int32_t> &cached
+) {
+    const size_t limit = std::min(prompt.size(), cached.size());
+    size_t prefix = 0;
+    while (prefix < limit && prompt[prefix] == cached[prefix]) ++prefix;
+    if (!prompt.empty() && prefix >= prompt.size()) --prefix;
+    return prefix;
+}
+
 /** Remove <think>...</think> sections without exposing their contents. */
 inline std::string strip_thinking(const std::string &text) {
     std::string result;
