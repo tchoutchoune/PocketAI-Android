@@ -17,7 +17,8 @@
 #include "inference_helpers.h"
 
 namespace {
-constexpr int HEADROOM = 8;
+constexpr int HEADROOM = 64;
+constexpr int MIN_GENERATION_TOKENS = 64;
 struct Options {
     int threads = 4;
     int context = 2048;
@@ -185,6 +186,28 @@ bool make_room(int required) {
     if (!llama_memory_seq_rm(llama_get_memory(context), 0, system_position, system_position + discard)) return false;
     llama_memory_seq_add(llama_get_memory(context), 0, system_position + discard, position, -discard);
     position -= discard;
+    ++shifts;
+    return true;
+}
+
+/**
+ * Reserve the whole current turn before decoding it. When the existing history
+ * no longer leaves enough room, drop the old conversational KV tail at once
+ * instead of sliding the context during the assistant response. The system
+ * prompt remains pinned.
+ */
+bool make_turn_room(int required) {
+    const int capacity = static_cast<int>(llama_n_ctx(context)) - HEADROOM;
+    if (position + required <= capacity) return true;
+    if (system_position + required > capacity) return false;
+
+    auto memory = llama_get_memory(context);
+    if (!memory || !llama_memory_seq_rm(memory, 0, system_position, position)) return false;
+    position = system_position;
+
+    if (!messages.empty() && messages.front().role == "system") messages.resize(1);
+    else messages.clear();
+
     ++shifts;
     return true;
 }
@@ -398,20 +421,49 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(JNIEnv *env, 
         }
         const auto user = java_text(env, text);
         const bool chat_template = common_chat_templates_was_explicit(templates.get());
-        const auto formatted = chat_template ? format_message("user", user, true) : user;
-        const auto tokens = tokenize_input(formatted, chat_template);
-        if (tokens.empty() || tokens.size() > llama_n_ctx(context) - system_position - HEADROOM - 1) return 1;
+        auto formatted = chat_template ? format_message("user", user, true) : user;
+        auto tokens = tokenize_input(formatted, chat_template);
+        if (tokens.empty()) return 1;
+
+        const int capacity = static_cast<int>(llama_n_ctx(context)) - HEADROOM;
+        const int minimum = std::min(static_cast<int>(maximum), MIN_GENERATION_TOKENS);
+        auto effective_budget = [&]() {
+            return pocketai::generation_limit(
+                capacity,
+                system_position,
+                static_cast<int>(tokens.size()),
+                static_cast<int>(maximum),
+                minimum
+            );
+        };
+
+        int effective = effective_budget();
+        if (!effective) return 1;
+
+        // Reserve prompt + complete output budget before the first token is decoded.
+        const int shifts_before = shifts;
+        if (!make_turn_room(static_cast<int>(tokens.size()) + effective)) return 1;
+
+        // A history reset changes the template state (and can change BOS handling),
+        // so rebuild the exact model input and budget against the retained system prompt.
+        if (shifts != shifts_before) {
+            formatted = chat_template ? format_message("user", user, true) : user;
+            tokens = tokenize_input(formatted, chat_template);
+            if (tokens.empty()) return 1;
+            effective = effective_budget();
+            if (!effective || !make_turn_room(static_cast<int>(tokens.size()) + effective)) return 1;
+        }
+
         cached_bytes.clear();
         assistant_text.clear();
         common_sampler_reset(sampler);
         const auto start = ggml_time_us();
-        if (!make_room(static_cast<int>(tokens.size()))) { context_dirty = true; return 1; }
         const int result = decode_prompt(tokens, true);
         prompt_us = ggml_time_us() - start;
         prompt_tokens = tokens.size();
         if (result) return result;
         if (chat_template) add_message("user", user);
-        budget.start(maximum);
+        budget.start(maximum, effective);
         generation_start = ggml_time_us();
         generation_end = 0;
         generation_eog = false;
@@ -424,9 +476,13 @@ extern "C" JNIEXPORT jstring JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(JNIEnv *env, jobject) {
     if (!context || !generating || cancelled.load() || budget.exhausted()) { finish_generation(); return nullptr; }
     try {
-        if (!make_room(1)) {
+        const int capacity = static_cast<int>(llama_n_ctx(context)) - HEADROOM;
+        if (position >= capacity) {
+            // The turn is pre-budgeted, so reaching this guard indicates an unexpected
+            // accounting mismatch. Stop cleanly rather than deleting the active prompt.
+            log_event(ANDROID_LOG_WARN, "Generation reached reserved context boundary");
             finish_generation();
-            throw_io(env, "This model cannot slide its context; reset the conversation"); return nullptr;
+            return nullptr;
         }
         apply_threads();
         const auto token = common_sampler_sample(sampler, context, -1);
@@ -474,7 +530,10 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_nativeDiagnostics(JNIEnv *env, 
     out << "GPU layers: " << gpu_layers << "; fallback: " << (fallback.empty() ? "none" : fallback) << '\n';
     out << "Threads: " << active_threads << " / " << options.threads << "; thermal limit: " << thread_limit.load() << '\n';
     out << "Context: " << (context ? llama_n_ctx(context) : options.context) << "; batch: " << options.batch << "; temperature: " << options.temperature << '\n';
-    out << "Generated: " << budget.produced << " / " << budget.limit << "; context shifts: " << shifts << '\n';
+    out << "Generated: " << budget.produced << " / " << budget.limit
+        << "; requested: " << budget.requested
+        << "; context-limited: " << (budget.context_limited() ? "yes" : "no")
+        << "; history resets: " << shifts << '\n';
     const int64_t duration = generation_start ? (generation_end ? generation_end : ggml_time_us()) - generation_start : 0;
     out << "Generation: " << (duration > 0 ? budget.produced * 1e6 / duration : 0.0) << " tokens/s; prompt: " << (prompt_us > 0 ? prompt_tokens * 1e6 / prompt_us : 0.0) << " tokens/s\n";
     out << "Backend warnings: " << backend_warnings.load() << "; errors: " << backend_errors.load() << '\n';
