@@ -1,0 +1,51 @@
+name: Verify and deliver PocketAI APK
+
+on:
+  push:
+    paths:
+      - '.github/workflows/deliver-apk.yml'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  deliver:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Download the original successful build
+        uses: actions/download-artifact@v4
+        with:
+          name: PocketAI-4.0-arm64-debug
+          run-id: 36783840570
+          github-token: ${{ github.token }}
+          path: original-apk
+      - name: Verify the exact APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd original-apk
+          sha256sum -c SHA256.txt
+          unzip -t PocketAI-4.0-arm64-debug.apk >/dev/null
+          SDK_TOOLS=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)
+          "$SDK_TOOLS/apksigner" verify --verbose --print-certs PocketAI-4.0-arm64-debug.apk
+          "$SDK_TOOLS/zipalign" -c -P 16 4 PocketAI-4.0-arm64-debug.apk
+          "$SDK_TOOLS/aapt" dump badging PocketAI-4.0-arm64-debug.apk
+          "$SDK_TOOLS/aapt" dump xmltree PocketAI-4.0-arm64-debug.apk AndroidManifest.xml
+          ls -l PocketAI-4.0-arm64-debug.apk
+      - name: Publish an APK that downloads directly
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          RELEASE_TAG=pocketai-4.0-preview
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --target 2503f12fb51fd5d8cf270a8f2a10c8e2080aba76 \
+              --prerelease --title 'PocketAI 4.0 — APK Android ARM64' \
+              --notes 'APK du build vérifié 36783840570. Android 13 ou supérieur, ARM64. Fichier APK direct, identique à celui de l’artefact GitHub. Version de test : gains GPU et services en ligne à valider sur téléphone.'
+          fi
+          gh release upload "$RELEASE_TAG" original-apk/PocketAI-4.0-arm64-debug.apk original-apk/SHA256.txt --clobber
