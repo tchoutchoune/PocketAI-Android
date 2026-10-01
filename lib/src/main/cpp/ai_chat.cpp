@@ -69,7 +69,11 @@ int prompt_reused_tokens = 0;
 int prompt_decoded_tokens = 0;
 int history_alignment_tokens = 0;
 int history_alignment_kv_tokens = 0;
+int history_alignment_plain_tokens = 0;
+int history_alignment_empty_tokens = 0;
+int history_divergence_index = -1;
 std::string history_alignment_mode = "none";
+std::string history_divergence_window = "none";
 int fallback_events = 0;
 llama_token last_generated_token = -1;
 int repeated_token_streak = 0;
@@ -182,7 +186,11 @@ void free_model() {
     prompt_decoded_tokens = 0;
     history_alignment_tokens = 0;
     history_alignment_kv_tokens = 0;
+    history_alignment_plain_tokens = 0;
+    history_alignment_empty_tokens = 0;
+    history_divergence_index = -1;
     history_alignment_mode = "none";
+    history_divergence_window = "none";
     fallback_events = 0;
 }
 
@@ -422,6 +430,25 @@ std::string render_full_reasoning_chat(const std::vector<common_chat_msg> &chat)
     return render_reasoning_chat(chat, true);
 }
 
+std::string token_id_window(
+    const std::vector<llama_token> &cached,
+    const llama_tokens &rendered,
+    size_t pivot
+) {
+    const size_t start = pivot > 4 ? pivot - 4 : 0;
+    const size_t limit = std::max(cached.size(), rendered.size());
+    const size_t end = std::min(limit, pivot + 5);
+    std::ostringstream out;
+    for (size_t i = start; i < end; ++i) {
+        if (i > start) out << " ";
+        out << i << ":";
+        if (i < cached.size()) out << cached[i]; else out << "-";
+        out << "/";
+        if (i < rendered.size()) out << rendered[i]; else out << "-";
+    }
+    return out.str().empty() ? "none" : out.str();
+}
+
 /**
  * Some reasoning templates emit an empty <think> block only in their generation
  * prompt, but omit it when the completed assistant message is rendered again.
@@ -439,7 +466,11 @@ common_chat_msg aligned_assistant_message(const std::string &content) {
 
     history_alignment_tokens = 0;
     history_alignment_kv_tokens = 0;
+    history_alignment_plain_tokens = 0;
+    history_alignment_empty_tokens = 0;
+    history_divergence_index = -1;
     history_alignment_mode = "plain";
+    history_divergence_window = "none";
 
     if (!template_supports_thinking || !context || kv_tokens.empty()) return plain;
 
@@ -470,11 +501,17 @@ common_chat_msg aligned_assistant_message(const std::string &content) {
             const auto rendered = render_reasoning_chat(candidate, false);
             const auto rendered_tokens = tokenize_from_start(rendered, true);
             const size_t prefix = pocketai::token_prefix_length(rendered_tokens, kv_tokens);
-            if (prefix > best_prefix) {
+            if (index == 0) history_alignment_plain_tokens = static_cast<int>(prefix);
+            else history_alignment_empty_tokens = static_cast<int>(prefix);
+            if (prefix > best_prefix || (prefix == best_prefix && index == 0)) {
                 best = variants[index];
                 best_prefix = prefix;
                 best_total = kv_tokens.size();
                 best_mode = index == 0 ? "plain" : "empty-reasoning";
+                history_divergence_index = prefix < kv_tokens.size() ? static_cast<int>(prefix) : -1;
+                history_divergence_window = prefix < kv_tokens.size()
+                    ? token_id_window(kv_tokens, rendered_tokens, prefix)
+                    : "none";
             }
         } catch (...) {
             // Keep the ordinary assistant representation if alignment probing fails.
@@ -1001,6 +1038,10 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_nativeDiagnostics(JNIEnv *env, 
         << " decoded tokens/s\n";
     out << "History alignment: " << history_alignment_tokens << " / "
         << history_alignment_kv_tokens << " cached tokens; mode " << history_alignment_mode << '\n';
+    out << "History alignment variants: plain " << history_alignment_plain_tokens
+        << "; empty-reasoning " << history_alignment_empty_tokens << '\n';
+    out << "KV divergence: index " << history_divergence_index
+        << "; token-ids cached/rendered " << history_divergence_window << '\n';
     out << "Output metrics: raw-tokens " << budget.produced
         << "; visible-tokens-est " << visible_tokens_estimate
         << "; hidden-thinking-tokens-est " << hidden_thinking_tokens_estimate
