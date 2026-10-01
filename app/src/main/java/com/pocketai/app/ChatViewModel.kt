@@ -281,7 +281,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             val info = diagnosticsWithSessionNote(rawInfo)
             logs.event("model_ready options=$activeOptions diagnostics=$info")
             prefs.edit().putString("lastModel", file.name).apply()
-            update { it.copy(modelName = file.nameWithoutExtension, status = "Prêt · ${activeOptions.threads} threads · ${activeOptions.contextSize} tokens", diagnostics = info) }
+            update {
+                it.copy(
+                    modelName = file.nameWithoutExtension,
+                    status = "Prêt · ${activeOptions.threads} threads · ${activeOptions.contextSize} tokens",
+                    diagnostics = info,
+                    liveMetrics = liveMetrics(0, 0),
+                )
+            }
         } catch (error: Exception) {
             activeFile = null
             update { it.copy(modelName = null, diagnostics = "") }
@@ -294,7 +301,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun unloadModel() = task("Libération de la mémoire…") {
         activeFile = null
-        update { it.copy(modelName = null, diagnostics = "") }
+        update { it.copy(modelName = null, diagnostics = "", liveMetrics = "") }
         engine?.cleanUp()
         update { it.copy(status = "Modèle déchargé") }
     }
@@ -312,7 +319,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             val sources = if (settings.webSearchEnabled) tools.search(text).take(3) else emptyList()
             val buffer = StringBuilder()
             var lastPaint = 0L
+            var lastMetricsPaint = 0L
+            var lastProgressLog = 0L
             val started = android.os.SystemClock.elapsedRealtime()
+            lastMetricWallMs = started
+            lastProcessCpuMs = Process.getElapsedCpuTime()
             var chunks = 0
 
             fun buildPrompt(includeHistory: Boolean): String {
@@ -348,13 +359,34 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     buffer.append(token)
                     chunks++
                     val now = android.os.SystemClock.elapsedRealtime()
-                    if (now - lastPaint >= 80) {
+                    val elapsedNow = now - started
+
+                    if (now - lastPaint >= 100) {
                         lastPaint = now
                         update { s ->
                             s.copy(messages = s.messages.map {
                                 if (it.id == response.id) it.copy(content = buffer.toString()) else it
                             })
                         }
+                    }
+
+                    if (now - lastMetricsPaint >= 500) {
+                        lastMetricsPaint = now
+                        val metrics = liveMetrics(elapsedNow, chunks)
+                        update { it.copy(liveMetrics = metrics) }
+                    }
+
+                    if (now - lastProgressLog >= 5_000) {
+                        lastProgressLog = now
+                        logs.event(
+                            "generation_progress elapsed_ms=$elapsedNow emitted_tokens=$chunks " +
+                                "backend=" + (if (activeOptions.gpuLayers > 0) "cpu+vulkan" else "cpu") +
+                                " threads=$currentThreadLimit/${activeOptions.threads}" +
+                                " thermal=$currentThermalStatus(" + thermalLabel(currentThermalStatus) + ")" +
+                                " headroom=" + thermalHeadroom() +
+                                " ram_avail_mib=" + memoryAvailableMiB() +
+                                " battery_c=" + batteryTemperatureC()
+                        )
                     }
                 }
             }
@@ -445,7 +477,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 "; visible-chars " + visibleOutput.length +
                 "; hidden-filtered-chars " + hiddenChars
             logs.event("generation_completed duration_s=$elapsed emitted_chunks=$chunks diagnostics=$info")
-            update { it.copy(status = "Réponse terminée · ${"%.1f".format(elapsed)} s", diagnostics = info) }
+            update {
+                it.copy(
+                    status = "Réponse terminée · ${"%.1f".format(elapsed)} s",
+                    diagnostics = info,
+                    liveMetrics = liveMetrics(elapsedMs, chunks),
+                )
+            }
         }
     }
 
