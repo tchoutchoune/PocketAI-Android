@@ -32,6 +32,43 @@ inline int generation_limit(int capacity, int system, int prompt_tokens, int req
     return std::min(requested, available);
 }
 
+/** Remove <think>...</think> sections without exposing their contents. */
+inline std::string strip_thinking(const std::string &text) {
+    std::string result;
+    result.reserve(text.size());
+    size_t cursor = 0;
+    int depth = 0;
+    while (cursor < text.size()) {
+        const auto open = text.find("<think>", cursor);
+        const auto close = text.find("</think>", cursor);
+        if (depth == 0) {
+            if (open == std::string::npos) {
+                result.append(text, cursor, std::string::npos);
+                break;
+            }
+            result.append(text, cursor, open - cursor);
+            cursor = open + 7;
+            depth = 1;
+        } else {
+            if (close == std::string::npos) break;
+            cursor = close + 8;
+            depth = 0;
+        }
+    }
+    return result;
+}
+
+inline size_t utf8_codepoints(const std::string &text) {
+    size_t count = 0;
+    for (size_t i = 0; i < text.size();) {
+        const auto first = static_cast<unsigned char>(text[i]);
+        const size_t width = first < 0x80 ? 1 : first < 0xE0 ? 2 : first < 0xF0 ? 3 : 4;
+        i += std::min(width, text.size() - i);
+        ++count;
+    }
+    return count;
+}
+
 // Complete UTF-8 prefixes only; an unfinished multibyte token waits for the next token.
 inline bool complete_utf8(const std::string &text) {
     for (size_t i = 0; i < text.size();) {
