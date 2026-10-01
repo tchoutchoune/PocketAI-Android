@@ -48,6 +48,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var needsHistoryRestore = true
     private val gpuUnstableModels = mutableSetOf<String>()
     private var backendOverrideNote: String? = null
+    private var lastModelLoadWallMs = 0L
+    private var lastCpuFallbackReloadMs = 0L
+    private var gpuFallbackCount = 0
     private val power = application.getSystemService(PowerManager::class.java)
     private var thermalRegistered = false
     private val thermalListener = PowerManager.OnThermalStatusChangedListener { status ->
@@ -87,10 +90,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         mutableState.update(transform)
     }
 
-    private fun diagnosticsWithSessionNote(raw: String): String =
-        backendOverrideNote?.let { "$raw\nApp fallback: $it" } ?: raw
+    private fun diagnosticsWithSessionNote(raw: String): String = buildString {
+        append(raw)
+        backendOverrideNote?.let { append("\nApp fallback: ").append(it) }
+        append("\nApp load timing: model-wall ").append(lastModelLoadWallMs)
+            .append(" ms; last-cpu-reload-wall ").append(lastCpuFallbackReloadMs)
+            .append(" ms; gpu-fallbacks ").append(gpuFallbackCount)
+    }
 
     private suspend fun reloadActiveModelOnCpu(file: File): String {
+        val reloadStarted = android.os.SystemClock.elapsedRealtime()
         val inference = inference()
         val profile = HardwareProfile.detect(getApplication())
         val cpuOptions = profile.recommend(file.length(), "cpu").copy(gpuLayers = 0)
@@ -111,6 +120,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         needsHistoryRestore = true
         gpuUnstableModels += file.absolutePath
         backendOverrideNote = "GPU corruption detected -> automatic CPU fallback; Vulkan disabled for this model until app restart"
+        lastCpuFallbackReloadMs = android.os.SystemClock.elapsedRealtime() - reloadStarted
+        gpuFallbackCount++
 
         val info = diagnosticsWithSessionNote(raw)
         logs.event("gpu_corruption_cpu_fallback model=${file.name} options=$activeOptions diagnostics=$info")
@@ -190,9 +201,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 if (forceCpu) it.copy(gpuLayers = 0) else it
             }
             activeOptions = options
+            val loadWallStarted = android.os.SystemClock.elapsedRealtime()
             inference.configure(options)
             inference.loadModel(file.absolutePath)
             inference.setSystemPrompt(SYSTEM_PROMPT)
+            lastModelLoadWallMs = android.os.SystemClock.elapsedRealtime() - loadWallStarted
+            lastCpuFallbackReloadMs = 0L
             thermalListener.onThermalStatusChanged(runCatching { power.currentThermalStatus }.getOrDefault(0))
             val rawInfo = inference.diagnostics()
             val actualContext = Regex("Context: (\\d+)").find(rawInfo)?.groupValues?.getOrNull(1)?.toIntOrNull()
@@ -307,10 +321,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 stream(buildPrompt(includeHistory = true))
             }
             needsHistoryRestore = false
-            val info = diagnosticsWithSessionNote(inference.diagnostics())
+            val nativeInfo = diagnosticsWithSessionNote(inference.diagnostics())
             val generation = Regex(
                 "Generated: (\\d+) / (\\d+); requested: (\\d+); context-limited: (yes|no)"
-            ).find(info)?.groupValues
+            ).find(nativeInfo)?.groupValues
             val produced = generation?.get(1)?.toIntOrNull() ?: 0
             val effectiveLimit = generation?.get(2)?.toIntOrNull() ?: 0
             val requestedLimit = generation?.get(3)?.toIntOrNull() ?: maxTokens
@@ -356,7 +370,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 update { it.copy(artifacts = it.artifacts + artifact) }
             }
-            val elapsed = (android.os.SystemClock.elapsedRealtime() - started) / 1000.0
+            val elapsedMs = android.os.SystemClock.elapsedRealtime() - started
+            val elapsed = elapsedMs / 1000.0
+            val rawOutput = buffer.toString()
+            val visibleOutput = ResponseText.visible(rawOutput)
+            val hiddenChars = (rawOutput.length - visibleOutput.length).coerceAtLeast(0)
+            val info = nativeInfo + "\nApp turn metrics: wall " + elapsedMs +
+                " ms; emitted-chunks " + chunks +
+                "; raw-chars " + rawOutput.length +
+                "; visible-chars " + visibleOutput.length +
+                "; hidden-filtered-chars " + hiddenChars
             logs.event("generation_completed duration_s=$elapsed emitted_chunks=$chunks diagnostics=$info")
             update { it.copy(status = "Réponse terminée · ${"%.1f".format(elapsed)} s", diagnostics = info) }
         }
