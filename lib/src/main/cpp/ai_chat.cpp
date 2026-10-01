@@ -316,6 +316,99 @@ llama_tokens tokenize_input(const std::string &text, bool parse_special) {
     return tokens;
 }
 
+llama_tokens tokenize_from_start(const std::string &text, bool parse_special) {
+    auto tokens = common_tokenize(context, text, false, parse_special);
+    const auto vocab = llama_model_get_vocab(model);
+    const auto bos = llama_vocab_bos(vocab);
+    if (llama_vocab_get_add_bos(vocab) && bos >= 0 && (tokens.empty() || tokens.front() != bos))
+        tokens.insert(tokens.begin(), bos);
+    return tokens;
+}
+
+std::string render_full_reasoning_chat(const std::vector<common_chat_msg> &chat) {
+    const auto vocab = llama_model_get_vocab(model);
+    common_chat_templates_inputs inputs;
+    inputs.messages = chat;
+    inputs.use_jinja = true;
+    inputs.enable_thinking = false;
+    inputs.add_generation_prompt = true;
+    inputs.add_bos = llama_vocab_get_add_bos(vocab);
+    inputs.add_eos = llama_vocab_get_add_eos(vocab);
+    return common_chat_templates_apply(templates.get(), inputs).prompt;
+}
+
+bool drop_oldest_history_turn(std::vector<common_chat_msg> &chat) {
+    const size_t first = (!chat.empty() && chat.front().role == "system") ? 1 : 0;
+    // Keep at least the current user message, which is always the final element.
+    if (chat.size() <= first + 1) return false;
+
+    size_t end = first + 1;
+    if (end < chat.size() - 1 && chat[end].role == "assistant") ++end;
+    chat.erase(chat.begin() + first, chat.begin() + end);
+    return true;
+}
+
+int process_reasoning_user(const std::string &user, int maximum) {
+    const int capacity = static_cast<int>(llama_n_ctx(context)) - HEADROOM;
+    const int minimum = std::min(maximum, MIN_GENERATION_TOKENS);
+
+    std::vector<common_chat_msg> candidate = messages;
+    common_chat_msg current;
+    current.role = "user";
+    current.content = user;
+    candidate.push_back(std::move(current));
+
+    std::string formatted;
+    llama_tokens tokens;
+    int effective = 0;
+    int dropped_turns = 0;
+
+    for (;;) {
+        formatted = render_full_reasoning_chat(candidate);
+        tokens = tokenize_from_start(formatted, true);
+        if (tokens.empty()) return 1;
+
+        effective = pocketai::generation_limit(
+            capacity,
+            0,
+            static_cast<int>(tokens.size()),
+            maximum,
+            minimum
+        );
+        if (effective > 0) break;
+
+        if (!drop_oldest_history_turn(candidate)) return 1;
+        ++dropped_turns;
+    }
+
+    // Qwen3-style templates are not guaranteed to be prefix-stable between turns
+    // when enable_thinking changes template branches. Rebuild the full structured
+    // prompt for each turn instead of trying to append a textual delta to the KV.
+    llama_memory_clear(llama_get_memory(context), false);
+    common_sampler_reset(sampler);
+    position = 0;
+    system_position = 0;
+    cached_bytes.clear();
+    assistant_text.clear();
+    needs_end_of_turn = false;
+    context_dirty = false;
+
+    const auto start = ggml_time_us();
+    const int result = decode_prompt(tokens, true);
+    prompt_us = ggml_time_us() - start;
+    prompt_tokens = static_cast<int>(tokens.size());
+    if (result) return result;
+
+    messages = std::move(candidate);
+    history_resets += dropped_turns;
+    budget.start(maximum, effective);
+    generation_start = ggml_time_us();
+    generation_end = 0;
+    generation_eog = false;
+    generating = true;
+    return 0;
+}
+
 int install_system_prompt() {
     clear_conversation();
     if (system_prompt.empty()) return 0;
@@ -485,12 +578,19 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(JNIEnv *env, 
     finish_generation();
     try {
         if (context_dirty && install_system_prompt()) return 2;
+
+        const auto user = java_text(env, text);
+        const bool chat_template = common_chat_templates_was_explicit(templates.get());
+
+        // Reasoning-capable templates such as Qwen3 can change previously rendered
+        // bytes depending on template state. Re-render the structured conversation
+        // from scratch for each turn so the KV cache always matches the template.
+        if (chat_template && template_supports_thinking)
+            return process_reasoning_user(user, static_cast<int>(maximum));
+
         if (needs_end_of_turn) {
             const int capacity = static_cast<int>(llama_n_ctx(context)) - HEADROOM;
             if (position + 1 > capacity) {
-                // The previous assistant turn ended on its output budget. If even its
-                // terminator no longer fits, discard old history cleanly instead of
-                // shifting a partial message and carrying mismatched template state.
                 const int resets_before = history_resets;
                 if (!make_turn_room(1)) { context_dirty = true; return 2; }
                 if (history_resets == resets_before) { context_dirty = true; return 2; }
@@ -505,18 +605,13 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(JNIEnv *env, 
                 needs_end_of_turn = false;
             }
         }
-        const auto user = java_text(env, text);
-        const bool chat_template = common_chat_templates_was_explicit(templates.get());
+
         auto formatted = chat_template ? format_message("user", user, true) : user;
         auto tokens = tokenize_input(formatted, chat_template);
         if (tokens.empty()) return 1;
 
         const int capacity = static_cast<int>(llama_n_ctx(context)) - HEADROOM;
         const int minimum = std::min(static_cast<int>(maximum), MIN_GENERATION_TOKENS);
-
-        // First preserve the existing conversation. If it still leaves a useful
-        // response window, cap this answer to that exact window rather than
-        // evicting history merely because the user selected a very large maximum.
         int effective = pocketai::generation_limit(
             capacity,
             static_cast<int>(position),
@@ -525,15 +620,11 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(JNIEnv *env, 
             minimum
         );
 
-        // Only when history leaves less than the minimum useful response window,
-        // reset the old conversational KV tail while keeping the system prompt.
         if (!effective) {
             const int resets_before = history_resets;
             if (!make_turn_room(static_cast<int>(tokens.size()) + minimum)) return 1;
 
             if (history_resets != resets_before) {
-                // A history reset changes template state (and can change BOS handling),
-                // so rebuild the exact model input against the retained system prompt.
                 formatted = chat_template ? format_message("user", user, true) : user;
                 tokens = tokenize_input(formatted, chat_template);
                 if (tokens.empty()) return 1;
@@ -557,7 +648,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(JNIEnv *env, 
         const auto start = ggml_time_us();
         const int result = decode_prompt(tokens, true);
         prompt_us = ggml_time_us() - start;
-        prompt_tokens = tokens.size();
+        prompt_tokens = static_cast<int>(tokens.size());
         if (result) return result;
         if (chat_template) add_message("user", user);
         budget.start(maximum, effective);
@@ -566,7 +657,10 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(JNIEnv *env, 
         generation_eog = false;
         generating = true;
         return 0;
-    } catch (...) { context_dirty = true; return 2; }
+    } catch (...) {
+        context_dirty = true;
+        return 2;
+    }
 }
 
 extern "C" JNIEXPORT jstring JNICALL
