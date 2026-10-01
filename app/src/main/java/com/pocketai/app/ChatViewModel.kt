@@ -147,11 +147,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             inference.setSystemPrompt(SYSTEM_PROMPT)
             thermalListener.onThermalStatusChanged(runCatching { power.currentThermalStatus }.getOrDefault(0))
             val info = inference.diagnostics()
+            val actualContext = Regex("Context: (\\d+)").find(info)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                ?.coerceIn(512, options.contextSize) ?: options.contextSize
+            activeOptions = options.copy(contextSize = actualContext)
             activeFile = file
             needsHistoryRestore = true
-            logs.event("model_ready options=$options diagnostics=$info")
+            logs.event("model_ready options=$activeOptions diagnostics=$info")
             prefs.edit().putString("lastModel", file.name).apply()
-            update { it.copy(modelName = file.nameWithoutExtension, status = "Prêt · ${options.threads} threads · ${options.contextSize} tokens", diagnostics = info) }
+            update { it.copy(modelName = file.nameWithoutExtension, status = "Prêt · ${activeOptions.threads} threads · ${activeOptions.contextSize} tokens", diagnostics = info) }
         } catch (error: Exception) {
             activeFile = null
             update { it.copy(modelName = null, diagnostics = "") }
