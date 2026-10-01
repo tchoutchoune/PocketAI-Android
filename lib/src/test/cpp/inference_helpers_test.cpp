@@ -29,6 +29,9 @@ int main() {
     assert(pocketai::strip_thinking("<think>secret</think>visible").compare("visible") == 0);
     assert(pocketai::strip_thinking("avant<think>secret</think>apres").compare("avantapres") == 0);
     assert(pocketai::strip_thinking("<think>incomplet").empty());
+    assert(pocketai::thinking_content("visible").empty());
+    assert(pocketai::thinking_content("<think>secret</think>visible").compare("secret") == 0);
+    assert(pocketai::thinking_content("<think>a</think>x<think>b</think>").compare("a\nb") == 0);
     assert(pocketai::utf8_codepoints("abc") == 3);
     assert(pocketai::utf8_codepoints("\xC3\xA9") == 1);
     assert(pocketai::utf8_codepoints("\xF0\x9F\x98\x80") == 1);
