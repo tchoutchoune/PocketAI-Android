@@ -87,6 +87,23 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         get() = prefs.getInt("maxTokens", 1024).coerceIn(64, 8192)
         set(value) { prefs.edit().putInt("maxTokens", value.coerceIn(64, 8192)).apply() }
 
+    var autoLength: Boolean
+        get() = prefs.getBoolean("autoLength", true)
+        set(value) { prefs.edit().putBoolean("autoLength", value).apply() }
+
+    fun effectiveMaxTokens(): Int {
+        if (!autoLength) return maxTokens
+        val contextCap = (activeOptions.contextSize / 4).coerceIn(256, 1024)
+        val profileCap = if (performanceMode == "eco") minOf(contextCap, 384) else contextCap
+        val thermalCap = when {
+            currentThermalStatus >= PowerManager.THERMAL_STATUS_CRITICAL -> 256
+            currentThermalStatus >= PowerManager.THERMAL_STATUS_SEVERE -> 384
+            currentThermalStatus >= PowerManager.THERMAL_STATUS_MODERATE -> 768
+            else -> 1024
+        }
+        return minOf(profileCap, thermalCap).coerceAtLeast(128)
+    }
+
     init {
         logs.event("application_started")
         thermalRegistered = runCatching {
@@ -152,7 +169,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val battery = batteryTemperatureC()?.let { " · batt. %.1f°C".format(it) }.orEmpty()
         return ("%s · threads %d/%d · %.2f tok/s · ctx %d · batch %d · max %d\nCPU proc. %.1f cœurs · RAM %d Mio · thermique %s%s%s").format(
             backend, currentThreadLimit, activeOptions.threads, tps,
-            activeOptions.contextSize, activeOptions.batchSize, maxTokens, cpuCoresUsed,
+            activeOptions.contextSize, activeOptions.batchSize, effectiveMaxTokens(), cpuCoresUsed,
             memoryAvailableMiB(), thermalLabel(currentThermalStatus), headroom, battery
         )
     }
@@ -358,7 +375,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             val inference = inference()
             suspend fun stream(prompt: String) {
                 thermalListener.onThermalStatusChanged(runCatching { power.currentThermalStatus }.getOrDefault(0))
-                inference.sendUserPrompt(prompt, maxTokens).collect { token ->
+                val tokenBudget = effectiveMaxTokens()
+                inference.sendUserPrompt(prompt, tokenBudget).collect { token ->
                     buffer.append(token)
                     chunks++
                     val now = android.os.SystemClock.elapsedRealtime()
@@ -388,7 +406,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 " threads=$currentThreadLimit/${activeOptions.threads}" +
                                 " context=${activeOptions.contextSize}" +
                                 " batch=${activeOptions.batchSize}" +
-                                " max_tokens=$maxTokens" +
+                                " max_tokens=${effectiveMaxTokens()}" +
+                                " auto_length=$autoLength" +
                                 " thermal=$currentThermalStatus(" + thermalLabel(currentThermalStatus) + ")" +
                                 " headroom=" + thermalHeadroom() +
                                 " ram_avail_mib=" + memoryAvailableMiB() +
@@ -432,7 +451,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             ).find(nativeInfo)?.groupValues
             val produced = generation?.get(1)?.toIntOrNull() ?: 0
             val effectiveLimit = generation?.get(2)?.toIntOrNull() ?: 0
-            val requestedLimit = generation?.get(3)?.toIntOrNull() ?: maxTokens
+            val requestedLimit = generation?.get(3)?.toIntOrNull() ?: effectiveMaxTokens()
             val contextLimited = generation?.get(4) == "yes"
             val reachedLimit = effectiveLimit > 0 && produced >= effectiveLimit
             var answer = buffer.toString()
