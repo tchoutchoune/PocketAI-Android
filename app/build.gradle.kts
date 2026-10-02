@@ -36,6 +36,7 @@ dependencies {
     implementation("io.noties.markwon:core:4.6.2")
     implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.8.7")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+    implementation("com.google.mlkit:text-recognition:16.0.1")
     testImplementation(libs.junit)
     testImplementation("org.json:json:20240303")
     testImplementation("org.robolectric:robolectric:4.16")
