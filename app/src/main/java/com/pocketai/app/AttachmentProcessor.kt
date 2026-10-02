@@ -2,6 +2,7 @@ package com.pocketai.app
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.ImageDecoder
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
 import android.provider.OpenableColumns
@@ -147,38 +148,62 @@ class AttachmentProcessor(private val context: Context) {
         val labeler = ImageLabeling.getClient(ImageLabelerOptions.DEFAULT_OPTIONS)
         return try {
             onProgress("OCR et analyse locale de l’image…")
-            val image = InputImage.fromFilePath(context, uri)
-            val textResult = Tasks.await(recognizer.process(image))
-            val labels = Tasks.await(labeler.process(image))
-                .asSequence()
-                .filter { it.confidence >= 0.45f }
-                .sortedByDescending { it.confidence }
-                .take(12)
-                .toList()
+            val bitmap = decodeBoundedImage(uri)
+            try {
+                val image = InputImage.fromBitmap(bitmap, 0)
+                val textResult = Tasks.await(recognizer.process(image))
+                val labels = Tasks.await(labeler.process(image))
+                    .asSequence()
+                    .filter { it.confidence >= 0.45f }
+                    .sortedByDescending { it.confidence }
+                    .take(12)
+                    .toList()
 
-            val combined = buildString {
-                if (textResult.text.isNotBlank()) {
-                    append("Texte OCR détecté :\n")
-                    append(textResult.text.trim())
-                    append("\n\n")
-                }
-                if (labels.isNotEmpty()) {
-                    append("Indices visuels détectés localement :\n")
-                    labels.forEach { label ->
-                        append("- ").append(label.text)
-                            .append(" (").append(String.format(Locale.ROOT, "%.0f%%", label.confidence * 100f)).append(")\n")
+                val combined = buildString {
+                    if (textResult.text.isNotBlank()) {
+                        append("Texte OCR détecté :\n")
+                        append(textResult.text.trim())
+                        append("\n\n")
                     }
-                    append("\nCes labels sont des indices génériques et peuvent être inexacts ; ne pas les présenter comme une certitude.")
+                    if (labels.isNotEmpty()) {
+                        append("Indices visuels détectés localement :\n")
+                        labels.forEach { label ->
+                            append("- ").append(label.text)
+                                .append(" (").append(String.format(Locale.ROOT, "%.0f%%", label.confidence * 100f)).append(")\n")
+                        }
+                        append("\nCes labels sont des indices génériques et peuvent être inexacts ; ne pas les présenter comme une certitude.")
+                    }
                 }
+                val bounded = bound(combined)
+                require(bounded.first.isNotBlank()) {
+                    "Aucun texte ni indice visuel exploitable détecté. Un vrai modèle vision multimodal sera nécessaire pour cette image."
+                }
+                PreparedAttachment(name, mime, "image OCR + vision légère", bounded.first, bounded.second, pages = 1)
+            } finally {
+                bitmap.recycle()
             }
-            val bounded = bound(combined)
-            require(bounded.first.isNotBlank()) {
-                "Aucun texte ni indice visuel exploitable détecté. Un vrai modèle vision multimodal sera nécessaire pour cette image."
-            }
-            PreparedAttachment(name, mime, "image OCR + vision légère", bounded.first, bounded.second, pages = 1)
         } finally {
             recognizer.close()
             labeler.close()
+        }
+    private fun decodeBoundedImage(uri: Uri): Bitmap {
+        val source = ImageDecoder.createSource(context.contentResolver, uri)
+        return ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+            val width = info.size.width.coerceAtLeast(1)
+            val height = info.size.height.coerceAtLeast(1)
+            val scale = minOf(
+                1f,
+                MAX_IMAGE_DIMENSION.toFloat() / width,
+                MAX_IMAGE_DIMENSION.toFloat() / height,
+            )
+            if (scale < 1f) {
+                decoder.setTargetSize(
+                    (width * scale).toInt().coerceAtLeast(1),
+                    (height * scale).toInt().coerceAtLeast(1),
+                )
+            }
+            decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+            decoder.isMutableRequired = false
         }
     }
 
@@ -274,6 +299,7 @@ class AttachmentProcessor(private val context: Context) {
         const val MAX_DOCX_XML_BYTES = 8 * 1024 * 1024
         const val MAX_EXTRACTED_CHARS = 18_000
         const val MAX_PDF_PAGES = 12
+        const val MAX_IMAGE_DIMENSION = 1800
         const val MAX_PDF_BITMAP_WIDTH = 1600
         const val MAX_PDF_BITMAP_HEIGHT = 2200
     }
