@@ -62,6 +62,7 @@ class MainActivity : AppCompatActivity() {
     private val shownMessages = mutableListOf<ChatMessage>()
     private lateinit var adapter: ChatAdapter
     private var pendingSave: GeneratedArtifact? = null
+    private var pendingCameraFile: File? = null
     private var lastModelsKey: Pair<Boolean, String?>? = null
     private var lastCreationKey: Pair<Boolean, Int>? = null
     private var exportInProgress = false
@@ -78,6 +79,17 @@ class MainActivity : AppCompatActivity() {
     }
     private val attachmentPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let(model::prepareAttachment)
+    }
+    private val cameraPicker = registerForActivityResult(ActivityResultContracts.TakePicture()) { success ->
+        val file = pendingCameraFile
+        pendingCameraFile = null
+        if (success && file != null && file.isFile && file.length() > 0) {
+            val uri = FileProvider.getUriForFile(this, "$packageName.files", file)
+            model.prepareAttachment(uri)
+        } else {
+            file?.delete()
+            if (!success) toast("Photo annulée")
+        }
     }
     private val savePicker = registerForActivityResult(object : ActivityResultContracts.CreateDocument("*/*") {
         override fun createIntent(context: android.content.Context, input: String): Intent =
@@ -230,7 +242,7 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(12), 0, dp(12), dp(4))
         }
-        attachmentButton = button("📎 Ajouter un fichier / une photo") {
+        attachmentButton = button("📎 Fichier / photo") {
             attachmentPicker.launch(arrayOf(
                 "text/*",
                 "application/json",
@@ -239,7 +251,8 @@ class MainActivity : AppCompatActivity() {
                 "image/*",
             ))
         }
-        attachmentRow.addView(attachmentButton, LinearLayout.LayoutParams(-2, -2))
+        attachmentRow.addView(attachmentButton, LinearLayout.LayoutParams(0, -2, 1f))
+        attachmentRow.addView(button("📷 Appareil photo") { startCameraCapture() }, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(6) })
         chat.addView(attachmentRow)
         attachmentStatus = text("", 11f).apply {
             visibility = View.GONE
@@ -725,6 +738,22 @@ class MainActivity : AppCompatActivity() {
         outState.putInt("tab", selectedTab)
         outState.putString("draft", input.text?.toString().orEmpty())
         pendingSave?.let { outState.putString("pendingPath", it.file.absolutePath); outState.putString("pendingMime", it.mimeType); outState.putString("pendingName", it.displayName) }
+    }
+
+    private fun startCameraCapture() {
+        try {
+            val directory = File(cacheDir, "exports").apply { mkdirs() }
+            directory.listFiles().orEmpty()
+                .filter { it.name.startsWith("camera-") && System.currentTimeMillis() - it.lastModified() > 60 * 60 * 1000L }
+                .forEach { it.delete() }
+            val file = File.createTempFile("camera-", ".jpg", directory)
+            pendingCameraFile = file
+            val uri = FileProvider.getUriForFile(this, "$packageName.files", file)
+            cameraPicker.launch(uri)
+        } catch (_: Exception) {
+            pendingCameraFile = null
+            showError("Impossible d’ouvrir l’appareil photo.")
+        }
     }
 
     private fun speakMessage(message: ChatMessage) {
