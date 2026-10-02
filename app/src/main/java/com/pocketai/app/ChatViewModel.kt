@@ -21,6 +21,9 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
@@ -201,6 +204,25 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             activeOptions.contextSize, activeOptions.batchSize, effectiveMaxTokens(), cpuCoresUsed,
             processPssMiB(), memoryAvailableMiB(), thermalLabel(currentThermalStatus), headroom, battery
         )
+    }
+
+    private fun nativeLiveMetrics(native: String): String {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val cpuCoresUsed = processCpuEquivalentCores(now)
+        val headroom = thermalHeadroom()?.let { " · marge %.2f".format(it) }.orEmpty()
+        val battery = batteryTemperatureC()?.let { " · batt. %.1f°C".format(it) }.orEmpty()
+        return buildString {
+            append(native.ifBlank { "Moteur actif" })
+            if (latestRollingTps > 0.0) append(" · roul ").append("%.2f".format(latestRollingTps)).append(" tok/s")
+            append("\nctx ").append(activeOptions.contextSize)
+                .append(" · batch ").append(activeOptions.batchSize)
+                .append(" · max ").append(effectiveMaxTokens())
+                .append(" · CPU proc. ").append("%.1f".format(cpuCoresUsed)).append(" cœurs")
+                .append(" · PSS ").append(processPssMiB()).append(" Mio")
+                .append(" · RAM libre ").append(memoryAvailableMiB()).append(" Mio")
+                .append(" · thermique ").append(thermalLabel(currentThermalStatus))
+                .append(headroom).append(battery)
+        }
     }
 
     private fun diagnosticsWithSessionNote(raw: String): String = buildString {
@@ -612,56 +634,78 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             val inference = inference()
-            suspend fun stream(prompt: String) {
+            suspend fun stream(prompt: String) = coroutineScope {
                 thermalListener.onThermalStatusChanged(runCatching { power.currentThermalStatus }.getOrDefault(0))
                 val tokenBudget = effectiveMaxTokens()
-                inference.sendUserPrompt(prompt, tokenBudget).collect { token ->
-                    buffer.append(token)
-                    chunks++
-                    val now = android.os.SystemClock.elapsedRealtime()
-                    val elapsedNow = now - started
+                var lastNativeProgressLog = 0L
+                val metricsPoller = launch(Dispatchers.Default) {
+                    while (isActive) {
+                        val now = android.os.SystemClock.elapsedRealtime()
+                        val native = inference.fastMetrics()
+                        if (native.isNotBlank()) {
+                            update { it.copy(liveMetrics = nativeLiveMetrics(native)) }
+                            if (now - lastNativeProgressLog >= 2_000) {
+                                lastNativeProgressLog = now
+                                logs.event(
+                                    "native_progress state=${native.replace('\n', ' ')}" +
+                                        " thermal=$currentThermalStatus(" + thermalLabel(currentThermalStatus) + ")" +
+                                        " pss_mib=" + processPssMiB() +
+                                        " ram_avail_mib=" + memoryAvailableMiB()
+                                )
+                            }
+                        }
+                        delay(350)
+                    }
+                }
+                try {
+                    inference.sendUserPrompt(prompt, tokenBudget).collect { token ->
+                        buffer.append(token)
+                        chunks++
+                        val now = android.os.SystemClock.elapsedRealtime()
+                        val elapsedNow = now - started
 
-                    if (now - lastPaint >= 100) {
-                        lastPaint = now
-                        update { s ->
-                            s.copy(messages = s.messages.map {
-                                if (it.id == response.id) it.copy(content = buffer.toString()) else it
-                            })
+                        if (now - lastPaint >= 100) {
+                            lastPaint = now
+                            update { s ->
+                                s.copy(messages = s.messages.map {
+                                    if (it.id == response.id) it.copy(content = buffer.toString()) else it
+                                })
+                            }
+                        }
+
+                        if (now - lastMetricsPaint >= 500) {
+                            lastMetricsPaint = now
+                            val rateDeltaMs = (now - lastRateTime).coerceAtLeast(1)
+                            val rateDeltaTokens = (chunks - lastRateTokens).coerceAtLeast(0)
+                            latestRollingTps = rateDeltaTokens * 1000.0 / rateDeltaMs
+                            lastRateTime = now
+                            lastRateTokens = chunks
+                        }
+
+                        if (now - lastProgressLog >= 5_000) {
+                            lastProgressLog = now
+                            logs.event(
+                                "generation_progress elapsed_ms=$elapsedNow emitted_tokens=$chunks " +
+                                    "backend=" + (if (activeOptions.gpuLayers > 0) "cpu+vulkan" else "cpu") +
+                                    " gpu_layers=${activeOptions.gpuLayers}" +
+                                    " threads=$currentThreadLimit/${activeOptions.threads}" +
+                                    " context=${activeOptions.contextSize}" +
+                                    " batch=${activeOptions.batchSize}" +
+                                    " max_tokens=${effectiveMaxTokens()}" +
+                                    " auto_length=$autoLength" +
+                                    " thermal=$currentThermalStatus(" + thermalLabel(currentThermalStatus) + ")" +
+                                    " headroom=" + thermalHeadroom() +
+                                    " ram_avail_mib=" + memoryAvailableMiB() +
+                                    " cpu_equiv_cores=" + "%.2f".format(latestProcessCpuCores) +
+                                    " process_pss_mib=" + processPssMiB() +
+                                    " rolling_tps=" + "%.2f".format(latestRollingTps) +
+                                    " average_tps=" + "%.2f".format(if (elapsedNow > 0) chunks * 1000.0 / elapsedNow else 0.0) +
+                                    " battery_c=" + batteryTemperatureC()
+                            )
                         }
                     }
-
-                    if (now - lastMetricsPaint >= 500) {
-                        lastMetricsPaint = now
-                        val rateDeltaMs = (now - lastRateTime).coerceAtLeast(1)
-                        val rateDeltaTokens = (chunks - lastRateTokens).coerceAtLeast(0)
-                        latestRollingTps = rateDeltaTokens * 1000.0 / rateDeltaMs
-                        lastRateTime = now
-                        lastRateTokens = chunks
-                        val metrics = liveMetrics(elapsedNow, chunks)
-                        update { it.copy(liveMetrics = metrics) }
-                    }
-
-                    if (now - lastProgressLog >= 5_000) {
-                        lastProgressLog = now
-                        logs.event(
-                            "generation_progress elapsed_ms=$elapsedNow emitted_tokens=$chunks " +
-                                "backend=" + (if (activeOptions.gpuLayers > 0) "cpu+vulkan" else "cpu") +
-                                " gpu_layers=${activeOptions.gpuLayers}" +
-                                " threads=$currentThreadLimit/${activeOptions.threads}" +
-                                " context=${activeOptions.contextSize}" +
-                                " batch=${activeOptions.batchSize}" +
-                                " max_tokens=${effectiveMaxTokens()}" +
-                                " auto_length=$autoLength" +
-                                " thermal=$currentThermalStatus(" + thermalLabel(currentThermalStatus) + ")" +
-                                " headroom=" + thermalHeadroom() +
-                                " ram_avail_mib=" + memoryAvailableMiB() +
-                                " cpu_equiv_cores=" + "%.2f".format(latestProcessCpuCores) +
-                                " process_pss_mib=" + processPssMiB() +
-                                " rolling_tps=" + "%.2f".format(latestRollingTps) +
-                                " average_tps=" + "%.2f".format(if (elapsedNow > 0) chunks * 1000.0 / elapsedNow else 0.0) +
-                                " battery_c=" + batteryTemperatureC()
-                        )
-                    }
+                } finally {
+                    metricsPoller.cancel()
                 }
             }
 
