@@ -324,7 +324,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun prepareAttachment(uri: android.net.Uri) = task("Analyse locale de la pièce jointe…") {
-        val prepared = attachments.prepare(uri)
+        val prepared = attachments.prepare(uri) { progress ->
+            update { it.copy(status = progress) }
+        }
         logs.event("attachment_prepared name=${prepared.name.take(80)} mime=${prepared.mimeType} kind=${prepared.kind} chars=${prepared.text.length} pages=${prepared.pages} truncated=${prepared.truncated}")
         update {
             it.copy(
