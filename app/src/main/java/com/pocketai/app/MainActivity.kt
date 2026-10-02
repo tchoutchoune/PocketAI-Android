@@ -115,6 +115,13 @@ class MainActivity : AppCompatActivity() {
                 pendingSave = GeneratedArtifact(file, savedInstanceState.getString("pendingMime") ?: "application/octet-stream", savedInstanceState.getString("pendingName") ?: file.name)
             }
         }
+        savedInstanceState?.getString("pendingCameraPath")?.let { path ->
+            val file = File(path)
+            val cameraDir = File(cacheDir, "exports")
+            if (file.exists() && runCatching { file.canonicalFile.parentFile == cameraDir.canonicalFile }.getOrDefault(false)) {
+                pendingCameraFile = file
+            }
+        }
         selectedTab = savedInstanceState?.getInt("tab") ?: 0
         val root = column().apply { setBackgroundColor(Color.parseColor("#10171E")) }
         ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
@@ -738,6 +745,7 @@ class MainActivity : AppCompatActivity() {
         outState.putInt("tab", selectedTab)
         outState.putString("draft", input.text?.toString().orEmpty())
         pendingSave?.let { outState.putString("pendingPath", it.file.absolutePath); outState.putString("pendingMime", it.mimeType); outState.putString("pendingName", it.displayName) }
+        pendingCameraFile?.let { outState.putString("pendingCameraPath", it.absolutePath) }
     }
 
     private fun startCameraCapture() {
