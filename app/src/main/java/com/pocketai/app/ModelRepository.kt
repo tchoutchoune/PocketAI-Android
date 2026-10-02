@@ -219,7 +219,7 @@ class ModelRepository(private val context: Context) {
             connection.instanceFollowRedirects = false
             connection.connectTimeout = 20_000
             connection.readTimeout = 20_000
-            connection.setRequestProperty("User-Agent", "PocketAI-Android/4.0")
+            connection.setRequestProperty("User-Agent", "PocketAI-Android/4.2")
             connection.setRequestProperty("Accept-Encoding", "identity")
             try {
                 val code = connection.responseCode
