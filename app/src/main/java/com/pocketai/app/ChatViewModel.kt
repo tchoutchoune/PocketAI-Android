@@ -370,7 +370,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val prepared = attachments.prepare(uri) { progress ->
             update { it.copy(status = progress) }
         }
-        logs.event("attachment_prepared name=${prepared.name.take(80)} mime=${prepared.mimeType} kind=${prepared.kind} chars=${prepared.text.length} pages=${prepared.pages} truncated=${prepared.truncated}")
+        logs.event("attachment_prepared mime=${prepared.mimeType} kind=${prepared.kind} chars=${prepared.text.length} pages=${prepared.pages} truncated=${prepared.truncated}")
         update {
             it.copy(
                 attachment = prepared,
