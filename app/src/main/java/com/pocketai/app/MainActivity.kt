@@ -73,6 +73,7 @@ class MainActivity : AppCompatActivity() {
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var pendingSpeech: String? = null
+    private var lastAutoSpokenMessageId: String? = null
 
     private val importPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let(model::importModel)
@@ -201,7 +202,7 @@ class MainActivity : AppCompatActivity() {
                     input.isEnabled = !state.busy
                     webToggle.isEnabled = !state.busy
                     attachmentButton.isEnabled = !state.busy
-                    attachmentStatus.text = state.attachment?.let { "📎 ${it.summary}  ·  toucher pour retirer" }.orEmpty()
+                    attachmentStatus.text = state.attachment?.let { "📎 ${it.summary} · reste joint aux prochaines questions · toucher pour retirer" }.orEmpty()
                     attachmentStatus.visibility = if (state.attachment == null) View.GONE else View.VISIBLE
                     val oldCount = shownMessages.size
                     if (shownMessages != state.messages) {
@@ -211,6 +212,13 @@ class MainActivity : AppCompatActivity() {
                         val newLastStreaming = state.messages.lastOrNull()?.isStreaming == true
                         shownMessages.clear()
                         shownMessages.addAll(state.messages)
+                        if (oldLastStreaming && !newLastStreaming) {
+                            val finished = shownMessages.lastOrNull()
+                            if (finished != null && !finished.isUser && ttsAutoRead() && lastAutoSpokenMessageId != finished.id) {
+                                lastAutoSpokenMessageId = finished.id
+                                speakMessage(finished)
+                            }
+                        }
                         if (samePrefix && shownMessages.isNotEmpty()) {
                             if (oldLastStreaming && newLastStreaming) {
                                 adapter.notifyItemChanged(shownMessages.lastIndex, ChatAdapter.PAYLOAD_STREAM)
@@ -527,6 +535,14 @@ class MainActivity : AppCompatActivity() {
         })
         settingsPanel.addView(text("En mode Auto, PocketAI adapte la longueur au contexte, au profil et à la pression thermique pour éviter les générations de plusieurs minutes. Une valeur manuelle reste disponible pour les réponses volontairement très longues.", 13f))
         settingsPanel.addView(text("Lecture vocale locale", 18f, true))
+        settingsPanel.addView(SwitchMaterial(this).apply {
+            text = "Lire automatiquement les réponses terminées"
+            isChecked = ttsAutoRead()
+            setTextColor(Color.parseColor("#D6E2EA"))
+            setOnCheckedChangeListener { _, checked ->
+                getSharedPreferences("pocketai", 0).edit().putBoolean("tts_auto_read", checked).apply()
+            }
+        })
         settingsPanel.addView(button("Vitesse de lecture : ${"%.2f".format(ttsRate())}×") {
             val rates = floatArrayOf(0.8f, 1.0f, 1.15f, 1.3f, 1.45f)
             val labels = rates.map { "${"%.2f".format(it)}×" }.toTypedArray()
@@ -826,6 +842,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun ttsRate(): Float =
         getSharedPreferences("pocketai", 0).getFloat("tts_rate", 1.0f).coerceIn(0.7f, 1.5f)
+
+    private fun ttsAutoRead(): Boolean =
+        getSharedPreferences("pocketai", 0).getBoolean("tts_auto_read", false)
 
     private fun speakText(text: String) {
         val engine = tts ?: return

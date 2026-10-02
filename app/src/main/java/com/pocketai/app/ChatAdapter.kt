@@ -120,7 +120,15 @@ class ChatAdapter(
         val visible = ResponseText.visible(message.content)
         holder.body.setTextIsSelectable(false)
         holder.body.movementMethod = null
-        holder.body.text = visible.ifBlank { "Préparation de la réponse…" }
+        val target = visible.ifBlank { "Préparation de la réponse…" }
+        val previous = holder.body.text?.toString().orEmpty()
+        // Most streaming updates only append text. Appending the delta avoids rebuilding
+        // a large TextView and reduces layout churn on long local generations.
+        if (visible.isNotBlank() && previous.isNotBlank() && target.startsWith(previous) && target.length > previous.length) {
+            holder.body.append(target.substring(previous.length))
+        } else if (previous != target) {
+            holder.body.text = target
+        }
         holder.progress.visibility = View.VISIBLE
         holder.actions.visibility = View.GONE
     }

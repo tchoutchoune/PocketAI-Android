@@ -675,7 +675,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             val visibleUserText = if (attachment == null) text else "$text\n\n📎 ${attachment.name}"
             val user = ChatMessage(content = visibleUserText, isUser = true)
             val response = ChatMessage(content = "", isUser = false, isStreaming = true)
-            update { it.copy(messages = it.messages + user + response, attachment = null) }
+            // Keep the active attachment available for follow-up questions until the user
+            // explicitly removes it or starts a new conversation.
+            update { it.copy(messages = it.messages + user + response) }
             val sources = if (settings.webSearchEnabled) tools.search(text).take(3) else emptyList()
             val buffer = StringBuilder()
             var lastPaint = 0L
@@ -689,6 +691,25 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             lastProcessCpuMs = Process.getElapsedCpuTime()
             var chunks = 0
             var firstTokenMs: Long? = null
+            refreshSlowTelemetry(started, force = true)
+            var peakPssMiB = cachedPssMiB
+            var minRamAvailableMiB = cachedRamAvailableMiB.takeIf { it > 0 } ?: Long.MAX_VALUE
+            var maxThermalStatus = currentThermalStatus
+            var maxBatteryC = cachedBatteryTemperatureC
+            var peakGpuBusyPct = cachedGpuBusyPercent
+            var peakGpuMHz = cachedGpuFrequencyMHz
+            var peakGpuC = cachedGpuTemperatureC
+
+            fun sampleTurnTelemetry() {
+                peakPssMiB = maxOf(peakPssMiB, cachedPssMiB)
+                if (cachedRamAvailableMiB > 0) minRamAvailableMiB = minOf(minRamAvailableMiB, cachedRamAvailableMiB)
+                maxThermalStatus = maxOf(maxThermalStatus, currentThermalStatus)
+                cachedBatteryTemperatureC?.let { value -> maxBatteryC = maxBatteryC?.let { maxOf(it, value) } ?: value }
+                cachedGpuBusyPercent?.let { value -> peakGpuBusyPct = peakGpuBusyPct?.let { maxOf(it, value) } ?: value }
+                cachedGpuFrequencyMHz?.let { value -> peakGpuMHz = peakGpuMHz?.let { maxOf(it, value) } ?: value }
+                cachedGpuTemperatureC?.let { value -> peakGpuC = peakGpuC?.let { maxOf(it, value) } ?: value }
+            }
+            sampleTurnTelemetry()
 
             fun buildPrompt(includeHistory: Boolean): String {
                 // Kotlin strings are measured in characters, not model tokens. These limits only
@@ -744,7 +765,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         val now = android.os.SystemClock.elapsedRealtime()
                         val native = inference.fastMetrics()
                         if (native.isNotBlank()) {
-                            update { it.copy(liveMetrics = nativeLiveMetrics(native)) }
+                            val hud = nativeLiveMetrics(native)
+                            sampleTurnTelemetry()
+                            update { it.copy(liveMetrics = hud) }
                             if (now - lastNativeProgressLog >= 2_000) {
                                 lastNativeProgressLog = now
                                 logs.event(
@@ -774,7 +797,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         chunks++
                         val elapsedNow = now - started
 
-                        if (now - lastPaint >= 140) {
+                        val paintIntervalMs = when {
+                            buffer.length >= 16_000 -> 300L
+                            buffer.length >= 8_000 -> 220L
+                            buffer.length >= 3_000 -> 180L
+                            else -> 120L
+                        }
+                        if (now - lastPaint >= paintIntervalMs) {
                             lastPaint = now
                             update { s ->
                                 s.copy(messages = s.messages.map {
@@ -905,13 +934,23 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             val firstTokenLatencyMs = firstTokenMs ?: elapsedMs
             val postFirstTokenMs = (elapsedMs - firstTokenLatencyMs).coerceAtLeast(1L)
             val appVisibleRate = if (chunks > 0) chunks * 1000.0 / postFirstTokenMs else 0.0
+            refreshSlowTelemetry(android.os.SystemClock.elapsedRealtime(), force = true)
+            sampleTurnTelemetry()
+            val minRamText = if (minRamAvailableMiB == Long.MAX_VALUE) -1L else minRamAvailableMiB
             val info = nativeInfo + "\nApp turn metrics: wall " + elapsedMs +
                 " ms; first-token-ms " + firstTokenLatencyMs +
                 "; post-first-token-tps " + "%.2f".format(appVisibleRate) +
                 "; emitted-chunks " + chunks +
                 "; raw-chars " + rawOutput.length +
                 "; visible-chars " + visibleOutput.length +
-                "; hidden-filtered-chars " + hiddenChars
+                "; hidden-filtered-chars " + hiddenChars +
+                "\nTurn telemetry peaks: pss-mib=" + peakPssMiB +
+                "; min-ram-mib=" + minRamText +
+                "; max-thermal=" + maxThermalStatus + "(" + thermalLabel(maxThermalStatus) + ")" +
+                "; max-battery-c=" + maxBatteryC +
+                "; peak-gpu-busy-pct=" + peakGpuBusyPct +
+                "; peak-gpu-mhz=" + peakGpuMHz +
+                "; peak-gpu-c=" + peakGpuC
             logs.event(
                 "generation_completed duration_s=$elapsed first_token_ms=$firstTokenLatencyMs" +
                     " post_first_token_tps=${"%.2f".format(appVisibleRate)} emitted_chunks=$chunks diagnostics=$info"
@@ -944,7 +983,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         task("Nouvelle conversation…") {
             engine?.takeIf { activeFile != null }?.let { it.setSystemPrompt(SYSTEM_PROMPT) }
             needsHistoryRestore = false
-            update { it.copy(messages = emptyList(), status = "Nouvelle conversation") }
+            update { it.copy(messages = emptyList(), attachment = null, status = "Nouvelle conversation") }
         }
     }
 
