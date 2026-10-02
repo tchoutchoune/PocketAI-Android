@@ -39,6 +39,7 @@ data class HardwareProfile(
         val hot = thermalStatus >= PowerManager.THERMAL_STATUS_SEVERE
         val warm = thermalStatus >= PowerManager.THERMAL_STATUS_MODERATE
         val eco = normalizedMode == "eco" || hot
+        val adaptive = normalizedMode == "auto"
         val cpuPerformance = normalizedMode == "cpu-performance"
         val vulkanExperimental = normalizedMode == "performance" || normalizedMode == "vulkan"
         val available = availableRamBytes.coerceAtLeast(0)
@@ -60,10 +61,9 @@ data class HardwareProfile(
             eco -> minOf(2, cpuCores)
             cpuPerformance -> minOf(6, cpuCores)
             vulkanExperimental -> minOf(4, cpuCores)
-            // Android battery saver should reduce load without making a 4B model
-            // practically unusable. The explicit Autonomy profile remains 2 threads.
-            powerSave -> minOf(3, cpuCores)
             warm -> minOf(3, cpuCores)
+            powerSave -> minOf(3, cpuCores)
+            adaptive && modelBytes >= 1536 * MIB && totalRamBytes >= 8 * GIB -> minOf(5, cpuCores)
             else -> minOf(4, cpuCores)
         }.coerceAtLeast(1)
 
@@ -82,7 +82,7 @@ data class HardwareProfile(
             batchSize = when {
                 context <= 1024 || eco -> 64
                 cpuPerformance || vulkanExperimental -> 256
-                powerSave -> 128
+                adaptive && !powerSave && !warm && context >= 2048 && modelBytes >= 1024 * MIB -> 256
                 else -> 128
             },
             gpuLayers = gpuLayers,
