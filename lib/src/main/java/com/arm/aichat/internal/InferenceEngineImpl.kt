@@ -47,6 +47,7 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
     private external fun load(modelPath: String): Int
     private external fun prepare(): Int
     private external fun nativeDiagnostics(): String
+    private external fun nativeFastMetrics(): String
     private external fun benchModel(pp: Int, tg: Int, pl: Int, nr: Int): String
     private external fun processSystemPrompt(systemPrompt: String): Int
     private external fun processUserPrompt(userPrompt: String, predictLength: Int): Int
@@ -110,6 +111,10 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
             check(!closing && !destroyed) { "Inference engine is closing or has been destroyed" }
             nativeDiagnostics()
         }
+    }
+
+    override fun fastMetrics(): String = synchronized(nativeControlLock) {
+        if (!nativeLoaded || closing || destroyed) "" else runCatching { nativeFastMetrics() }.getOrDefault("")
     }
 
     override fun cancelGeneration() {
