@@ -308,7 +308,8 @@ class MainActivity : AppCompatActivity() {
         modelsPanel.addView(text(HardwareProfile.detect(this).summary, 14f))
         modelsPanel.addView(text("Commence par un petit modèle pour la rapidité. PocketAI peut charger d’autres familles (Qwen, Gemma, DeepSeek, Mistral, Phi, etc.) dès lors que le fichier GGUF et son architecture sont pris en charge par la version intégrée de llama.cpp. Les fichiers restent sur ton téléphone.", 14f))
         modelsPanel.addView(button("Importer un fichier GGUF") { importPicker.launch(arrayOf("*/*")) }.apply { isEnabled = !model.state.value.busy })
-        modelsPanel.addView(button("Explorer les modèles GGUF sur Hugging Face") {
+        modelsPanel.addView(button("Rechercher un GGUF sur Hugging Face") { huggingFaceSearchDialog() }.apply { isEnabled = !model.state.value.busy })
+        modelsPanel.addView(button("Explorer Hugging Face dans le navigateur") {
             openLink("https://huggingface.co/models?library=gguf&sort=trending")
         })
         modelsPanel.addView(text("Modèles installés", 18f, true))
@@ -345,6 +346,54 @@ class MainActivity : AppCompatActivity() {
             controls.addView(button("Licence") { openLink(entry.licenseUrl) })
             contents.addView(controls); modelsPanel.addView(card(contents))
         }
+
+        val hf = model.state.value.hfResults
+        if (hf.isNotEmpty()) {
+            modelsPanel.addView(text("Résultats Hugging Face vérifiés", 18f, true))
+            modelsPanel.addView(text("PocketAI n’affiche ici que des fichiers GGUF publics non découpés dont Hugging Face fournit la taille et le SHA-256 LFS. La compatibilité de l’architecture est ensuite vérifiée par llama.cpp au chargement.", 13f))
+            hf.forEach { entry ->
+                val contents = column()
+                contents.addView(text(entry.title, 15f, true))
+                contents.addView(text(entry.description, 12f))
+                val controls = row()
+                controls.addView(button("Télécharger") {
+                    MaterialAlertDialogBuilder(this)
+                        .setTitle("Télécharger ce GGUF ?")
+                        .setMessage("${entry.title}\n\n${entry.description}\n\nLe fichier est épinglé au commit Hugging Face trouvé et son SHA-256 sera vérifié avant installation. Vérifie aussi la licence du dépôt.")
+                        .setNegativeButton("Annuler", null)
+                        .setPositiveButton("Télécharger") { _, _ -> model.downloadModel(entry) }
+                        .show()
+                }.apply { isEnabled = !model.state.value.busy })
+                controls.addView(button("Dépôt") { openLink(entry.licenseUrl) })
+                contents.addView(controls)
+                modelsPanel.addView(card(contents))
+            }
+            modelsPanel.addView(button("Effacer les résultats") { model.clearHuggingFaceResults(); renderModels() })
+        }
+    }
+
+    private fun huggingFaceSearchDialog() {
+        val field = EditText(this).apply {
+            hint = "Ex. Gemma 3 1B, DeepSeek R1, Qwen 3…"
+            inputType = InputType.TYPE_CLASS_TEXT
+            isSingleLine = true
+        }
+        val wrapper = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(4), dp(20), 0)
+            addView(field, LinearLayout.LayoutParams(-1, -2))
+        }
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Rechercher des GGUF")
+            .setMessage("Recherche publique sur Hugging Face. PocketAI retient uniquement les fichiers uniques disposant d’une empreinte SHA-256 vérifiable.")
+            .setView(wrapper)
+            .setNegativeButton("Annuler", null)
+            .setPositiveButton("Rechercher") { _, _ ->
+                val query = field.text?.toString()?.trim().orEmpty()
+                if (query.length >= 2) model.searchHuggingFace(query)
+                else toast("Saisis au moins deux caractères.")
+            }
+            .show()
     }
 
     private fun renderCreation() {
