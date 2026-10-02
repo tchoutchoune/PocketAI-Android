@@ -306,8 +306,11 @@ class MainActivity : AppCompatActivity() {
         modelsPanel.removeAllViews(); pad(modelsPanel)
         modelsPanel.addView(text("Le bon modèle pour ton téléphone", 22f, true))
         modelsPanel.addView(text(HardwareProfile.detect(this).summary, 14f))
-        modelsPanel.addView(text("Commence par 0,5B pour la rapidité. Un modèle plus grand demande davantage de mémoire. Les fichiers restent sur ton téléphone.", 14f))
+        modelsPanel.addView(text("Commence par un petit modèle pour la rapidité. PocketAI peut charger d’autres familles (Qwen, Gemma, DeepSeek, Mistral, Phi, etc.) dès lors que le fichier GGUF et son architecture sont pris en charge par la version intégrée de llama.cpp. Les fichiers restent sur ton téléphone.", 14f))
         modelsPanel.addView(button("Importer un fichier GGUF") { importPicker.launch(arrayOf("*/*")) }.apply { isEnabled = !model.state.value.busy })
+        modelsPanel.addView(button("Explorer les modèles GGUF sur Hugging Face") {
+            openLink("https://huggingface.co/models?library=gguf&sort=trending")
+        })
         modelsPanel.addView(text("Modèles installés", 18f, true))
         val installed = model.models.installed()
         if (installed.isEmpty()) modelsPanel.addView(text("Aucun modèle pour l’instant. Importe un GGUF ou télécharge un modèle ci-dessous.", 14f))
@@ -460,6 +463,9 @@ class MainActivity : AppCompatActivity() {
                 .setMessage(HardwareProfile.detect(this).summary + "\n\n" + model.state.value.diagnostics.ifBlank { "Charge un modèle pour confirmer le moteur utilisé." })
                 .setPositiveButton("Fermer", null).show()
         })
+        settingsPanel.addView(button("Benchmark CPU / modèle chargé") {
+            model.benchmarkActiveModel()
+        }.apply { isEnabled = model.state.value.modelName != null && !model.state.value.busy })
         settingsPanel.addView(button("Exporter les logs de débogage") {
             if (pendingSave == null && !exportInProgress) lifecycleScope.launch {
                 exportInProgress = true
