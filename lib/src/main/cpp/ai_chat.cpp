@@ -50,6 +50,13 @@ std::atomic<bool> cancelled{false};
 std::atomic<int> thread_limit{32};
 std::atomic<int> backend_warnings{0};
 std::atomic<int> backend_errors{0};
+std::atomic<int> live_phase{0}; // 0 idle, 1 prompt/prefill, 2 generation
+std::atomic<int> live_prompt_total{0};
+std::atomic<int> live_prompt_done{0};
+std::atomic<int> live_generated{0};
+std::atomic<int> live_threads{0};
+std::atomic<int> live_gpu_layers{0};
+std::atomic<int64_t> live_phase_start_us{0};
 pocketai::GenerationBudget budget;
 bool generating = false;
 bool generation_eog = false;
@@ -129,6 +136,7 @@ jstring android_text(JNIEnv *env, const std::string &text) {
 
 void apply_threads(llama_context *target = nullptr) {
     active_threads = std::max(1, std::min(options.threads, thread_limit.load(std::memory_order_relaxed)));
+    live_threads.store(active_threads, std::memory_order_relaxed);
     if (target || context) llama_set_n_threads(target ? target : context, active_threads, active_threads);
 }
 
@@ -147,6 +155,10 @@ void clear_conversation() {
     last_generated_token = -1;
     repeated_token_streak = 0;
     generation_degenerate = false;
+    live_phase.store(0, std::memory_order_relaxed);
+    live_prompt_total.store(0, std::memory_order_relaxed);
+    live_prompt_done.store(0, std::memory_order_relaxed);
+    live_generated.store(0, std::memory_order_relaxed);
 }
 
 void free_context() {
@@ -167,6 +179,10 @@ void free_context() {
     last_generated_token = -1;
     repeated_token_streak = 0;
     generation_degenerate = false;
+    live_phase.store(0, std::memory_order_relaxed);
+    live_prompt_total.store(0, std::memory_order_relaxed);
+    live_prompt_done.store(0, std::memory_order_relaxed);
+    live_generated.store(0, std::memory_order_relaxed);
 }
 
 void free_model() {
@@ -175,6 +191,7 @@ void free_model() {
     model_path.clear();
     system_prompt.clear();
     gpu_layers = 0;
+    live_gpu_layers.store(0, std::memory_order_relaxed);
     model_load_us = 0;
     context_prepare_us = 0;
     system_prompt_us = 0;
@@ -203,7 +220,10 @@ bool load_selected_model(bool use_gpu) {
     params.progress_callback = load_progress;
     params.progress_callback_user_data = nullptr;
     model = llama_model_load_from_file(model_path.c_str(), params);
-    if (model) gpu_layers = use_gpu ? std::min(options.gpu_layers, llama_model_n_layer(model) + 1) : 0;
+    if (model) {
+        gpu_layers = use_gpu ? std::min(options.gpu_layers, llama_model_n_layer(model) + 1) : 0;
+        live_gpu_layers.store(gpu_layers, std::memory_order_relaxed);
+    }
     return model != nullptr;
 }
 
@@ -286,6 +306,11 @@ bool make_turn_room(int required) {
 }
 
 int decode_prompt(const llama_tokens &tokens, bool last_logit) {
+    live_phase.store(1, std::memory_order_relaxed);
+    live_prompt_total.store(static_cast<int>(tokens.size()), std::memory_order_relaxed);
+    live_prompt_done.store(0, std::memory_order_relaxed);
+    live_generated.store(0, std::memory_order_relaxed);
+    live_phase_start_us.store(ggml_time_us(), std::memory_order_relaxed);
     for (size_t offset = 0; offset < tokens.size();) {
         if (cancelled.load()) { context_dirty = true; return 3; }
         const int count = std::min(options.batch, static_cast<int>(tokens.size() - offset));
@@ -301,6 +326,7 @@ int decode_prompt(const llama_tokens &tokens, bool last_logit) {
                          tokens.begin() + static_cast<std::ptrdiff_t>(offset + count));
         position += count;
         offset += count;
+        live_prompt_done.store(static_cast<int>(offset), std::memory_order_relaxed);
     }
     return 0;
 }
@@ -608,6 +634,9 @@ int process_reasoning_user(const std::string &user, int maximum) {
     generation_start = ggml_time_us();
     generation_end = 0;
     generation_eog = false;
+    live_generated.store(0, std::memory_order_relaxed);
+    live_phase_start_us.store(generation_start, std::memory_order_relaxed);
+    live_phase.store(2, std::memory_order_relaxed);
     generating = true;
     return 0;
 }
@@ -635,6 +664,7 @@ void finish_generation() {
         needs_end_of_turn = !generation_eog;
     }
     generating = false;
+    live_phase.store(0, std::memory_order_relaxed);
     cached_bytes.clear();
     log_event(ANDROID_LOG_INFO, cancelled.load() ? "Generation cancelled" : "Generation complete");
 }
@@ -801,6 +831,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(JNIEnv *env
         system_prompt = java_text(env, text);
         const int result = install_system_prompt();
         system_prompt_us = ggml_time_us() - start;
+        live_phase.store(0, std::memory_order_relaxed);
         return result;
     } catch (...) {
         system_prompt_us = ggml_time_us() - start;
@@ -908,6 +939,9 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(JNIEnv *env, 
         generation_start = ggml_time_us();
         generation_end = 0;
         generation_eog = false;
+        live_generated.store(0, std::memory_order_relaxed);
+        live_phase_start_us.store(generation_start, std::memory_order_relaxed);
+        live_phase.store(2, std::memory_order_relaxed);
         generating = true;
         return 0;
     } catch (...) {
@@ -967,6 +1001,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(JNIEnv *env, 
         kv_tokens.push_back(token);
         if (llama_vocab_is_eog(llama_model_get_vocab(model), token)) { generation_eog = true; finish_generation(); return nullptr; }
         budget.consume();
+        live_generated.store(budget.produced, std::memory_order_relaxed);
         cached_bytes += common_token_to_piece(context, token);
         if (pocketai::complete_utf8(cached_bytes)) {
             assistant_text += cached_bytes;
@@ -989,6 +1024,34 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(JNIEnv *env, 
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_finishGeneration(JNIEnv *, jobject) { finish_generation(); }
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_nativeFastMetrics(JNIEnv *env, jobject) {
+    const int phase = live_phase.load(std::memory_order_relaxed);
+    const int threads = live_threads.load(std::memory_order_relaxed);
+    const int layers = live_gpu_layers.load(std::memory_order_relaxed);
+    const int64_t started = live_phase_start_us.load(std::memory_order_relaxed);
+    const int64_t elapsed = started > 0 ? std::max<int64_t>(1, ggml_time_us() - started) : 1;
+    std::ostringstream out;
+    out.precision(3);
+    if (phase == 1) {
+        const int done = live_prompt_done.load(std::memory_order_relaxed);
+        const int total = live_prompt_total.load(std::memory_order_relaxed);
+        out << "Préfill " << done << "/" << total
+            << " · " << (done > 0 ? done * 1e6 / elapsed : 0.0) << " tok/s";
+    } else if (phase == 2) {
+        const int produced = live_generated.load(std::memory_order_relaxed);
+        out << "Génération " << produced
+            << " · " << (produced > 0 ? produced * 1e6 / elapsed : 0.0) << " tok/s";
+    } else {
+        out << "Moteur prêt";
+    }
+    out << " · " << (layers > 0 ? "CPU+Vulkan" : "CPU")
+        << " · threads " << threads
+        << " · GPU layers " << layers
+        << " · " << elapsed / 1000.0 << " ms";
+    return android_text(env, out.str());
+}
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_nativeDiagnostics(JNIEnv *env, jobject) {
