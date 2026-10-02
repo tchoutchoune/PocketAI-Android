@@ -67,6 +67,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val activityManager = application.getSystemService(ActivityManager::class.java)
     @Volatile private var currentThermalStatus = runCatching { power.currentThermalStatus }.getOrDefault(PowerManager.THERMAL_STATUS_NONE)
     @Volatile private var currentThreadLimit = 1
+    @Volatile private var preferredThreadLimit = 32
     private var lastMetricWallMs = android.os.SystemClock.elapsedRealtime()
     private var lastProcessCpuMs = Process.getElapsedCpuTime()
     @Volatile private var latestProcessCpuCores = 0.0
@@ -74,7 +75,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var thermalRegistered = false
     private val thermalListener = PowerManager.OnThermalStatusChangedListener { status ->
         currentThermalStatus = status
-        val requested = activeOptions.threads.coerceAtLeast(1)
+        val configured = activeOptions.threads.coerceAtLeast(1)
+        val requested = minOf(configured, preferredThreadLimit).coerceAtLeast(1)
         val limit = when {
             status >= PowerManager.THERMAL_STATUS_CRITICAL -> 1
             status >= PowerManager.THERMAL_STATUS_SEVERE -> minOf(2, requested)
@@ -83,7 +85,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }.coerceAtLeast(1)
         currentThreadLimit = limit
         engine?.setThreadLimit(limit)
-        logs.event("thermal=$status(" + thermalLabel(status) + ") thread_limit=$limit requested_threads=$requested headroom=" + thermalHeadroom())
+        logs.event("thermal=$status(" + thermalLabel(status) + ") thread_limit=$limit preferred_threads=$preferredThreadLimit configured_threads=$configured headroom=" + thermalHeadroom())
     }
 
     var performanceMode: String
@@ -242,6 +244,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         return retry
     }
 
+    private fun threadTuneKey(file: File, options: InferenceOptions): String =
+        "threads_" + listOf(
+            Build.MODEL,
+            file.name,
+            file.length(),
+            options.contextSize,
+            options.batchSize,
+            options.gpuLayers,
+            options.threads,
+        ).joinToString("|").hashCode()
+
+    private fun restoredThreadLimit(file: File, options: InferenceOptions): Int {
+        val stored = prefs.getInt(threadTuneKey(file, options), options.threads)
+        return stored.coerceIn(1, options.threads.coerceAtLeast(1))
+    }
+
     private suspend fun reloadActiveModelOnCpu(file: File): String {
         val reloadStarted = android.os.SystemClock.elapsedRealtime()
         val inference = inference()
@@ -258,6 +276,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         update { it.copy(status = "GPU instable détecté · bascule automatique sur CPU performance…") }
         inference.cleanUp()
         activeOptions = cpuOptions
+        preferredThreadLimit = restoredThreadLimit(file, cpuOptions)
         inference.configure(cpuOptions)
         inference.loadModel(file.absolutePath)
         inference.setSystemPrompt(SYSTEM_PROMPT)
@@ -396,6 +415,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 } else it
             }
             activeOptions = options
+            preferredThreadLimit = restoredThreadLimit(file, options)
             val loadWallStarted = android.os.SystemClock.elapsedRealtime()
             inference.configure(options)
             inference.loadModel(file.absolutePath)
@@ -432,9 +452,71 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun unloadModel() = task("Libération de la mémoire…") {
         activeFile = null
+        preferredThreadLimit = 32
         update { it.copy(modelName = null, diagnostics = "", liveMetrics = "") }
         engine?.cleanUp()
         update { it.copy(status = "Modèle déchargé") }
+    }
+
+    fun autoTuneThreads() {
+        val file = activeFile ?: run {
+            update { it.copy(error = "Charge d’abord un modèle pour régler les threads.") }
+            return
+        }
+        if (activeOptions.gpuLayers > 0) {
+            update { it.copy(error = "L’auto-réglage des threads est réservé au profil CPU. Recharge le modèle en Auto ou CPU performance.") }
+            return
+        }
+        task("Auto-réglage CPU du modèle…") {
+            val inference = inference()
+            val thermalMax = when {
+                currentThermalStatus >= PowerManager.THERMAL_STATUS_CRITICAL -> 1
+                currentThermalStatus >= PowerManager.THERMAL_STATUS_SEVERE -> minOf(2, activeOptions.threads)
+                currentThermalStatus >= PowerManager.THERMAL_STATUS_MODERATE -> minOf(4, activeOptions.threads)
+                else -> activeOptions.threads
+            }.coerceAtLeast(1)
+            val candidates = listOf(2, 3, 4, 5, 6)
+                .filter { it <= thermalMax && it <= activeOptions.threads }
+                .ifEmpty { listOf(1) }
+            data class Sample(val threads: Int, val prompt: Double, val generation: Double)
+            val samples = mutableListOf<Sample>()
+            for (threads in candidates) {
+                inference.setThreadLimit(threads)
+                currentThreadLimit = threads
+                update { it.copy(status = "Benchmark CPU · $threads thread(s)…") }
+                val result = inference.bench(
+                    minOf(128, (activeOptions.contextSize - 64).coerceAtLeast(32)),
+                    minOf(32, (activeOptions.contextSize - 64).coerceAtLeast(16)),
+                    1,
+                    1,
+                )
+                val prompt = Regex("Prompt: ([0-9.]+)").find(result)?.groupValues?.getOrNull(1)?.toDoubleOrNull() ?: 0.0
+                val generation = Regex("Generation: ([0-9.]+)").find(result)?.groupValues?.getOrNull(1)?.toDoubleOrNull() ?: 0.0
+                if (prompt > 0 && generation > 0) samples += Sample(threads, prompt, generation)
+                logs.event("thread_tune_sample model=${file.name} threads=$threads prompt_tps=$prompt generation_tps=$generation thermal=$currentThermalStatus")
+            }
+            require(samples.isNotEmpty()) { "Le benchmark CPU n’a produit aucune mesure exploitable." }
+            val maxPrompt = samples.maxOf { it.prompt }.coerceAtLeast(0.001)
+            val maxGeneration = samples.maxOf { it.generation }.coerceAtLeast(0.001)
+            val best = samples.maxBy { sample ->
+                0.35 * sample.prompt / maxPrompt + 0.65 * sample.generation / maxGeneration
+            }
+            preferredThreadLimit = best.threads
+            inference.setThreadLimit(best.threads)
+            currentThreadLimit = best.threads
+            prefs.edit().putInt(threadTuneKey(file, activeOptions), best.threads).apply()
+            val summary = samples.joinToString(" · ") {
+                "${it.threads}t: prompt ${"%.1f".format(it.prompt)}, gen ${"%.1f".format(it.generation)} tok/s"
+            }
+            logs.event("thread_tune_selected model=${file.name} threads=${best.threads} samples=$summary")
+            update {
+                it.copy(
+                    status = "Auto-réglage terminé · ${best.threads} threads",
+                    liveMetrics = "CPU réglé à ${best.threads}/${activeOptions.threads} threads · gen ${"%.1f".format(best.generation)} tok/s",
+                    diagnostics = diagnosticsWithSessionNote(inference.diagnostics()) + "\nThread auto-tune: $summary\nSelected: ${best.threads}",
+                )
+            }
+        }
     }
 
     fun benchmarkActiveModel() {
