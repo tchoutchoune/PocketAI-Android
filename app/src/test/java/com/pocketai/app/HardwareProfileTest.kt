@@ -76,6 +76,21 @@ class HardwareProfileTest {
         assertEquals(0, options.gpuLayers)
     }
 
+    @Test fun adaptiveProfileSpeedsLargeModelsWithoutEnablingGpu() {
+        val options = capable.recommend(2 * gib, "auto")
+        assertEquals(5, options.threads)
+        assertEquals(256, options.batchSize)
+        assertEquals(4096, options.contextSize)
+        assertEquals(0, options.gpuLayers)
+    }
+
+    @Test fun adaptiveProfileRespectsBatterySaver() {
+        val options = capable.copy(powerSave = true).recommend(2 * gib, "auto")
+        assertEquals(3, options.threads)
+        assertEquals(128, options.batchSize)
+        assertEquals(0, options.gpuLayers)
+    }
+
     @Test fun inaccessibleCoreFrequenciesStillProduceValidThreadCount() {
         val options = capable.copy(cpuCores = 1, bigCores = 0).recommend(mode = "balanced")
         assertEquals(1, options.threads)
