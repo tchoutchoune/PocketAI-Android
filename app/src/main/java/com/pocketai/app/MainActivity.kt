@@ -531,6 +531,9 @@ class MainActivity : AppCompatActivity() {
         settingsPanel.addView(button("Benchmark CPU / modèle chargé") {
             model.benchmarkActiveModel()
         }.apply { isEnabled = model.state.value.modelName != null && !model.state.value.busy })
+        settingsPanel.addView(button("Auto-régler les threads CPU") {
+            model.autoTuneThreads()
+        }.apply { isEnabled = model.state.value.modelName != null && !model.state.value.busy })
         settingsPanel.addView(button("Exporter les logs de débogage") {
             if (pendingSave == null && !exportInProgress) lifecycleScope.launch {
                 exportInProgress = true
