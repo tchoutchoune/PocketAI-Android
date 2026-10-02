@@ -41,19 +41,25 @@ data class PreparedAttachment(
  * Text files and DOCX are parsed directly; images and PDFs use the bundled ML Kit OCR model.
  */
 class AttachmentProcessor(private val context: Context) {
-    suspend fun prepare(uri: Uri): PreparedAttachment = withContext(Dispatchers.IO) {
+    suspend fun prepare(uri: Uri, onProgress: (String) -> Unit = {}): PreparedAttachment = withContext(Dispatchers.IO) {
         val metadata = metadata(uri)
         val name = metadata.first
         val mime = metadata.second
         val lower = name.lowercase(Locale.ROOT)
 
         when {
-            mime == "application/pdf" || lower.endsWith(".pdf") -> preparePdf(uri, name, mime)
+            mime == "application/pdf" || lower.endsWith(".pdf") -> preparePdf(uri, name, mime, onProgress)
             mime.startsWith("image/") || lower.endsWith(".png") || lower.endsWith(".jpg") ||
                 lower.endsWith(".jpeg") || lower.endsWith(".webp") || lower.endsWith(".heic") ->
-                prepareImage(uri, name, mime.ifBlank { "image/*" })
-            mime == DOCX_MIME || lower.endsWith(".docx") -> prepareDocx(uri, name, DOCX_MIME)
-            isTextLike(mime, lower) -> prepareText(uri, name, mime.ifBlank { "text/plain" })
+                prepareImage(uri, name, mime.ifBlank { "image/*" }, onProgress)
+            mime == DOCX_MIME || lower.endsWith(".docx") -> {
+                onProgress("Lecture du document DOCX…")
+                prepareDocx(uri, name, DOCX_MIME)
+            }
+            isTextLike(mime, lower) -> {
+                onProgress("Lecture du fichier texte…")
+                prepareText(uri, name, mime.ifBlank { "text/plain" })
+            }
             else -> throw IOException("Format non pris en charge pour l’analyse locale : $mime")
         }
     }
@@ -136,10 +142,11 @@ class AttachmentProcessor(private val context: Context) {
         return PreparedAttachment(name, mime, "DOCX", bounded.first, bounded.second)
     }
 
-    private fun prepareImage(uri: Uri, name: String, mime: String): PreparedAttachment {
+    private fun prepareImage(uri: Uri, name: String, mime: String, onProgress: (String) -> Unit): PreparedAttachment {
         val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         val labeler = ImageLabeling.getClient(ImageLabelerOptions.DEFAULT_OPTIONS)
         return try {
+            onProgress("OCR et analyse locale de l’image…")
             val image = InputImage.fromFilePath(context, uri)
             val textResult = Tasks.await(recognizer.process(image))
             val labels = Tasks.await(labeler.process(image))
@@ -175,7 +182,7 @@ class AttachmentProcessor(private val context: Context) {
         }
     }
 
-    private fun preparePdf(uri: Uri, name: String, mime: String): PreparedAttachment {
+    private fun preparePdf(uri: Uri, name: String, mime: String, onProgress: (String) -> Unit): PreparedAttachment {
         val descriptor = context.contentResolver.openFileDescriptor(uri, "r")
             ?: throw IOException("Impossible d’ouvrir le PDF.")
         val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
@@ -187,6 +194,7 @@ class AttachmentProcessor(private val context: Context) {
                 val output = StringBuilder()
                 for (index in 0 until pagesToRead) {
                     if (output.length >= MAX_EXTRACTED_CHARS) break
+                    onProgress("OCR PDF · page ${index + 1}/$pagesToRead")
                     renderer.openPage(index).use { page ->
                         val scale = minOf(
                             MAX_PDF_BITMAP_WIDTH.toFloat() / page.width.coerceAtLeast(1),
