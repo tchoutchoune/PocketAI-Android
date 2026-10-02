@@ -202,7 +202,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun processPssMiB(): Long =
-        (Debug.getPss().toLong() / 1024L).coerceAtLeast(0)
+        (Debug.getPss() / 1024L).coerceAtLeast(0L)
 
     private fun readGpuBusyPercent(): Double? = runCatching {
         val values = gpuBusyFile.readText().trim().split(Regex("\\s+"))
