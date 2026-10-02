@@ -42,10 +42,12 @@ class DiagnosticsLogTest {
 
     @Test fun rotatingLogsStayBoundedAndRetainRecentEvents() {
         val log = DiagnosticsLog(context)
-        repeat(700) { log.event("event-$it ${"x".repeat(2000)}") }
+        // Two 2 MiB generations are retained. Write enough data to force more than
+        // one rotation so this test still verifies eviction of the oldest events.
+        repeat(2400) { log.event("event-$it ${"x".repeat(2000)}") }
         val export = log.snapshot()
-        assertTrue(export.length < 1_100_000)
-        assertTrue(export.contains("event-699"))
+        assertTrue(export.length < 4_300_000)
+        assertTrue(export.contains("event-2399"))
         assertFalse(export.contains("event-0 "))
         assertTrue(File(context.filesDir, "diagnostics").listFiles().orEmpty().size <= 2)
     }
