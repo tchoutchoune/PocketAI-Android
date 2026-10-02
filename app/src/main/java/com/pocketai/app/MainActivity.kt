@@ -444,6 +444,22 @@ class MainActivity : AppCompatActivity() {
                 }.show()
         })
         settingsPanel.addView(text("En mode Auto, PocketAI adapte la longueur au contexte, au profil et à la pression thermique pour éviter les générations de plusieurs minutes. Une valeur manuelle reste disponible pour les réponses volontairement très longues.", 13f))
+        settingsPanel.addView(text("Lecture vocale locale", 18f, true))
+        settingsPanel.addView(button("Vitesse de lecture : ${"%.2f".format(ttsRate())}×") {
+            val rates = floatArrayOf(0.8f, 1.0f, 1.15f, 1.3f, 1.45f)
+            val labels = rates.map { "${"%.2f".format(it)}×" }.toTypedArray()
+            MaterialAlertDialogBuilder(this).setTitle("Vitesse de la voix")
+                .setItems(labels) { _, index ->
+                    getSharedPreferences("pocketai", 0).edit().putFloat("tts_rate", rates[index]).apply()
+                    tts?.setSpeechRate(rates[index])
+                    renderSettings()
+                }.show()
+        })
+        settingsPanel.addView(button("Arrêter la lecture vocale") {
+            tts?.stop()
+        })
+        settingsPanel.addView(text("PocketAI utilise en priorité une voix Android disponible hors ligne dans la langue du téléphone. Les longues réponses sont lues par morceaux pour éviter les limites du moteur TTS.", 13f))
+
         settingsPanel.addView(text("Services en ligne facultatifs", 18f, true))
         settingsPanel.addView(text("Aucun envoi en ligne sans action explicite. La recherche transmet la question à Brave. Les générations d’image/vidéo transmettent leur description au fournisseur. Les clés sont chiffrées sur ce téléphone et exclues des sauvegardes.", 14f))
         settingsPanel.addView(button("Recherche web · ${if (model.settings.hasBraveKey) "configurée" else "à configurer"}") { onlineDialog("web") })
@@ -689,6 +705,15 @@ class MainActivity : AppCompatActivity() {
             if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
                 engine.setLanguage(Locale.FRANCE)
             }
+            val targetLanguage = engine.voice?.locale?.language ?: preferred.language
+            engine.voices.orEmpty()
+                .filter { !it.isNetworkConnectionRequired && it.locale.language == targetLanguage }
+                .maxWithOrNull(
+                    compareBy<android.speech.tts.Voice> { it.quality }
+                        .thenByDescending { -it.latency }
+                )
+                ?.let { engine.voice = it }
+            engine.setSpeechRate(ttsRate())
             ttsReady = true
             pendingSpeech?.also {
                 pendingSpeech = null
@@ -697,9 +722,13 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun ttsRate(): Float =
+        getSharedPreferences("pocketai", 0).getFloat("tts_rate", 1.0f).coerceIn(0.7f, 1.5f)
+
     private fun speakText(text: String) {
         val engine = tts ?: return
         engine.stop()
+        engine.setSpeechRate(ttsRate())
         val max = (TextToSpeech.getMaxSpeechInputLength() - 256).coerceAtLeast(1000)
         val chunks = mutableListOf<String>()
         var remaining = text
