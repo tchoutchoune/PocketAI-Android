@@ -20,6 +20,9 @@ interface InferenceEngine {
     /** Hardware, backend selection, fallback reason, and last generation throughput. */
     suspend fun diagnostics(): String
 
+    /** Lock-free native progress snapshot safe to poll while prompt/generation work is running. */
+    fun fastMetrics(): String
+
     /** Cancel a native decode or model load without waiting for the inference dispatcher. */
     fun cancelGeneration()
 
