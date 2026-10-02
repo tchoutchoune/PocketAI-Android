@@ -6,6 +6,7 @@ import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
+import android.speech.tts.TextToSpeech
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
@@ -39,6 +40,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.Locale
 
 class MainActivity : AppCompatActivity() {
     private lateinit var model: ChatViewModel
@@ -50,6 +52,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var sendButton: MaterialButton
     private lateinit var input: TextInputEditText
     private lateinit var webToggle: SwitchMaterial
+    private lateinit var attachmentButton: MaterialButton
+    private lateinit var attachmentStatus: TextView
     private lateinit var chat: LinearLayout
     private lateinit var modelsPanel: LinearLayout
     private lateinit var creationPanel: LinearLayout
@@ -65,9 +69,15 @@ class MainActivity : AppCompatActivity() {
     private lateinit var newButton: MaterialButton
     private var selectedTab = 0
     private var followStreaming = true
+    private var tts: TextToSpeech? = null
+    private var ttsReady = false
+    private var pendingSpeech: String? = null
 
     private val importPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let(model::importModel)
+    }
+    private val attachmentPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let(model::prepareAttachment)
     }
     private val savePicker = registerForActivityResult(object : ActivityResultContracts.CreateDocument("*/*") {
         override fun createIntent(context: android.content.Context, input: String): Intent =
@@ -171,6 +181,9 @@ class MainActivity : AppCompatActivity() {
                     sendButton.text = if (state.busy) "Arrêter" else "Envoyer"
                     input.isEnabled = !state.busy
                     webToggle.isEnabled = !state.busy
+                    attachmentButton.isEnabled = !state.busy
+                    attachmentStatus.text = state.attachment?.let { "📎 ${it.summary}  ·  toucher pour retirer" }.orEmpty()
+                    attachmentStatus.visibility = if (state.attachment == null) View.GONE else View.VISIBLE
                     val oldCount = shownMessages.size
                     if (shownMessages != state.messages) {
                         val changed = shownMessages.size == state.messages.size && shownMessages.dropLast(1) == state.messages.dropLast(1)
@@ -212,11 +225,41 @@ class MainActivity : AppCompatActivity() {
         }
         toggleRow.addView(webToggle, LinearLayout.LayoutParams(-1, -2))
         chat.addView(toggleRow)
-        adapter = ChatAdapter(this, shownMessages, ::chooseExport) { message ->
-            val clipboard = getSystemService(ClipboardManager::class.java)
-            clipboard.setPrimaryClip(ClipData.newPlainText("PocketAI", (if (message.isUser) message.content else ResponseText.visible(message.content))))
-            toast("Réponse copiée")
+
+        val attachmentRow = row().apply {
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), 0, dp(12), dp(4))
         }
+        attachmentButton = button("📎 Ajouter un fichier / une photo") {
+            attachmentPicker.launch(arrayOf(
+                "text/*",
+                "application/json",
+                "application/pdf",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "image/*",
+            ))
+        }
+        attachmentRow.addView(attachmentButton, LinearLayout.LayoutParams(-2, -2))
+        chat.addView(attachmentRow)
+        attachmentStatus = text("", 11f).apply {
+            visibility = View.GONE
+            setPadding(dp(16), 0, dp(16), dp(6))
+            setTextColor(Color.parseColor("#9DE3C5"))
+            setOnClickListener { model.clearAttachment() }
+        }
+        chat.addView(attachmentStatus)
+
+        adapter = ChatAdapter(
+            this,
+            shownMessages,
+            ::chooseExport,
+            { message ->
+                val clipboard = getSystemService(ClipboardManager::class.java)
+                clipboard.setPrimaryClip(ClipData.newPlainText("PocketAI", (if (message.isUser) message.content else ResponseText.visible(message.content))))
+                toast("Réponse copiée")
+            },
+            ::speakMessage,
+        )
         messageList = RecyclerView(this).apply {
             layoutManager = LinearLayoutManager(this@MainActivity).apply { stackFromEnd = true }
             adapter = this@MainActivity.adapter
@@ -608,6 +651,80 @@ class MainActivity : AppCompatActivity() {
         outState.putInt("tab", selectedTab)
         outState.putString("draft", input.text?.toString().orEmpty())
         pendingSave?.let { outState.putString("pendingPath", it.file.absolutePath); outState.putString("pendingMime", it.mimeType); outState.putString("pendingName", it.displayName) }
+    }
+
+    private fun speakMessage(message: ChatMessage) {
+        val plain = ResponseText.visible(message.content)
+            .replace(Regex("(?m)^[#>*+\\-]+\\s*"), "")
+            .replace(Regex("\\[([^]]+)]\\([^)]*\\)"), "$1")
+            .replace(Regex("[*_~`]{1,3}"), "")
+            .trim()
+        if (plain.isBlank()) return
+        if (ttsReady) {
+            speakText(plain)
+            return
+        }
+        pendingSpeech = plain
+        if (tts != null) {
+            toast("Préparation de la voix…")
+            return
+        }
+        tts = TextToSpeech(this) { status ->
+            if (status != TextToSpeech.SUCCESS) {
+                pendingSpeech = null
+                tts?.shutdown()
+                tts = null
+                showError("La synthèse vocale Android n’est pas disponible sur cet appareil.")
+                return@TextToSpeech
+            }
+            val engine = tts ?: return@TextToSpeech
+            val preferred = Locale.getDefault()
+            val result = engine.setLanguage(preferred)
+            if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                engine.setLanguage(Locale.FRANCE)
+            }
+            ttsReady = true
+            pendingSpeech?.also {
+                pendingSpeech = null
+                speakText(it)
+            }
+        }
+    }
+
+    private fun speakText(text: String) {
+        val engine = tts ?: return
+        engine.stop()
+        val max = (TextToSpeech.getMaxSpeechInputLength() - 256).coerceAtLeast(1000)
+        val chunks = mutableListOf<String>()
+        var remaining = text
+        while (remaining.length > max) {
+            val window = remaining.take(max)
+            val split = maxOf(
+                window.lastIndexOf(". "),
+                window.lastIndexOf("! "),
+                window.lastIndexOf("? "),
+                window.lastIndexOf("\n"),
+                window.lastIndexOf(" "),
+            ).takeIf { it >= max / 2 } ?: max
+            chunks += remaining.substring(0, split + if (split < remaining.length && remaining.getOrNull(split) != ' ') 0 else 1).trim()
+            remaining = remaining.substring((split + 1).coerceAtMost(remaining.length)).trimStart()
+        }
+        if (remaining.isNotBlank()) chunks += remaining
+        chunks.forEachIndexed { index, chunk ->
+            engine.speak(
+                chunk,
+                if (index == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD,
+                null,
+                "pocketai-${System.nanoTime()}-$index",
+            )
+        }
+    }
+
+    override fun onDestroy() {
+        tts?.stop()
+        tts?.shutdown()
+        tts = null
+        super.onDestroy()
     }
 
     private fun showError(message: String) { MaterialAlertDialogBuilder(this).setTitle("PocketAI").setMessage(message).setPositiveButton("Compris", null).show() }
