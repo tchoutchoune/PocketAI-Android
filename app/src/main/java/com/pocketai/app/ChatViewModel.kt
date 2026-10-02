@@ -451,9 +451,34 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun downloadModel(entry: ModelEntry) = task("Téléchargement de ${entry.title}…") {
+        var baseBytes = -1L
+        var baseTimeMs = android.os.SystemClock.elapsedRealtime()
+        var lastDownloadLogMs = 0L
         val file = models.download(entry) { received, total ->
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (baseBytes < 0L) {
+                baseBytes = received
+                baseTimeMs = now
+            }
+            val deltaBytes = (received - baseBytes).coerceAtLeast(0L)
+            val deltaMs = (now - baseTimeMs).coerceAtLeast(1L)
+            val bytesPerSecond = deltaBytes * 1000.0 / deltaMs
             val percent = if (total > 0) "${received * 100 / total}%" else "${received / 1024 / 1024} Mo"
-            update { it.copy(status = "${entry.title} · $percent") }
+            val speed = if (bytesPerSecond >= 1024.0) {
+                " · ${"%.1f".format(bytesPerSecond / (1024.0 * 1024.0))} Mo/s"
+            } else ""
+            val eta = if (total > received && bytesPerSecond > 32 * 1024) {
+                val seconds = ((total - received) / bytesPerSecond).toLong().coerceAtLeast(0L)
+                " · reste ~${if (seconds >= 60) "${seconds / 60} min ${seconds % 60} s" else "${seconds} s"}"
+            } else ""
+            update { it.copy(status = "${entry.title} · $percent$speed$eta") }
+            if (now - lastDownloadLogMs >= 5_000L) {
+                lastDownloadLogMs = now
+                logs.event(
+                    "model_download_progress received=$received total=$total" +
+                        " bytes_per_s=${"%.0f".format(bytesPerSecond)} resumed_from=${baseBytes.coerceAtLeast(0L)}"
+                )
+            }
         }
         update { it.copy(status = "${file.name} disponible") }
     }
@@ -663,6 +688,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             lastMetricWallMs = started
             lastProcessCpuMs = Process.getElapsedCpuTime()
             var chunks = 0
+            var firstTokenMs: Long? = null
 
             fun buildPrompt(includeHistory: Boolean): String {
                 // Kotlin strings are measured in characters, not model tokens. These limits only
@@ -727,9 +753,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 try {
                     inference.sendUserPrompt(prompt, tokenBudget).collect { token ->
+                        val now = android.os.SystemClock.elapsedRealtime()
+                        if (chunks == 0) {
+                            firstTokenMs = now - started
+                            logs.event(
+                                "first_token latency_ms=${firstTokenMs}" +
+                                    " backend=" + (if (activeOptions.gpuLayers > 0) "cpu+vulkan" else "cpu") +
+                                    " threads=$currentThreadLimit/${activeOptions.threads}" +
+                                    " context=${activeOptions.contextSize} batch=${activeOptions.batchSize}"
+                            )
+                        }
                         buffer.append(token)
                         chunks++
-                        val now = android.os.SystemClock.elapsedRealtime()
                         val elapsedNow = now - started
 
                         if (now - lastPaint >= 140) {
@@ -786,6 +821,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 logs.event("gpu_corruption_detected model=${file.name} gpu_layers=${activeOptions.gpuLayers}; retrying_on_cpu=true")
                 buffer.setLength(0)
                 chunks = 0
+                firstTokenMs = null
+                lastRateTokens = 0
+                lastRateTime = android.os.SystemClock.elapsedRealtime()
                 lastPaint = 0L
                 update { s ->
                     s.copy(
@@ -857,17 +895,26 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             val rawOutput = buffer.toString()
             val visibleOutput = ResponseText.visible(rawOutput)
             val hiddenChars = (rawOutput.length - visibleOutput.length).coerceAtLeast(0)
+            val firstTokenLatencyMs = firstTokenMs ?: elapsedMs
+            val postFirstTokenMs = (elapsedMs - firstTokenLatencyMs).coerceAtLeast(1L)
+            val appVisibleRate = if (chunks > 0) chunks * 1000.0 / postFirstTokenMs else 0.0
             val info = nativeInfo + "\nApp turn metrics: wall " + elapsedMs +
-                " ms; emitted-chunks " + chunks +
+                " ms; first-token-ms " + firstTokenLatencyMs +
+                "; post-first-token-tps " + "%.2f".format(appVisibleRate) +
+                "; emitted-chunks " + chunks +
                 "; raw-chars " + rawOutput.length +
                 "; visible-chars " + visibleOutput.length +
                 "; hidden-filtered-chars " + hiddenChars
-            logs.event("generation_completed duration_s=$elapsed emitted_chunks=$chunks diagnostics=$info")
+            logs.event(
+                "generation_completed duration_s=$elapsed first_token_ms=$firstTokenLatencyMs" +
+                    " post_first_token_tps=${"%.2f".format(appVisibleRate)} emitted_chunks=$chunks diagnostics=$info"
+            )
             update {
                 it.copy(
-                    status = "Réponse terminée · ${"%.1f".format(elapsed)} s",
+                    status = "Réponse terminée · ${"%.1f".format(elapsed)} s · 1er token ${"%.1f".format(firstTokenLatencyMs / 1000.0)} s",
                     diagnostics = info,
-                    liveMetrics = liveMetrics(elapsedMs, chunks),
+                    liveMetrics = liveMetrics(elapsedMs, chunks) +
+                        "\n1er token ${"%.1f".format(firstTokenLatencyMs / 1000.0)} s · après 1er token ${"%.2f".format(appVisibleRate)} tok/s",
                 )
             }
         }
