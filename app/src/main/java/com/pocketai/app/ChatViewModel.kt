@@ -8,6 +8,7 @@ import android.os.BatteryManager
 import android.os.Build
 import android.os.PowerManager
 import android.os.Process
+import android.os.Debug
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.arm.aichat.AiChat
@@ -67,6 +68,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var lastMetricWallMs = android.os.SystemClock.elapsedRealtime()
     private var lastProcessCpuMs = Process.getElapsedCpuTime()
     @Volatile private var latestProcessCpuCores = 0.0
+    @Volatile private var latestRollingTps = 0.0
     private var thermalRegistered = false
     private val thermalListener = PowerManager.OnThermalStatusChangedListener { status ->
         currentThermalStatus = status
@@ -170,6 +172,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         return info.availMem / (1024 * 1024)
     }
 
+    private fun processPssMiB(): Long =
+        (Debug.getPss().toLong() / 1024L).coerceAtLeast(0)
+
     private fun processCpuEquivalentCores(nowWallMs: Long): Double {
         val cpuMs = Process.getElapsedCpuTime()
         val wallDelta = (nowWallMs - lastMetricWallMs).coerceAtLeast(1)
@@ -183,14 +188,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private fun liveMetrics(elapsedMs: Long, emittedTokens: Int): String {
         val now = android.os.SystemClock.elapsedRealtime()
         val cpuCoresUsed = processCpuEquivalentCores(now)
-        val tps = if (elapsedMs > 0) emittedTokens * 1000.0 / elapsedMs else 0.0
+        val averageTps = if (elapsedMs > 0) emittedTokens * 1000.0 / elapsedMs else 0.0
         val backend = if (activeOptions.gpuLayers > 0) "CPU+Vulkan" else "CPU"
         val headroom = thermalHeadroom()?.let { " · marge %.2f".format(it) }.orEmpty()
         val battery = batteryTemperatureC()?.let { " · batt. %.1f°C".format(it) }.orEmpty()
-        return ("%s · threads %d/%d · %.2f tok/s · ctx %d · batch %d · max %d\nCPU proc. %.1f cœurs · RAM %d Mio · thermique %s%s%s").format(
-            backend, currentThreadLimit, activeOptions.threads, tps,
+        return ("%s · threads %d/%d · %.2f tok/s (moy %.2f) · ctx %d · batch %d · max %d\nCPU proc. %.1f cœurs · PSS %d Mio · RAM libre %d Mio · thermique %s%s%s").format(
+            backend, currentThreadLimit, activeOptions.threads, latestRollingTps, averageTps,
             activeOptions.contextSize, activeOptions.batchSize, effectiveMaxTokens(), cpuCoresUsed,
-            memoryAvailableMiB(), thermalLabel(currentThermalStatus), headroom, battery
+            processPssMiB(), memoryAvailableMiB(), thermalLabel(currentThermalStatus), headroom, battery
         )
     }
 
@@ -459,6 +464,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             var lastMetricsPaint = 0L
             var lastProgressLog = 0L
             val started = android.os.SystemClock.elapsedRealtime()
+            var lastRateTime = started
+            var lastRateTokens = 0
+            latestRollingTps = 0.0
             lastMetricWallMs = started
             lastProcessCpuMs = Process.getElapsedCpuTime()
             var chunks = 0
@@ -521,6 +529,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
                     if (now - lastMetricsPaint >= 500) {
                         lastMetricsPaint = now
+                        val rateDeltaMs = (now - lastRateTime).coerceAtLeast(1)
+                        val rateDeltaTokens = (chunks - lastRateTokens).coerceAtLeast(0)
+                        latestRollingTps = rateDeltaTokens * 1000.0 / rateDeltaMs
+                        lastRateTime = now
+                        lastRateTokens = chunks
                         val metrics = liveMetrics(elapsedNow, chunks)
                         update { it.copy(liveMetrics = metrics) }
                     }
@@ -540,7 +553,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 " headroom=" + thermalHeadroom() +
                                 " ram_avail_mib=" + memoryAvailableMiB() +
                                 " cpu_equiv_cores=" + "%.2f".format(latestProcessCpuCores) +
-                                " live_tps=" + "%.2f".format(if (elapsedNow > 0) chunks * 1000.0 / elapsedNow else 0.0) +
+                                " process_pss_mib=" + processPssMiB() +
+                                " rolling_tps=" + "%.2f".format(latestRollingTps) +
+                                " average_tps=" + "%.2f".format(if (elapsedNow > 0) chunks * 1000.0 / elapsedNow else 0.0) +
                                 " battery_c=" + batteryTemperatureC()
                         )
                     }
