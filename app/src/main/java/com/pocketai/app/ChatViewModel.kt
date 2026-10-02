@@ -85,7 +85,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     var performanceMode: String
-        get() = prefs.getString("mode", "balanced") ?: "balanced"
+        get() = prefs.getString("mode", "auto") ?: "auto"
         set(value) {
             prefs.edit()
                 .putString("mode", value)
@@ -123,7 +123,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     init {
         // 4.1.1 migration: an old remembered Performance profile used Vulkan
         // automatically. Vulkan is now an explicit one-shot retry after failures.
-        if (prefs.getString("mode", "balanced") == "performance" &&
+        if (prefs.getString("mode", "auto") == "performance" &&
             !prefs.getBoolean("vulkan_retry_once", false)) {
             prefs.edit().putString("mode", "cpu-performance").apply()
         }
