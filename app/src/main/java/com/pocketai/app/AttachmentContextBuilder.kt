@@ -75,7 +75,14 @@ internal object AttachmentContextBuilder {
                     index to score
                 }
                 .sortedWith(compareByDescending<Pair<Int, Double>> { it.second }.thenBy { it.first })
-                .map { it.first }
+                .let { scored ->
+                    // A focused query should not consume the prompt budget with
+                    // unrelated zero-score chunks after the relevant passage was found.
+                    // If nothing matches, keep one deterministic fallback chunk so
+                    // callers still get useful document context instead of an empty prompt.
+                    val relevant = scored.filter { it.second > 0.0 }
+                    (if (relevant.isNotEmpty()) relevant else scored.take(1)).map { it.first }
+                }
         }
 
         val selected = mutableListOf<Int>()
