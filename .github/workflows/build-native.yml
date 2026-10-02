@@ -53,6 +53,11 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      - name: Restore stable preview signing key
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: pocketai-preview-debug-signing-v1
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
         with:
@@ -77,7 +82,7 @@ jobs:
       - name: Upload APK and verification evidence
         uses: actions/upload-artifact@v6
         with:
-          name: PocketAI-4.2.0-assistant-arm64-debug
+          name: PocketAI-4.2.1-assistant-arm64-debug
           path: out/*
           retention-days: 14
           if-no-files-found: error

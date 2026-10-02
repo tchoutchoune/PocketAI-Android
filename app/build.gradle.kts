@@ -7,11 +7,11 @@ android {
     compileSdk = 36
     ndkVersion = "29.0.13113456"
     defaultConfig {
-        applicationId = "io.github.tchoutchoune.pocketai.assistant420"
+        applicationId = "io.github.tchoutchoune.pocketai.preview"
         minSdk = 33
         targetSdk = 36
-        versionCode = 420
-        versionName = "4.2.0-assistant"
+        versionCode = 421
+        versionName = "4.2.1-assistant"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk { abiFilters += "arm64-v8a" }
     }
