@@ -33,6 +33,9 @@ class HuggingFaceRepository {
             val details = runCatching {
                 JSONObject(get("https://huggingface.co/api/models/${encodePath(repoId)}?blobs=true"))
             }.getOrNull() ?: continue
+            val pinnedRevision = details.optString("sha")
+                .takeIf { it.matches(Regex("[a-fA-F0-9]{40,64}")) }
+                ?: revision
             val siblings = details.optJSONArray("siblings") ?: continue
             val license = details.optJSONObject("cardData")?.optString("license").orEmpty()
             val downloads = details.optLong("downloads", model.optLong("downloads", 0L))
@@ -48,7 +51,7 @@ class HuggingFaceRepository {
                 val size = lfs.optLong("size", -1L)
                 if (!sha.matches(Regex("[a-f0-9]{64}")) || size < 16) continue
 
-                val pinned = if (revision == "main") "main" else revision
+                val pinned = if (pinnedRevision == "main") "main" else pinnedRevision
                 val url = "https://huggingface.co/${encodePath(repoId)}/resolve/$pinned/${encodePath(filename)}?download=true"
                 val quant = filename.substringBeforeLast(".gguf").substringAfterLast('-').uppercase()
                 val description = buildString {
