@@ -7,7 +7,7 @@ TASK_APK="$TASK_REPO/app/build/outputs/apk/debug/app-debug.apk"
 test -s "$TASK_APK"
 mkdir -p "$TASK_REPO/out"
 unzip -t "$TASK_APK" > "$TASK_REPO/out/ZIP-CHECK.txt"
-"$TASK_SDK/build-tools/35.0.0/apksigner" verify --verbose "$TASK_APK" > "$TASK_REPO/out/SIGNATURE.txt"
+"$TASK_SDK/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$TASK_APK" > "$TASK_REPO/out/SIGNATURE.txt"
 "$TASK_SDK/build-tools/35.0.0/aapt" dump badging "$TASK_APK" > "$TASK_REPO/out/PACKAGE.txt"
 python3 - "$TASK_APK" "$TASK_REPO/out" <<'PY'
 from pathlib import Path

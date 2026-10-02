@@ -15,8 +15,22 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk { abiFilters += "arm64-v8a" }
     }
+    val previewKeystore = rootProject.file(".ci-signing/preview-debug.keystore")
+    signingConfigs {
+        if (previewKeystore.exists()) {
+            create("preview") {
+                storeFile = previewKeystore
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
+    }
     buildTypes {
-        debug { isMinifyEnabled = false }
+        debug {
+            isMinifyEnabled = false
+            if (previewKeystore.exists()) signingConfig = signingConfigs.getByName("preview")
+        }
         release {
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")

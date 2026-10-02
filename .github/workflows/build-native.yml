@@ -56,8 +56,17 @@ jobs:
       - name: Restore stable preview signing key
         uses: actions/cache@v4
         with:
-          path: ~/.android/debug.keystore
-          key: pocketai-preview-debug-signing-v1
+          path: .ci-signing/preview-debug.keystore
+          key: pocketai-preview-debug-signing-v2
+      - name: Ensure stable preview signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .ci-signing
+          if [ ! -s .ci-signing/preview-debug.keystore ]; then
+            keytool -genkeypair -noprompt               -keystore .ci-signing/preview-debug.keystore               -storetype PKCS12               -storepass android               -alias androiddebugkey               -keypass android               -keyalg RSA               -keysize 2048               -validity 10000               -dname "CN=PocketAI Preview,O=PocketAI,C=FR"
+          fi
+          keytool -list -v             -keystore .ci-signing/preview-debug.keystore             -storepass android             -alias androiddebugkey | sed -n '/SHA256:/p'
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
         with:
