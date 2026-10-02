@@ -68,7 +68,7 @@ jobs:
       - name: Upload APK and verification evidence
         uses: actions/upload-artifact@v6
         with:
-          name: PocketAI-4.1.1-optimized-arm64-debug
+          name: PocketAI-4.2.0-assistant-arm64-debug
           path: out/*
           retention-days: 14
           if-no-files-found: error
