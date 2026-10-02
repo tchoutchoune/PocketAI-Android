@@ -469,6 +469,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
         task("Auto-réglage CPU du modèle…") {
             val inference = inference()
+            // Re-open the full configured range while tuning; an older saved tune
+            // must not prevent the benchmark from testing a faster thread count.
+            preferredThreadLimit = activeOptions.threads.coerceAtLeast(1)
             val thermalMax = when {
                 currentThermalStatus >= PowerManager.THERMAL_STATUS_CRITICAL -> 1
                 currentThermalStatus >= PowerManager.THERMAL_STATUS_SEVERE -> minOf(2, activeOptions.threads)
