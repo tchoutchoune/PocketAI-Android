@@ -534,11 +534,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 "${it.threads}t: prompt ${"%.1f".format(it.prompt)}, gen ${"%.1f".format(it.generation)} tok/s"
             }
             logs.event("thread_tune_selected model=${file.name} threads=${best.threads} samples=$summary")
+            val tunedDiagnostics = diagnosticsWithSessionNote(inference.diagnostics()) +
+                "\nThread auto-tune: $summary\nSelected: ${best.threads}"
             update {
                 it.copy(
                     status = "Auto-réglage terminé · ${best.threads} threads",
                     liveMetrics = "CPU réglé à ${best.threads}/${activeOptions.threads} threads · gen ${"%.1f".format(best.generation)} tok/s",
-                    diagnostics = diagnosticsWithSessionNote(inference.diagnostics()) + "\nThread auto-tune: $summary\nSelected: ${best.threads}",
+                    diagnostics = tunedDiagnostics,
                 )
             }
         }
