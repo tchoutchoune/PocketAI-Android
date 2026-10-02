@@ -10,8 +10,8 @@ android {
         applicationId = "io.github.tchoutchoune.pocketai.preview"
         minSdk = 33
         targetSdk = 36
-        versionCode = 421
-        versionName = "4.2.1-assistant"
+        versionCode = 422
+        versionName = "4.2.2-assistant-rag"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk { abiFilters += "arm64-v8a" }
     }

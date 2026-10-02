@@ -297,10 +297,10 @@ class AttachmentProcessor(private val context: Context) {
 
     private companion object {
         const val DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        const val MAX_TEXT_BYTES = 512 * 1024
+        const val MAX_TEXT_BYTES = 2 * 1024 * 1024
         const val MAX_DOCX_XML_BYTES = 8 * 1024 * 1024
-        const val MAX_EXTRACTED_CHARS = 18_000
-        const val MAX_PDF_PAGES = 12
+        const val MAX_EXTRACTED_CHARS = 120_000
+        const val MAX_PDF_PAGES = 24
         const val MAX_IMAGE_DIMENSION = 1800
         const val MAX_PDF_BITMAP_WIDTH = 1600
         const val MAX_PDF_BITMAP_HEIGHT = 2200
