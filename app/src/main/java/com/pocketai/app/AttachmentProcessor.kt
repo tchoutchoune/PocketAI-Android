@@ -7,6 +7,8 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import com.google.android.gms.tasks.Tasks
 import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.label.ImageLabeling
+import com.google.mlkit.vision.label.defaults.ImageLabelerOptions
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.Dispatchers
@@ -136,16 +138,40 @@ class AttachmentProcessor(private val context: Context) {
 
     private fun prepareImage(uri: Uri, name: String, mime: String): PreparedAttachment {
         val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+        val labeler = ImageLabeling.getClient(ImageLabelerOptions.DEFAULT_OPTIONS)
         return try {
             val image = InputImage.fromFilePath(context, uri)
-            val result = Tasks.await(recognizer.process(image))
-            val bounded = bound(result.text)
-            require(bounded.first.isNotBlank()) {
-                "Aucun texte détecté dans l’image. L’analyse visuelle générale nécessitera un modèle vision."
+            val textResult = Tasks.await(recognizer.process(image))
+            val labels = Tasks.await(labeler.process(image))
+                .asSequence()
+                .filter { it.confidence >= 0.45f }
+                .sortedByDescending { it.confidence }
+                .take(12)
+                .toList()
+
+            val combined = buildString {
+                if (textResult.text.isNotBlank()) {
+                    append("Texte OCR détecté :\n")
+                    append(textResult.text.trim())
+                    append("\n\n")
+                }
+                if (labels.isNotEmpty()) {
+                    append("Indices visuels détectés localement :\n")
+                    labels.forEach { label ->
+                        append("- ").append(label.text)
+                            .append(" (").append(String.format(Locale.ROOT, "%.0f%%", label.confidence * 100f)).append(")\n")
+                    }
+                    append("\nCes labels sont des indices génériques et peuvent être inexacts ; ne pas les présenter comme une certitude.")
+                }
             }
-            PreparedAttachment(name, mime, "image OCR", bounded.first, bounded.second, pages = 1)
+            val bounded = bound(combined)
+            require(bounded.first.isNotBlank()) {
+                "Aucun texte ni indice visuel exploitable détecté. Un vrai modèle vision multimodal sera nécessaire pour cette image."
+            }
+            PreparedAttachment(name, mime, "image OCR + vision légère", bounded.first, bounded.second, pages = 1)
         } finally {
             recognizer.close()
+            labeler.close()
         }
     }
 
