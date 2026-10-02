@@ -387,8 +387,8 @@ class MainActivity : AppCompatActivity() {
         settingsPanel.removeAllViews(); pad(settingsPanel)
         settingsPanel.addView(text("Ton PocketAI", 22f, true))
         settingsPanel.addView(text("Performances", 18f, true))
-        val modeLabels = arrayOf("CPU · équilibré", "CPU · performance", "Autonomie", "Vulkan · expérimental")
-        val modes = arrayOf("balanced", "cpu-performance", "eco", "performance")
+        val modeLabels = arrayOf("Auto · adaptatif", "CPU · performance", "CPU · équilibré", "Autonomie", "Vulkan · expérimental")
+        val modes = arrayOf("auto", "cpu-performance", "balanced", "eco", "performance")
         val selectedMode = modes.indexOf(model.performanceMode).coerceAtLeast(0)
         settingsPanel.addView(button("Profil : ${modeLabels[selectedMode]}") {
             MaterialAlertDialogBuilder(this).setTitle("Profil matériel")
@@ -411,7 +411,7 @@ class MainActivity : AppCompatActivity() {
                     }
                 }.setNegativeButton("Fermer", null).show()
         })
-        settingsPanel.addView(text("CPU · performance utilise davantage de cœurs et un batch plus grand pour accélérer surtout l’historique et les prompts longs. Vulkan reste expérimental sur Android et peut basculer automatiquement sur CPU si la sortie devient incohérente. La chauffe réduit toujours les threads.", 14f))
+        settingsPanel.addView(text("Auto adapte CPU, batch et contexte à la taille du modèle et à l’état du téléphone. CPU · performance pousse davantage les cœurs pour les gros modèles. Vulkan reste expérimental et n’est retenté qu’après une action explicite. La chauffe peut toujours réduire les threads.", 14f))
         val lengthLabel = if (model.autoLength) {
             "Auto · jusqu’à ${model.effectiveMaxTokens()} tokens"
         } else {
