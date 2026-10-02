@@ -38,6 +38,7 @@ internal data class ChatUiState(
     val diagnostics: String = "",
     val liveMetrics: String = "",
     val attachment: PreparedAttachment? = null,
+    val hfResults: List<ModelEntry> = emptyList(),
 )
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
@@ -47,6 +48,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     val logs = DiagnosticsLog(application)
     private val tools = OnlineTools(settings, artifacts)
     private val attachments = AttachmentProcessor(application)
+    private val huggingFace = HuggingFaceRepository()
     private val conversations = ConversationStore(application)
     private val prefs = application.getSharedPreferences("pocketai", 0)
     private val mutableState = MutableStateFlow(ChatUiState(messages = conversations.load(), artifacts = artifacts.list()))
@@ -348,6 +350,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
         update { it.copy(status = "${file.name} disponible") }
     }
+
+    fun searchHuggingFace(query: String) = task("Recherche de modèles GGUF sur Hugging Face…") {
+        val results = huggingFace.search(query)
+        logs.event("hf_search query_length=${query.length.coerceAtMost(80)} results=${results.size}")
+        update {
+            it.copy(
+                hfResults = results,
+                status = if (results.isEmpty()) "Aucun GGUF vérifiable trouvé pour « ${query.take(40)} »"
+                else "${results.size} modèle(s) GGUF trouvé(s) sur Hugging Face",
+            )
+        }
+    }
+
+    fun clearHuggingFaceResults() = update { it.copy(hfResults = emptyList()) }
 
     fun loadModel(file: File) = task("Préparation de ${file.name}…") {
         val inference = inference()
