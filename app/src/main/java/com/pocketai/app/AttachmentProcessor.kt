@@ -186,6 +186,8 @@ class AttachmentProcessor(private val context: Context) {
             recognizer.close()
             labeler.close()
         }
+    }
+
     private fun decodeBoundedImage(uri: Uri): Bitmap {
         val source = ImageDecoder.createSource(context.contentResolver, uri)
         return ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
