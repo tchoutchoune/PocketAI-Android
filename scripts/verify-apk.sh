@@ -8,6 +8,10 @@ test -s "$TASK_APK"
 mkdir -p "$TASK_REPO/out"
 unzip -t "$TASK_APK" > "$TASK_REPO/out/ZIP-CHECK.txt"
 "$TASK_SDK/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$TASK_APK" > "$TASK_REPO/out/SIGNATURE.txt"
+EXPECTED_PREVIEW_CERT_SHA256="a0f04583b124e77b5ea2c739e7206d8c92d9a06615166f94fe26c245c2985e77"
+ACTUAL_PREVIEW_CERT_SHA256=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$TASK_REPO/out/SIGNATURE.txt" | tr '[:upper:]' '[:lower:]' | tr -d ':')
+test "$ACTUAL_PREVIEW_CERT_SHA256" = "$EXPECTED_PREVIEW_CERT_SHA256"
+printf 'Preview signing certificate SHA-256: %s\n' "$ACTUAL_PREVIEW_CERT_SHA256" >> "$TASK_REPO/out/SIGNATURE.txt"
 "$TASK_SDK/build-tools/35.0.0/aapt" dump badging "$TASK_APK" > "$TASK_REPO/out/PACKAGE.txt"
 python3 - "$TASK_APK" "$TASK_REPO/out" <<'PY'
 from pathlib import Path
