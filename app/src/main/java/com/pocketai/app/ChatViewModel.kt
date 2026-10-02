@@ -414,6 +414,33 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         update { it.copy(status = "Modèle déchargé") }
     }
 
+    fun benchmarkActiveModel() {
+        val file = activeFile ?: run {
+            update { it.copy(error = "Charge d’abord un modèle pour lancer le benchmark.") }
+            return
+        }
+        task("Benchmark local du modèle…") {
+            val inference = inference()
+            thermalListener.onThermalStatusChanged(runCatching { power.currentThermalStatus }.getOrDefault(0))
+            val pp = minOf(256, (activeOptions.contextSize - 64).coerceAtLeast(32))
+            val tg = minOf(64, (activeOptions.contextSize - 64).coerceAtLeast(16))
+            val started = android.os.SystemClock.elapsedRealtime()
+            val result = inference.bench(pp, tg, 1, 2)
+            val elapsed = android.os.SystemClock.elapsedRealtime() - started
+            val raw = inference.diagnostics()
+            val info = diagnosticsWithSessionNote(raw) +
+                "\nApp benchmark: model=${file.name}; pp=$pp; tg=$tg; repetitions=2; wall-ms=$elapsed\n$result"
+            logs.event("benchmark model=${file.name} pp=$pp tg=$tg reps=2 wall_ms=$elapsed result=${result.replace('\n', ';')}")
+            update {
+                it.copy(
+                    status = "Benchmark terminé · ${elapsed / 1000.0} s",
+                    diagnostics = info,
+                    liveMetrics = result.replace("\n", " · "),
+                )
+            }
+        }
+    }
+
     fun send(text: String, outputFileName: String? = null, outputMime: String = "text/plain") {
         if (text.isBlank() || state.value.busy) return
         if (activeFile == null) {
