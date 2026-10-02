@@ -28,7 +28,9 @@ class HuggingFaceRepository {
         for (index in 0 until root.length()) {
             val model = root.optJSONObject(index) ?: continue
             val repoId = model.optString("id").takeIf { it.contains('/') } ?: continue
-            if (model.optBoolean("private", false) || model.optBoolean("gated", false)) continue
+            val gated = model.opt("gated")
+            val isGated = gated != null && gated != JSONObject.NULL && gated != false && gated.toString() != "false"
+            if (model.optBoolean("private", false) || isGated) continue
             val revision = model.optString("sha").takeIf { it.matches(Regex("[a-fA-F0-9]{40,64}")) } ?: "main"
             val details = runCatching {
                 JSONObject(get("https://huggingface.co/api/models/${encodePath(repoId)}?blobs=true"))
@@ -44,12 +46,14 @@ class HuggingFaceRepository {
             for (fileIndex in 0 until siblings.length()) {
                 val sibling = siblings.optJSONObject(fileIndex) ?: continue
                 val filename = sibling.optString("rfilename")
+                val lowerName = filename.lowercase()
                 if (!filename.endsWith(".gguf", ignoreCase = true)) continue
+                if ("mmproj" in lowerName || "projector" in lowerName) continue
                 if (Regex("(?i)-\\d{5}-of-\\d{5}\\.gguf$").containsMatchIn(filename)) continue
                 val lfs = sibling.optJSONObject("lfs") ?: continue
                 val sha = lfs.optString("sha256").lowercase()
                 val size = lfs.optLong("size", -1L)
-                if (!sha.matches(Regex("[a-f0-9]{64}")) || size < 16) continue
+                if (!sha.matches(Regex("[a-f0-9]{64}")) || size < 8L * 1024 * 1024) continue
 
                 val pinned = if (pinnedRevision == "main") "main" else pinnedRevision
                 val url = "https://huggingface.co/${encodePath(repoId)}/resolve/$pinned/${encodePath(filename)}?download=true"
@@ -74,6 +78,7 @@ class HuggingFaceRepository {
 
             candidates += files.sortedWith(
                 compareBy<ModelEntry> { quantizationRank(it.title) }
+                    .thenBy { mobileSizeRank(it.sizeBytes) }
                     .thenBy { it.sizeBytes }
             ).take(3)
             if (candidates.size >= limit) break
@@ -111,6 +116,13 @@ class HuggingFaceRepository {
 
     private fun encodePath(path: String): String =
         path.split('/').joinToString("/") { URLEncoder.encode(it, StandardCharsets.UTF_8.toString()).replace("+", "%20") }
+
+    private fun mobileSizeRank(bytes: Long): Int = when {
+        bytes <= 1L * 1024 * 1024 * 1024 -> 0
+        bytes <= 2L * 1024 * 1024 * 1024 -> 1
+        bytes <= 4L * 1024 * 1024 * 1024 -> 2
+        else -> 3
+    }
 
     private fun quantizationRank(title: String): Int = when {
         Regex("(?i)Q4_K_M").containsMatchIn(title) -> 0

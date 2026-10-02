@@ -7,10 +7,18 @@ TASK_LLAMA_DIR=${POCKETAI_LLAMA_DIR:-$TASK_TOOLS/llama.cpp}
 TASK_VULKAN_DIR=${POCKETAI_VULKAN_DIR:-$TASK_TOOLS/vulkan-tools}
 export PATH="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}/cmake/3.31.6/bin:$TASK_VULKAN_DIR/bin:$PATH"
 cd "$TASK_REPO"
+mkdir -p out build/native-tests
+BUILD_LOG="$TASK_REPO/out/BUILD.log"
+set +e
 bash gradlew -PllamaCppDir="$TASK_LLAMA_DIR" -PvulkanToolsDir="$TASK_VULKAN_DIR" \
     :app:assembleDebug :app:testDebugUnitTest :lib:testDebugUnitTest \
-    --no-daemon --max-workers=4 '-Dorg.gradle.jvmargs=-Xmx6g' "$@"
-mkdir -p out build/native-tests
+    --no-daemon --max-workers=4 '-Dorg.gradle.jvmargs=-Xmx6g' "$@" 2>&1 | tee "$BUILD_LOG"
+GRADLE_STATUS=${PIPESTATUS[0]}
+set -e
+if [ "$GRADLE_STATUS" -ne 0 ]; then
+    printf 'Gradle failed with exit code %s\n' "$GRADLE_STATUS" | tee -a "$BUILD_LOG" >&2
+    exit "$GRADLE_STATUS"
+fi
 g++ -std=c++17 -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined \
     lib/src/test/cpp/inference_helpers_test.cpp -o build/native-tests/inference-helpers
 build/native-tests/inference-helpers

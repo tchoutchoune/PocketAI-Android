@@ -22,7 +22,7 @@ import org.robolectric.annotation.Config
 class ChatAdapterTest {
     @Test fun sourceLinksAreClickableAndOpenTheBrowser() {
         val activity = activity()
-        val adapter = ChatAdapter(activity, mutableListOf(ChatMessage(content = "[Source](https://example.org/page)", isUser = false)), {}, {})
+        val adapter = ChatAdapter(activity, mutableListOf(ChatMessage(content = "[Source](https://example.org/page)", isUser = false)), {}, {}, {})
         val holder = adapter.onCreateViewHolder(LinearLayout(activity), 0)
         adapter.onBindViewHolder(holder, 0)
         assertTrue(holder.body.movementMethod is LinkMovementMethod)
@@ -36,7 +36,7 @@ class ChatAdapterTest {
     @Test fun modelLinksCannotLaunchLocalFilesOrApplicationSchemes() {
         val activity = activity()
         for (url in listOf("file:///private/data", "javascript:alert(1)", "intent://example", "content://private/data")) {
-            val adapter = ChatAdapter(activity, mutableListOf(ChatMessage(content = "[Lien]($url)", isUser = false)), {}, {})
+            val adapter = ChatAdapter(activity, mutableListOf(ChatMessage(content = "[Lien]($url)", isUser = false)), {}, {}, {})
             val holder = adapter.onCreateViewHolder(LinearLayout(activity), 0)
             adapter.onBindViewHolder(holder, 0)
             val text = holder.body.text as Spanned
@@ -48,13 +48,26 @@ class ChatAdapterTest {
     @Test fun hidesActionsUntilStreamingResponseIsComplete() {
         val activity = activity()
         val messages = mutableListOf(ChatMessage(content = "Début de réponse", isUser = false, isStreaming = true))
-        val adapter = ChatAdapter(activity, messages, {}, {})
+        val adapter = ChatAdapter(activity, messages, {}, {}, {})
         val holder = adapter.onCreateViewHolder(LinearLayout(activity), 0)
         adapter.onBindViewHolder(holder, 0)
         assertEquals(View.GONE, holder.actions.visibility)
         messages[0] = messages[0].copy(isStreaming = false)
         adapter.onBindViewHolder(holder, 0)
         assertEquals(View.VISIBLE, holder.actions.visibility)
+    }
+
+
+    @Test fun streamingPayloadUpdatesTextWithoutShowingActions() {
+        val activity = activity()
+        val messages = mutableListOf(ChatMessage(content = "Un", isUser = false, isStreaming = true))
+        val adapter = ChatAdapter(activity, messages, {}, {}, {})
+        val holder = adapter.onCreateViewHolder(LinearLayout(activity), 0)
+        adapter.onBindViewHolder(holder, 0)
+        messages[0] = messages[0].copy(content = "Un deux")
+        adapter.onBindViewHolder(holder, 0, mutableListOf(ChatAdapter.PAYLOAD_STREAM))
+        assertEquals("Un deux", holder.body.text.toString())
+        assertEquals(View.GONE, holder.actions.visibility)
     }
 
     private fun activity(): Activity = Robolectric.buildActivity(Activity::class.java).setup().get().apply {

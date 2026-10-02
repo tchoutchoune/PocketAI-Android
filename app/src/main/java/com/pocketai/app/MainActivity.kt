@@ -205,15 +205,28 @@ class MainActivity : AppCompatActivity() {
                     attachmentStatus.visibility = if (state.attachment == null) View.GONE else View.VISIBLE
                     val oldCount = shownMessages.size
                     if (shownMessages != state.messages) {
-                        val changed = shownMessages.size == state.messages.size && shownMessages.dropLast(1) == state.messages.dropLast(1)
-                        shownMessages.clear(); shownMessages.addAll(state.messages)
-                        if (changed && shownMessages.isNotEmpty()) adapter.notifyItemChanged(shownMessages.lastIndex)
-                        else adapter.notifyDataSetChanged()
+                        val samePrefix = shownMessages.size == state.messages.size &&
+                            shownMessages.dropLast(1) == state.messages.dropLast(1)
+                        val oldLastStreaming = shownMessages.lastOrNull()?.isStreaming == true
+                        val newLastStreaming = state.messages.lastOrNull()?.isStreaming == true
+                        shownMessages.clear()
+                        shownMessages.addAll(state.messages)
+                        if (samePrefix && shownMessages.isNotEmpty()) {
+                            if (oldLastStreaming && newLastStreaming) {
+                                adapter.notifyItemChanged(shownMessages.lastIndex, ChatAdapter.PAYLOAD_STREAM)
+                            } else {
+                                adapter.notifyItemChanged(shownMessages.lastIndex)
+                            }
+                        } else {
+                            adapter.notifyDataSetChanged()
+                        }
                         if (state.messages.size > oldCount) followStreaming = true
                         if (followStreaming && shownMessages.isNotEmpty()) {
-                            messageList.post {
-                                messageList.scrollToPosition(shownMessages.lastIndex)
-                                messageList.scrollBy(0, Int.MAX_VALUE)
+                            val target = shownMessages.lastIndex
+                            messageList.postOnAnimation {
+                                if (followStreaming && target < shownMessages.size) {
+                                    messageList.scrollToPosition(target)
+                                }
                             }
                         }
                     }

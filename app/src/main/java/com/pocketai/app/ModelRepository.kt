@@ -94,44 +94,69 @@ class ModelRepository(private val context: Context) {
                     onProgress(entry.sizeBytes, entry.sizeBytes)
                     return@withLock preferred
                 }
-                preflight(entry.sizeBytes)
+
                 val destination = uniqueFile(name)
-                val temporary = partialFile()
+                val temporary = resumablePartialFile(expectedHash)
+                if (temporary.length() > entry.sizeBytes) temporary.delete()
+                var existing = temporary.length().coerceAtMost(entry.sizeBytes)
+                preflight(entry.sizeBytes, existing)
+                onProgress(existing, entry.sizeBytes)
+
                 var connection: HttpsURLConnection? = null
                 try {
-                    connection = openHttps(entry.url)
+                    connection = openHttps(entry.url, existing)
+                    if (existing > 0 && connection.responseCode != 206) {
+                        connection.disconnect()
+                        connection = null
+                        temporary.delete()
+                        existing = 0L
+                        preflight(entry.sizeBytes)
+                        connection = openHttps(entry.url, 0L)
+                    }
+
+                    val expectedTransfer = (entry.sizeBytes - existing).coerceAtLeast(0L)
                     val advertisedLength = connection.contentLengthLong
-                    require(advertisedLength <= 0 || advertisedLength == entry.sizeBytes) {
-                        "La taille annoncée ne correspond pas au catalogue officiel."
+                    require(advertisedLength <= 0 || advertisedLength == expectedTransfer) {
+                        "La taille annoncée ne correspond pas au modèle attendu."
                     }
-                    val digest = MessageDigest.getInstance("SHA-256")
                     val count = connection.inputStream.use {
-                        copyToFile(it, temporary, entry.sizeBytes, digest) { progress ->
-                            onProgress(progress, entry.sizeBytes)
-                        }
+                        copyToFile(
+                            input = it,
+                            target = temporary,
+                            maximumBytes = entry.sizeBytes,
+                            progress = { progress -> onProgress(progress, entry.sizeBytes) },
+                            initialCount = existing,
+                            append = existing > 0,
+                        )
                     }
-                    require(count == entry.sizeBytes) { "Téléchargement incomplet : recommencez." }
+                    require(count == entry.sizeBytes) { "Téléchargement incomplet : la reprise sera proposée au prochain essai." }
                     validateHeader(temporary)
-                    require(digest.digest().toHex() == expectedHash) {
-                        "Empreinte SHA-256 incorrecte : le modèle téléchargé a été supprimé."
+                    currentCoroutineContext().ensureActive()
+                    val actualHash = sha256(temporary)
+                    require(actualHash == expectedHash) {
+                        temporary.delete()
+                        "Empreinte SHA-256 incorrecte : le téléchargement partiel a été supprimé."
                     }
                     currentCoroutineContext().ensureActive()
                     commit(temporary, destination)
                     onProgress(count, entry.sizeBytes)
                     destination
+                } catch (error: Exception) {
+                    if (temporary.length() > entry.sizeBytes) temporary.delete()
+                    throw error
                 } finally {
                     connection?.disconnect()
-                    temporary.delete()
                 }
             }
         }
 
-    private fun preflight(bytes: Long) {
+    private fun preflight(bytes: Long, alreadyPresent: Long = 0L) {
         require(bytes <= modelSizeLimit()) {
             "Ce modèle dépasse le budget mémoire prudent de cet appareil. Choisissez un modèle plus petit."
         }
-        require(directory.usableSpace >= bytes + STORAGE_RESERVE) {
-            "Espace insuffisant : libérez au moins ${((bytes + STORAGE_RESERVE) / MIB)} Mo."
+        val remaining = (bytes - alreadyPresent.coerceAtLeast(0L)).coerceAtLeast(0L)
+        require(directory.usableSpace >= remaining + STORAGE_RESERVE) {
+            "Espace insuffisant : libérez au moins ${((remaining + STORAGE_RESERVE) / MIB)} Mo."
         }
     }
 
@@ -147,11 +172,15 @@ class ModelRepository(private val context: Context) {
         maximumBytes: Long,
         digest: MessageDigest? = null,
         progress: ((Long) -> Unit)? = null,
+        initialCount: Long = 0L,
+        append: Boolean = false,
     ): Long {
-        var count = 0L
+        require(initialCount >= 0L && initialCount <= maximumBytes) { "Position de reprise invalide." }
+        require(!append || target.length() == initialCount) { "Le fichier partiel ne correspond pas à la position de reprise." }
+        var count = initialCount
         var lastReport = 0L
         BufferedInputStream(input, BUFFER_BYTES).use { buffered ->
-            FileOutputStream(target).use { fileOutput ->
+            FileOutputStream(target, append).use { fileOutput ->
                 BufferedOutputStream(fileOutput, BUFFER_BYTES).use { output ->
                     val buffer = ByteArray(BUFFER_BYTES)
                     while (true) {
@@ -202,6 +231,9 @@ class ModelRepository(private val context: Context) {
 
     private fun partialFile(): File = File(directory, ".${UUID.randomUUID()}.part")
 
+    private fun resumablePartialFile(expectedHash: String): File =
+        File(directory, ".download-${expectedHash.take(24)}.part")
+
     private fun commit(temporary: File, destination: File) {
         require(!destination.exists()) { "Un autre fichier porte déjà ce nom." }
         try {
@@ -211,16 +243,17 @@ class ModelRepository(private val context: Context) {
         }
     }
 
-    private fun openHttps(address: String): HttpsURLConnection {
+    private fun openHttps(address: String, rangeStart: Long = 0L): HttpsURLConnection {
         var next = URL(address)
         repeat(6) {
             require(next.protocol == "https" && next.userInfo == null) { "Seules les adresses HTTPS sont autorisées." }
             val connection = next.openConnection() as HttpsURLConnection
             connection.instanceFollowRedirects = false
             connection.connectTimeout = 20_000
-            connection.readTimeout = 20_000
+            connection.readTimeout = 30_000
             connection.setRequestProperty("User-Agent", "PocketAI-Android/4.2")
             connection.setRequestProperty("Accept-Encoding", "identity")
+            if (rangeStart > 0L) connection.setRequestProperty("Range", "bytes=$rangeStart-")
             try {
                 val code = connection.responseCode
                 if (code in listOf(301, 302, 303, 307, 308)) {
@@ -228,7 +261,8 @@ class ModelRepository(private val context: Context) {
                     next = URL(next, location)
                     connection.disconnect()
                 } else {
-                    if (code != 200) throw IOException("Le serveur du modèle répond HTTP $code.")
+                    val accepted = code == 200 || (rangeStart > 0L && code == 206)
+                    if (!accepted) throw IOException("Le serveur du modèle répond HTTP $code.")
                     return connection
                 }
             } catch (error: Exception) {

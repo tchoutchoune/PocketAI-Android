@@ -28,6 +28,8 @@ class ChatAdapter(
     private val onCopy: (ChatMessage) -> Unit,
     private val onSpeak: (ChatMessage) -> Unit,
 ) : RecyclerView.Adapter<ChatAdapter.MessageHolder>() {
+    init { setHasStableIds(true) }
+
     private val markdown = Markwon.builder(context).usePlugin(object : AbstractMarkwonPlugin() {
         override fun configureConfiguration(builder: MarkwonConfiguration.Builder) {
             builder.linkResolver { view, destination ->
@@ -46,6 +48,7 @@ class ChatAdapter(
     }).build()
 
     override fun getItemCount(): Int = messages.size
+    override fun getItemId(position: Int): Long = messages[position].id.hashCode().toLong()
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): MessageHolder {
         val root = FrameLayout(context).apply {
@@ -101,7 +104,28 @@ class ChatAdapter(
     }
 
     override fun onBindViewHolder(holder: MessageHolder, position: Int) {
+        bindFull(holder, messages[position])
+    }
+
+    override fun onBindViewHolder(holder: MessageHolder, position: Int, payloads: MutableList<Any>) {
         val message = messages[position]
+        if (payloads.contains(PAYLOAD_STREAM) && !message.isUser && message.isStreaming) {
+            bindStreamingText(holder, message)
+        } else {
+            bindFull(holder, message)
+        }
+    }
+
+    private fun bindStreamingText(holder: MessageHolder, message: ChatMessage) {
+        val visible = ResponseText.visible(message.content)
+        holder.body.setTextIsSelectable(false)
+        holder.body.movementMethod = null
+        holder.body.text = visible.ifBlank { "Préparation de la réponse…" }
+        holder.progress.visibility = View.VISIBLE
+        holder.actions.visibility = View.GONE
+    }
+
+    private fun bindFull(holder: MessageHolder, message: ChatMessage) {
         val visible = if (message.isUser) message.content else ResponseText.visible(message.content)
         val layout = holder.card.layoutParams as FrameLayout.LayoutParams
         layout.marginStart = if (message.isUser) dp(36) else 0
@@ -112,17 +136,11 @@ class ChatAdapter(
         holder.heading.text = if (message.isUser) "Vous" else "PocketAI"
         if (message.isUser) {
             holder.body.setTextIsSelectable(true)
+            holder.body.movementMethod = null
             holder.body.text = visible
         } else if (message.isStreaming) {
-            // Markdown parsing and span rebuilding on every token makes long answers
-            // janky and can fight RecyclerView scrolling. Stream cheap plain text,
-            // then render Markdown once when the answer is complete.
-            holder.body.setTextIsSelectable(false)
-            holder.body.movementMethod = null
-            holder.body.text = visible.ifBlank { "Préparation de la réponse…" }
+            bindStreamingText(holder, message)
         } else {
-            // Selectable TextViews install ArrowKeyMovementMethod; Markwon does not replace it.
-            // The explicit movement method makes source citations open in the browser.
             holder.body.setTextIsSelectable(false)
             holder.body.movementMethod = LinkMovementMethod.getInstance()
             markdown.setMarkdown(holder.body, visible.ifBlank { "Aucune réponse reçue." })
@@ -166,6 +184,10 @@ class ChatAdapter(
     }
 
     private fun dp(value: Int): Int = (value * context.resources.displayMetrics.density).toInt()
+
+    companion object {
+        const val PAYLOAD_STREAM = "stream"
+    }
 
     class MessageHolder(
         view: View,

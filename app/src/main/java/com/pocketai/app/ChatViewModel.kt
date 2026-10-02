@@ -75,6 +75,28 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var lastProcessCpuMs = Process.getElapsedCpuTime()
     @Volatile private var latestProcessCpuCores = 0.0
     @Volatile private var latestRollingTps = 0.0
+    @Volatile private var cachedPssMiB = 0L
+    @Volatile private var cachedRamAvailableMiB = 0L
+    @Volatile private var cachedBatteryTemperatureC: Float? = null
+    @Volatile private var cachedThermalHeadroom: Float? = null
+    @Volatile private var cachedGpuBusyPercent: Double? = null
+    @Volatile private var cachedGpuFrequencyMHz: Double? = null
+    @Volatile private var cachedGpuTemperatureC: Double? = null
+    private var lastSlowTelemetryMs = 0L
+    private val gpuBusyFile = File("/sys/class/kgsl/kgsl-3d0/gpubusy")
+    private val gpuFrequencyFile = File("/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq")
+    private val gpuThermalFile: File? by lazy {
+        runCatching {
+            File("/sys/class/thermal").listFiles().orEmpty()
+                .asSequence()
+                .filter { it.name.startsWith("thermal_zone") }
+                .mapNotNull { zone ->
+                    val type = runCatching { File(zone, "type").readText().trim().lowercase() }.getOrNull()
+                    if (type != null && ("gpu" in type || "kgsl" in type)) File(zone, "temp") else null
+                }
+                .firstOrNull()
+        }.getOrNull()
+    }
     private var thermalRegistered = false
     private val thermalListener = PowerManager.OnThermalStatusChangedListener { status ->
         currentThermalStatus = status
@@ -182,6 +204,48 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private fun processPssMiB(): Long =
         (Debug.getPss().toLong() / 1024L).coerceAtLeast(0)
 
+    private fun readGpuBusyPercent(): Double? = runCatching {
+        val values = gpuBusyFile.readText().trim().split(Regex("\\s+"))
+            .mapNotNull { it.toLongOrNull() }
+        if (values.size < 2 || values[1] <= 0L) null
+        else (values[0].toDouble() * 100.0 / values[1].toDouble()).coerceIn(0.0, 100.0)
+    }.getOrNull()
+
+    private fun readGpuFrequencyMHz(): Double? = runCatching {
+        val raw = gpuFrequencyFile.readText().trim().toDouble()
+        when {
+            raw >= 10_000_000.0 -> raw / 1_000_000.0
+            raw >= 10_000.0 -> raw / 1_000.0
+            raw > 0.0 -> raw
+            else -> null
+        }
+    }.getOrNull()
+
+    private fun readGpuTemperatureC(): Double? = runCatching {
+        val raw = gpuThermalFile?.readText()?.trim()?.toDoubleOrNull() ?: return@runCatching null
+        val celsius = if (raw > 1_000.0) raw / 1_000.0 else raw
+        celsius.takeIf { it in -20.0..150.0 }
+    }.getOrNull()
+
+    @Synchronized
+    private fun refreshSlowTelemetry(nowMs: Long, force: Boolean = false) {
+        if (!force && nowMs - lastSlowTelemetryMs < 1_500L) return
+        lastSlowTelemetryMs = nowMs
+        cachedPssMiB = processPssMiB()
+        cachedRamAvailableMiB = memoryAvailableMiB()
+        cachedBatteryTemperatureC = batteryTemperatureC()
+        cachedThermalHeadroom = thermalHeadroom()
+        cachedGpuBusyPercent = readGpuBusyPercent()
+        cachedGpuFrequencyMHz = readGpuFrequencyMHz()
+        cachedGpuTemperatureC = readGpuTemperatureC()
+    }
+
+    private fun gpuTelemetryText(): String = buildString {
+        cachedGpuBusyPercent?.let { append(" · GPU ").append("%.0f%%".format(it)) }
+        cachedGpuFrequencyMHz?.let { append(" ").append("%.0f".format(it)).append(" MHz") }
+        cachedGpuTemperatureC?.let { append(" ").append("%.1f°C".format(it)) }
+    }
+
     private fun processCpuEquivalentCores(nowWallMs: Long): Double {
         val cpuMs = Process.getElapsedCpuTime()
         val wallDelta = (nowWallMs - lastMetricWallMs).coerceAtLeast(1)
@@ -194,23 +258,25 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun liveMetrics(elapsedMs: Long, emittedTokens: Int): String {
         val now = android.os.SystemClock.elapsedRealtime()
+        refreshSlowTelemetry(now)
         val cpuCoresUsed = processCpuEquivalentCores(now)
         val averageTps = if (elapsedMs > 0) emittedTokens * 1000.0 / elapsedMs else 0.0
         val backend = if (activeOptions.gpuLayers > 0) "CPU+Vulkan" else "CPU"
-        val headroom = thermalHeadroom()?.let { " · marge %.2f".format(it) }.orEmpty()
-        val battery = batteryTemperatureC()?.let { " · batt. %.1f°C".format(it) }.orEmpty()
-        return ("%s · threads %d/%d · %.2f tok/s (moy %.2f) · ctx %d · batch %d · max %d\nCPU proc. %.1f cœurs · PSS %d Mio · RAM libre %d Mio · thermique %s%s%s").format(
+        val headroom = cachedThermalHeadroom?.let { " · marge %.2f".format(it) }.orEmpty()
+        val battery = cachedBatteryTemperatureC?.let { " · batt. %.1f°C".format(it) }.orEmpty()
+        return ("%s · threads %d/%d · %.2f tok/s (moy %.2f) · ctx %d · batch %d · max %d\nCPU proc. %.1f cœurs · PSS %d Mio · RAM libre %d Mio · thermique %s%s%s%s").format(
             backend, currentThreadLimit, activeOptions.threads, latestRollingTps, averageTps,
             activeOptions.contextSize, activeOptions.batchSize, effectiveMaxTokens(), cpuCoresUsed,
-            processPssMiB(), memoryAvailableMiB(), thermalLabel(currentThermalStatus), headroom, battery
+            cachedPssMiB, cachedRamAvailableMiB, thermalLabel(currentThermalStatus), headroom, battery, gpuTelemetryText()
         )
     }
 
     private fun nativeLiveMetrics(native: String): String {
         val now = android.os.SystemClock.elapsedRealtime()
+        refreshSlowTelemetry(now)
         val cpuCoresUsed = processCpuEquivalentCores(now)
-        val headroom = thermalHeadroom()?.let { " · marge %.2f".format(it) }.orEmpty()
-        val battery = batteryTemperatureC()?.let { " · batt. %.1f°C".format(it) }.orEmpty()
+        val headroom = cachedThermalHeadroom?.let { " · marge %.2f".format(it) }.orEmpty()
+        val battery = cachedBatteryTemperatureC?.let { " · batt. %.1f°C".format(it) }.orEmpty()
         return buildString {
             append(native.ifBlank { "Moteur actif" })
             if (latestRollingTps > 0.0) append(" · roul ").append("%.2f".format(latestRollingTps)).append(" tok/s")
@@ -218,10 +284,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 .append(" · batch ").append(activeOptions.batchSize)
                 .append(" · max ").append(effectiveMaxTokens())
                 .append(" · CPU proc. ").append("%.1f".format(cpuCoresUsed)).append(" cœurs")
-                .append(" · PSS ").append(processPssMiB()).append(" Mio")
-                .append(" · RAM libre ").append(memoryAvailableMiB()).append(" Mio")
+                .append(" · PSS ").append(cachedPssMiB).append(" Mio")
+                .append(" · RAM libre ").append(cachedRamAvailableMiB).append(" Mio")
                 .append(" · thermique ").append(thermalLabel(currentThermalStatus))
-                .append(headroom).append(battery)
+                .append(headroom).append(battery).append(gpuTelemetryText())
         }
     }
 
@@ -656,7 +722,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 )
                             }
                         }
-                        delay(350)
+                        delay(300)
                     }
                 }
                 try {
@@ -666,7 +732,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         val now = android.os.SystemClock.elapsedRealtime()
                         val elapsedNow = now - started
 
-                        if (now - lastPaint >= 100) {
+                        if (now - lastPaint >= 140) {
                             lastPaint = now
                             update { s ->
                                 s.copy(messages = s.messages.map {
@@ -840,8 +906,48 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         return artifact
     }
 
+    private fun runtimeDiagnosticSnapshot(): String {
+        val now = android.os.SystemClock.elapsedRealtime()
+        refreshSlowTelemetry(now, force = true)
+        val app = getApplication<Application>()
+        val version = runCatching {
+            app.packageManager.getPackageInfo(app.packageName, 0).versionName
+        }.getOrNull() ?: "unknown"
+        val native = engine?.fastMetrics().orEmpty()
+        return buildString {
+            append("PocketAI runtime snapshot\n")
+            append("app=").append(version)
+                .append(" package=").append(app.packageName)
+                .append(" android=").append(Build.VERSION.SDK_INT)
+                .append(" device=").append(Build.MANUFACTURER).append(" ").append(Build.MODEL)
+                .append(" abi=").append(Build.SUPPORTED_ABIS.joinToString()).append('\n')
+            append("mode=").append(performanceMode)
+                .append(" autoLength=").append(autoLength)
+                .append(" maxTokens=").append(maxTokens)
+                .append(" effectiveMax=").append(effectiveMaxTokens())
+                .append(" webEnabled=").append(settings.webSearchEnabled).append('\n')
+            append("model=").append(activeFile?.name ?: "none")
+                .append(" bytes=").append(activeFile?.length() ?: 0L)
+                .append(" options=").append(activeOptions)
+                .append(" threads=").append(currentThreadLimit).append('/').append(activeOptions.threads)
+                .append(" preferredThreads=").append(preferredThreadLimit).append('\n')
+            append("thermal=").append(currentThermalStatus).append('(').append(thermalLabel(currentThermalStatus)).append(')')
+                .append(" headroom=").append(cachedThermalHeadroom)
+                .append(" batteryC=").append(cachedBatteryTemperatureC)
+                .append(" pssMiB=").append(cachedPssMiB)
+                .append(" ramAvailMiB=").append(cachedRamAvailableMiB)
+                .append(" cpuEquivalentCores=").append("%.2f".format(latestProcessCpuCores))
+                .append(" gpuBusyPct=").append(cachedGpuBusyPercent)
+                .append(" gpuMHz=").append(cachedGpuFrequencyMHz)
+                .append(" gpuC=").append(cachedGpuTemperatureC).append('\n')
+            if (native.isNotBlank()) append("nativeLive=").append(native.replace('\n', ' ')).append('\n')
+        }
+    }
+
     fun exportLogs(): GeneratedArtifact {
-        val artifact = artifacts.createDocument("pocketai-diagnostic.txt", "text/plain", logs.snapshot() + "\n\n" + state.value.diagnostics)
+        val report = runtimeDiagnosticSnapshot() + "\n" + logs.snapshot() +
+            "\n\nCurrent engine diagnostics\n" + state.value.diagnostics
+        val artifact = artifacts.createDocument("pocketai-diagnostic.txt", "text/plain", report)
         update { it.copy(artifacts = artifacts.list()) }
         return artifact
     }
