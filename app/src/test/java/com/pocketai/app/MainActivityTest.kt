@@ -44,7 +44,9 @@ class MainActivityTest {
 
     @Test fun webCannotBeEnabledWithoutExplicitCredentialConfiguration() {
         val activity = start()
-        val toggle = views(activity).filterIsInstance<SwitchMaterial>().single()
+        val toggle = views(activity)
+            .filterIsInstance<SwitchMaterial>()
+            .first { it.text.toString() == "Compléter avec le web" }
         toggle.isChecked = true
         assertFalse(toggle.isChecked)
         assertFalse(ViewModelProvider(activity)[ChatViewModel::class.java].settings.webSearchEnabled)
