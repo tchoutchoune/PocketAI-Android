@@ -15,7 +15,7 @@ internal object VulkanTuning {
     fun candidates(base: InferenceOptions): List<InferenceOptions> =
         listOf(16, 256).flatMap { layers -> listOf(32, 64).map { micro ->
             base.copy(gpuLayers = layers, microBatchSize = micro)
-        } }
+        } } + listOf(16, 4).map { base.copy(gpuLayers = it, microBatchSize = 1) }
 
     private fun usable(sample: BackendMeasurement) = sample.validated &&
         sample.promptTps.isFinite() && sample.promptTps > 0 &&

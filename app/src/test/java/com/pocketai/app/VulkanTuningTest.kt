@@ -35,7 +35,7 @@ class VulkanTuningTest {
 
     @Test fun tuningCoversPartialAndFullOffloadWithSmallPhysicalBatches() {
         val candidates = VulkanTuning.candidates(InferenceOptions(batchSize = 128))
-        assertEquals(setOf(16 to 32, 16 to 64, 256 to 32, 256 to 64), candidates.map { it.gpuLayers to it.microBatchSize }.toSet())
+        assertEquals(setOf(16 to 32, 16 to 64, 256 to 32, 256 to 64, 16 to 1, 4 to 1), candidates.map { it.gpuLayers to it.microBatchSize }.toSet())
         assertTrue(candidates.all { it.batchSize == 128 })
     }
 }

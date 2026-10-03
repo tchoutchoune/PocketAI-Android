@@ -71,6 +71,8 @@ class VulkanBackendIntegrationTest {
         model.compareVulkanBackends(file)
         assertEquals(1, engine.benchmarks)
         assertEquals(0, engine.gpuValidations)
+        assertEquals(1, engine.cpuValidations)
+        assertEquals(0, model.gpuBlacklistCount)
         assertEquals("cpu-performance", model.performanceMode)
         assertEquals(history, model.state.value.messages)
         assertTrue(model.state.value.status.startsWith("CPU conservé"))
@@ -82,8 +84,9 @@ class VulkanBackendIntegrationTest {
         inject(engine)
         val history = model.state.value.messages
         model.compareVulkanBackends(file)
-        assertEquals(5, engine.benchmarks)
-        assertEquals(9, engine.gpuValidations)
+        assertEquals(7, engine.benchmarks)
+        assertEquals(13, engine.gpuValidations)
+        assertEquals(1, engine.cpuValidations)
         assertEquals("performance", model.performanceMode)
         assertEquals(history, model.state.value.messages)
         val recipe = app.getSharedPreferences("pocketai", 0).all.entries.single { it.key.startsWith("vulkan_recipe_") }
@@ -106,11 +109,84 @@ class VulkanBackendIntegrationTest {
         assertTrue(engine.cleanups >= 3)
     }
 
-    private class FakeEngine(val fallback: Boolean = false, val cancelValidation: Boolean = false) : InferenceEngine {
+    @Test fun failedGpuMetricsSurviveFinalCpuReloadAndPreventGpuBenchmark() = runBlocking {
+        val engine = FakeEngine(gpuFailureReason = "numeric_mismatch")
+        inject(engine)
+        model.compareVulkanBackends(file)
+        assertEquals(1, engine.benchmarks)
+        assertEquals("cpu-performance", model.performanceMode)
+        assertEquals(1, model.gpuBlacklistCount)
+        assertTrue(model.state.value.diagnostics.contains("raison=numeric_mismatch"))
+        assertTrue(model.state.value.diagnostics.contains("JS=0.08"))
+        assertTrue(model.state.value.diagnostics.contains("RMS relatif=0.11"))
+        assertTrue(model.state.value.backendComparison.contains("Contrôle CPU contre CPU : validé"))
+    }
+
+    @Test fun temporaryAllocationFailureDoesNotPersistGpuBlacklist() = runBlocking {
+        val engine = FakeEngine(gpuFailureReason = "context_allocation_failed")
+        inject(engine)
+        model.compareVulkanBackends(file)
+        assertEquals(0, model.gpuBlacklistCount)
+        assertEquals(1, engine.benchmarks)
+        assertTrue(model.state.value.diagnostics.contains("raison=context_allocation_failed"))
+        assertFalse(app.getSharedPreferences("pocketai", 0).all.keys.any { it.startsWith("vulkan_recipe_") })
+    }
+
+    @Test fun failedCpuSelfControlStopsBeforeAnyGpuAttempt() = runBlocking {
+        val engine = FakeEngine(cpuSelfFailure = true)
+        inject(engine)
+        val history = model.state.value.messages
+        try { model.compareVulkanBackends(file); fail("CPU self-control must stop the comparison") }
+        catch (error: IllegalArgumentException) { assertTrue(error.message!!.contains("GPU non évalué")) }
+        assertEquals(0, engine.gpuLoads)
+        assertEquals(0, engine.benchmarks)
+        assertEquals(0, model.gpuBlacklistCount)
+        assertEquals(history, model.state.value.messages)
+        assertTrue(model.state.value.backendComparison.contains("Contrôle CPU contre CPU : refusé"))
+    }
+
+    @Test fun singleTokenRescueCanBeSelectedAndCachedAfterValidation() = runBlocking {
+        val engine = FakeEngine(gpuFailureReason = "numeric_mismatch", rescueOnly = true)
+        inject(engine)
+        model.compareVulkanBackends(file)
+        assertEquals(3, engine.benchmarks)
+        assertEquals("performance", model.performanceMode)
+        assertEquals(0, model.gpuBlacklistCount)
+        val recipe = app.getSharedPreferences("pocketai", 0).all.entries.single { it.key.startsWith("vulkan_recipe_") }
+        assertEquals(1, JSONObject(recipe.value.toString()).getInt("microBatch"))
+        assertTrue(model.state.value.backendComparison.contains("GPU 16 couches · lot 1 après mesure : validé"))
+    }
+
+    @Test fun slowerValidatedGpuIsNotCachedForFutureLoading() = runBlocking {
+        val engine = FakeEngine(slowerGpu = true)
+        inject(engine)
+        model.compareVulkanBackends(file)
+        assertEquals("cpu-performance", model.performanceMode)
+        assertEquals(0, model.gpuBlacklistCount)
+        assertFalse(app.getSharedPreferences("pocketai", 0).all.keys.any { it.startsWith("vulkan_recipe_") })
+    }
+
+    @Test fun finalAllocationFailureDoesNotBlacklistEarlierValidatedRescue() = runBlocking {
+        val engine = FakeEngine(gpuFailureReason = "numeric_mismatch", rescueOnly = true,
+            finalFailureReason = "context_allocation_failed")
+        inject(engine)
+        model.compareVulkanBackends(file)
+        assertEquals("cpu-performance", model.performanceMode)
+        assertEquals(0, model.gpuBlacklistCount)
+        assertTrue(model.state.value.backendComparison.contains("GPU retenu · contrôle final : refusé"))
+        assertFalse(app.getSharedPreferences("pocketai", 0).all.keys.any { it.startsWith("vulkan_recipe_") })
+    }
+
+    private class FakeEngine(val fallback: Boolean = false, val cancelValidation: Boolean = false,
+        val gpuFailureReason: String? = null, val cpuSelfFailure: Boolean = false,
+        val rescueOnly: Boolean = false, val slowerGpu: Boolean = false,
+        val finalFailureReason: String? = null) : InferenceEngine {
         override val state = MutableStateFlow<InferenceEngine.State>(InferenceEngine.State.ModelReady)
         private var options = InferenceOptions()
         var benchmarks = 0
         var gpuValidations = 0
+        var cpuValidations = 0
+        var gpuLoads = 0
         var cleanups = 0
         override suspend fun configure(options: InferenceOptions) { this.options = options }
         private fun layers() = if (fallback) 0 else options.gpuLayers.coerceAtMost(36)
@@ -118,17 +194,32 @@ class VulkanBackendIntegrationTest {
         override fun fastMetrics() = ""
         override fun cancelGeneration() { }
         override fun setThreadLimit(threads: Int, batchThreads: Int) { }
-        override suspend fun loadModel(pathToModel: String) { }
+        override suspend fun loadModel(pathToModel: String) { if (layers() > 0) gpuLoads++ }
         override suspend fun setSystemPrompt(systemPrompt: String) { }
         override fun sendUserPrompt(message: String, predictLength: Int) = emptyFlow<String>()
         override suspend fun bench(pp: Int, tg: Int, pl: Int, nr: Int): String {
             benchmarks++
+            if (layers() > 0 && slowerGpu) return "Prompt: 20 tokens/s\nGeneration: 10 tokens/s"
             return if (layers() > 0) "Prompt: 80 tokens/s\nGeneration: ${if (layers() == 36) 24 else 20} tokens/s" else "Prompt: 50 tokens/s\nGeneration: 12 tokens/s"
         }
         override suspend fun validateBackend(captureCpuReference: Boolean): String {
             if (!captureCpuReference) {
-                gpuValidations++
-                if (cancelValidation) throw CancellationException("Test cancellation")
+                if (layers() > 0) {
+                    gpuValidations++
+                    if (cancelValidation) throw CancellationException("Test cancellation")
+                    if (finalFailureReason != null && gpuLoads == 7) {
+                        return JSONObject().put("passed", false).put("samples", 0)
+                            .put("reason", finalFailureReason).put("stage", "context_allocation").toString()
+                    }
+                    if (gpuFailureReason != null && (!rescueOnly || options.microBatchSize != 1)) {
+                        return JSONObject().put("passed", false).put("samples", if (gpuFailureReason == "numeric_mismatch") 12 else 0)
+                            .put("reason", gpuFailureReason).put("stage", "logit_comparison")
+                            .put("maxJs", 0.08).put("maxRelativeRmse", 0.11).put("failureMask", 12).toString()
+                    }
+                } else {
+                    cpuValidations++
+                    if (cpuSelfFailure) return "{\"passed\":false,\"samples\":12,\"reason\":\"numeric_mismatch\"}"
+                }
             }
             return "{\"passed\":true,\"samples\":12}"
         }

@@ -50,6 +50,8 @@ std::string fallback;
 std::string gpu_description;
 pocketai::VulkanProbe vulkan_probe;
 std::string validation_summary = "not compared with CPU";
+std::string last_validation_record;
+std::string last_validation_path;
 struct ValidationProbe {
     std::vector<llama_token> input;
     std::vector<llama_token> continuation;
@@ -1144,7 +1146,9 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_nativeDiagnostics(JNIEnv *env, 
     out << "Vulkan GPU: " << (gpu_description.empty() ? "unavailable (device/driver unsupported or backend absent)" : gpu_description) << '\n';
     out << "Vulkan driver: " << (vulkan_probe.fingerprint.empty() ? "unavailable" : vulkan_probe.fingerprint) << '\n';
     out << "Vulkan compatibility: " << (vulkan_probe.adreno840 ? "Adreno 840 FP32, scalar matmul, synchronous queues, flash attention off" : "standard") << '\n';
-    out << "Backend validation: " << validation_summary << '\n';
+    out << "Current context validation: " << validation_summary << '\n';
+    out << "Last probe attempt for this model: "
+        << (last_validation_path == model_path && !last_validation_record.empty() ? last_validation_record : "none") << '\n';
     out << "Requested: " << (options.gpu_layers ? "Vulkan" : "CPU") << "; active: " << (context ? gpu_layers > 0 ? "Vulkan + CPU" : "CPU" : "no model") << '\n';
     out << "GPU layers: " << gpu_layers << "; fallback: " << (fallback.empty() ? "none" : fallback) << '\n';
     out << "Micro-batch: " << (context ? llama_n_ubatch(context) : options.micro_batch) << '\n';
@@ -1286,16 +1290,45 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_validateBackendNative(JNIEnv *e
             if (ctx) llama_free(ctx);
         }
     } resources;
-    int checked = 0, top_matches = 0;
+    int checked = 0, top_matches = 0, failure_mask = 0, failed_comparisons = 0;
+    int probe_index = -1, step_index = -1, first_bad_probe = -1, first_bad_step = -1;
+    int decode_status = 0, nonfinite_count = 0;
     double max_js = 0, max_rmse = 0;
+    const char *stage = "model_check";
+    const char *reason = "model_unavailable";
+    auto json_number = [](double value) {
+        if (!std::isfinite(value)) return std::string("null");
+        std::ostringstream number;
+        number.precision(8);
+        number << value;
+        return number.str();
+    };
+    auto record = [&](bool passed) {
+        std::ostringstream out;
+        out.precision(8);
+        out << "{\"passed\":" << (passed ? "true" : "false") << ",\"samples\":" << checked
+            << ",\"reason\":\"" << reason << "\",\"stage\":\"" << stage
+            << "\",\"backend\":\"" << (gpu_layers > 0 ? "Vulkan" : "CPU") << "\",\"gpuLayers\":" << gpu_layers
+            << ",\"microBatch\":" << options.micro_batch << ",\"maxJs\":" << json_number(max_js)
+            << ",\"maxRelativeRmse\":" << json_number(max_rmse)
+            << ",\"topMatches\":" << top_matches << ",\"failureMask\":" << failure_mask
+            << ",\"failedComparisons\":" << failed_comparisons << ",\"firstFailureProbe\":" << first_bad_probe
+            << ",\"firstFailureStep\":" << first_bad_step << ",\"probe\":" << probe_index << ",\"step\":" << step_index
+            << ",\"decodeStatus\":" << decode_status << ",\"nonfiniteCount\":" << nonfinite_count << "}";
+        last_validation_record = out.str();
+        last_validation_path = model_path;
+        return android_text(env, last_validation_record);
+    };
     try {
         if (!model || (capture && gpu_layers > 0)) throw std::runtime_error("reference requires CPU");
+        stage = "model_metadata"; reason = "metadata_failed";
         struct stat metadata{};
         if (stat(model_path.c_str(), &metadata)) throw std::runtime_error("model metadata");
         const int vocab_size = llama_vocab_n_tokens(llama_model_get_vocab(model));
         const auto key = model_path + "|" + std::to_string(metadata.st_size) + "|" +
             std::to_string(metadata.st_mtim.tv_sec) + "|" + std::to_string(metadata.st_mtim.tv_nsec) + "|" + std::to_string(vocab_size);
         if (capture) {
+            stage = "reference_input"; reason = "reference_input_failed";
             validation_reference.clear();
             validation_model_key.clear();
             for (const auto *text : {
@@ -1311,35 +1344,57 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_validateBackendNative(JNIEnv *e
                 validation_reference.push_back({std::move(input), {}, {}});
             }
         } else if (validation_model_key != key || validation_reference.size() != 3) {
+            reason = "reference_unavailable";
             throw std::runtime_error("matching CPU reference missing");
         }
+        stage = "context_allocation"; reason = "context_allocation_failed";
         resources.ctx = new_context(512);
         if (!resources.ctx || llama_n_ctx(resources.ctx) < 192) throw std::runtime_error("probe context");
+        stage = "batch_allocation"; reason = "batch_allocation_failed";
         resources.batch = llama_batch_init(options.batch, 0, 1);
         resources.allocated = true;
         if (!resources.batch.token || !resources.batch.pos || !resources.batch.n_seq_id || !resources.batch.seq_id || !resources.batch.logits) throw std::runtime_error("probe batch");
         bool passed = true;
         for (auto &probe : validation_reference) {
+            ++probe_index;
+            step_index = -1;
+            stage = "memory_reset"; reason = "memory_reset_failed";
             llama_memory_clear(llama_get_memory(resources.ctx), false);
             for (size_t offset = 0; offset < probe.input.size();) {
+                stage = "prompt_decode"; reason = "prompt_decode_failed";
                 if (cancelled.load()) throw std::runtime_error("cancelled");
                 apply_threads(resources.ctx);
                 common_batch_clear(resources.batch);
                 const size_t count = std::min(size_t(options.batch), probe.input.size() - offset);
                 for (size_t i = 0; i < count; ++i) common_batch_add(resources.batch, probe.input[offset + i], offset + i, {0}, offset + i + 1 == probe.input.size());
-                if (llama_decode(resources.ctx, resources.batch)) throw std::runtime_error("probe decode");
+                decode_status = llama_decode(resources.ctx, resources.batch);
+                if (decode_status) throw std::runtime_error("probe decode");
                 offset += count;
             }
             for (int step = 0; step < 4; ++step) {
+                step_index = step;
+                stage = "logits"; reason = "logits_unavailable";
                 if (cancelled.load()) throw std::runtime_error("cancelled");
                 const float *logits = llama_get_logits_ith(resources.ctx, -1);
-                if (!pocketai::finite_logits(logits, vocab_size)) throw std::runtime_error("nonfinite probe");
+                if (!logits) throw std::runtime_error("missing probe logits");
+                if (!pocketai::finite_logits(logits, vocab_size)) {
+                    reason = "nonfinite_logits";
+                    for (int i = 0; i < vocab_size; ++i) if (!std::isfinite(logits[i])) ++nonfinite_count;
+                    throw std::runtime_error("nonfinite probe");
+                }
                 if (capture) {
+                    stage = "reference_capture"; reason = "reference_capture_failed";
                     probe.logits.emplace_back(logits, logits + vocab_size);
                     probe.continuation.push_back(std::max_element(logits, logits + vocab_size) - logits);
                 } else {
+                    stage = "logit_comparison"; reason = "reference_incomplete";
                     if (probe.logits.size() != 4 || probe.continuation.size() != 4) throw std::runtime_error("incomplete reference");
                     const auto comparison = pocketai::compare_logits(probe.logits[step], logits, vocab_size);
+                    failure_mask |= comparison.failures;
+                    if (!comparison.passed) {
+                        ++failed_comparisons;
+                        if (first_bad_probe < 0) { first_bad_probe = probe_index; first_bad_step = step; }
+                    }
                     passed = passed && comparison.passed;
                     max_js = std::max(max_js, comparison.js);
                     max_rmse = std::max(max_rmse, comparison.relative_rmse);
@@ -1347,28 +1402,32 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_validateBackendNative(JNIEnv *e
                 }
                 ++checked;
                 if (step < 3) {
+                    stage = "continuation_decode"; reason = "continuation_decode_failed";
                     common_batch_clear(resources.batch);
                     common_batch_add(resources.batch, probe.continuation[step], probe.input.size() + step, {0}, true);
                     apply_threads(resources.ctx);
-                    if (llama_decode(resources.ctx, resources.batch)) throw std::runtime_error("probe continuation");
+                    decode_status = llama_decode(resources.ctx, resources.batch);
+                    if (decode_status) throw std::runtime_error("probe continuation");
                 }
             }
         }
         if (capture) validation_model_key = key;
+        stage = "completed";
+        reason = capture ? "cpu_reference_captured" : passed ? "matched" : "numeric_mismatch";
         validation_summary = capture ? "CPU reference captured (12 distributions)" : passed ? "CPU comparison passed (12 distributions)" : "CPU comparison FAILED";
-        std::ostringstream out;
-        out << "{\"passed\":" << (passed ? "true" : "false") << ",\"samples\":" << checked
-            << ",\"maxJs\":" << max_js << ",\"maxRelativeRmse\":" << max_rmse << ",\"topMatches\":" << top_matches << "}";
-        return android_text(env, out.str());
+        return record(passed);
     } catch (...) {
         if (capture) { validation_reference.clear(); validation_model_key.clear(); }
         validation_summary = cancelled.load() ? "comparison cancelled" : "comparison unavailable or failed";
-        return android_text(env, "{\"passed\":false,\"samples\":0,\"note\":\"probe cancelled, unavailable or nonfinite\"}");
+        if (cancelled.load()) reason = "cancelled";
+        return record(false);
     }
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_shutdown(JNIEnv *, jobject) {
+    last_validation_record.clear();
+    last_validation_path.clear();
     validation_reference.clear();
     validation_model_key.clear();
     llama_backend_free();

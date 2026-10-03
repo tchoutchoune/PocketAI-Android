@@ -17,9 +17,15 @@ int main(int argc, char **argv) {
     const std::vector<float> corrupt{3.0f, -4.0f, 0.0f, 2.0f};
     const std::vector<float> nonfinite{0.0f, std::numeric_limits<float>::infinity(), 3.0f, 2.0f};
     assert(pocketai::compare_logits(reference, shifted.data(), shifted.size()).passed);
+    assert(pocketai::compare_logits(reference, shifted.data(), shifted.size()).failures == 0);
     assert(pocketai::compare_logits(reference, close.data(), close.size()).passed);
     assert(!pocketai::compare_logits(reference, corrupt.data(), corrupt.size()).passed);
+    const auto corruption = pocketai::compare_logits(reference, corrupt.data(), corrupt.size());
+    assert(corruption.failures & pocketai::JS_DIVERGENCE);
+    assert(corruption.failures & pocketai::RELATIVE_RMSE);
+    assert(corruption.failures & pocketai::TOP_TOKEN_MARGIN);
     assert(!pocketai::compare_logits(reference, nonfinite.data(), nonfinite.size()).passed);
+    assert(pocketai::compare_logits(reference, nonfinite.data(), nonfinite.size()).failures == pocketai::INVALID_LOGITS);
     assert(!pocketai::compare_logits(reference, close.data(), 0).passed);
     assert(!pocketai::finite_logits(nullptr, 4));
     const std::vector<float> flat(32, 0.0f);

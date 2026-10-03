@@ -6,11 +6,16 @@
 #include <vector>
 
 namespace pocketai {
+enum LogitFailure {
+    INVALID_LOGITS = 1, NONFINITE_METRICS = 2, JS_DIVERGENCE = 4,
+    RELATIVE_RMSE = 8, TOP_TOKEN_MARGIN = 16,
+};
 struct LogitComparison {
     bool passed = false;
     double js = 0;
     double relative_rmse = 0;
     bool top_match = false;
+    int failures = INVALID_LOGITS;
 };
 
 inline bool finite_logits(const float *values, size_t count) {
@@ -53,8 +58,12 @@ inline LogitComparison compare_logits(const std::vector<float> &reference, const
     result.relative_rmse = std::sqrt(error / std::max(variance, double(count) * 1e-6));
     result.top_match = top_a == top_b;
     const bool close_top = reference[top_a] - reference[top_b] <= 0.35 && actual[top_b] - actual[top_a] <= 0.35;
-    result.passed = std::isfinite(result.js) && std::isfinite(result.relative_rmse) &&
-        result.js <= 0.01 && result.relative_rmse <= 0.03 && close_top;
+    result.failures = 0;
+    if (!std::isfinite(result.js) || !std::isfinite(result.relative_rmse)) result.failures |= NONFINITE_METRICS;
+    if (result.js > 0.01) result.failures |= JS_DIVERGENCE;
+    if (result.relative_rmse > 0.03) result.failures |= RELATIVE_RMSE;
+    if (!close_top) result.failures |= TOP_TOKEN_MARGIN;
+    result.passed = result.failures == 0;
     return result;
 }
 }
