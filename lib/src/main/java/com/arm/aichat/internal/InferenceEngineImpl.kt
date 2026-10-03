@@ -43,7 +43,8 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
     }
 
     private external fun init(nativeLibDir: String)
-    private external fun configureNative(threads: Int, contextSize: Int, batchSize: Int, gpuLayers: Int, temperature: Float)
+    private external fun configureNative(threads: Int, contextSize: Int, batchSize: Int, gpuLayers: Int, temperature: Float, microBatchSize: Int)
+    private external fun validateBackendNative(captureCpuReference: Boolean): String
     private external fun load(modelPath: String): Int
     private external fun prepare(): Int
     private external fun nativeDiagnostics(): String
@@ -100,7 +101,7 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
         mutex.withLock {
             check(!closing && !destroyed) { "Inference engine is closing or has been destroyed" }
             check(!modelLoaded) { "Unload the model before changing inference options" }
-            configureNative(options.threads, options.contextSize, options.batchSize, options.gpuLayers, options.temperature)
+            configureNative(options.threads, options.contextSize, options.batchSize, options.gpuLayers, options.temperature, options.microBatchSize)
             setThreadLimitNative(thermalThreadLimit, thermalBatchThreadLimit)
             _state.value = InferenceEngine.State.Initialized
         }
@@ -236,6 +237,17 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
             startOperation()
             _state.value = InferenceEngine.State.Benchmarking
             try { benchModel(pp, tg, pl, nr) }
+            finally { _state.value = InferenceEngine.State.ModelReady }
+        }
+    }
+
+    override suspend fun validateBackend(captureCpuReference: Boolean): String = withContext(dispatcher) {
+        awaitInitialization()
+        mutex.withLock {
+            check(!closing && !destroyed && modelLoaded && _state.value is InferenceEngine.State.ModelReady)
+            startOperation()
+            _state.value = InferenceEngine.State.Benchmarking
+            try { validateBackendNative(captureCpuReference) }
             finally { _state.value = InferenceEngine.State.ModelReady }
         }
     }

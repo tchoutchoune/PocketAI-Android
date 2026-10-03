@@ -1,4 +1,5 @@
 #include "../../main/cpp/inference_helpers.h"
+#include "../../main/cpp/backend_validation.h"
 #include <cassert>
 #include <iostream>
 #include <iterator>
@@ -10,6 +11,23 @@ int main(int argc, char **argv) {
         return 0;
     }
     pocketai::GenerationBudget budget;
+    const std::vector<float> reference{-4.0f, 0.0f, 3.0f, 2.0f};
+    const std::vector<float> shifted{6.0f, 10.0f, 13.0f, 12.0f};
+    const std::vector<float> close{-3.999f, 0.001f, 3.002f, 1.999f};
+    const std::vector<float> corrupt{3.0f, -4.0f, 0.0f, 2.0f};
+    const std::vector<float> nonfinite{0.0f, std::numeric_limits<float>::infinity(), 3.0f, 2.0f};
+    assert(pocketai::compare_logits(reference, shifted.data(), shifted.size()).passed);
+    assert(pocketai::compare_logits(reference, close.data(), close.size()).passed);
+    assert(!pocketai::compare_logits(reference, corrupt.data(), corrupt.size()).passed);
+    assert(!pocketai::compare_logits(reference, nonfinite.data(), nonfinite.size()).passed);
+    assert(!pocketai::compare_logits(reference, close.data(), 0).passed);
+    assert(!pocketai::finite_logits(nullptr, 4));
+    const std::vector<float> flat(32, 0.0f);
+    assert(!pocketai::compare_logits(std::vector<float>(32, 4.0f), reference.data(), 4).passed);
+    auto spike = flat;
+    spike[7] = 12.0f;
+    assert(!pocketai::compare_logits(flat, spike.data(), spike.size()).passed);
+    assert(pocketai::compare_logits(flat, flat.data(), flat.size()).passed);
     budget.start(3);
     for (int i = 0; i < 3; ++i) {
         assert(!budget.exhausted());

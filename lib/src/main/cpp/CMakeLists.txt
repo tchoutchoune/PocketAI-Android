@@ -55,12 +55,21 @@ if(GGML_VULKAN)
     list(PREPEND CMAKE_PREFIX_PATH "${VULKAN_TOOLS_DIR}")
     set(SPIRV-Headers_DIR "${VULKAN_TOOLS_DIR}/share/cmake/SPIRV-Headers" CACHE PATH "SPIRV header package")
 endif()
-add_subdirectory("${LLAMA_SRC}" build-llama)
+set(LLAMA_BUILD_SRC "${LLAMA_SRC}")
+if(GGML_VULKAN AND ANDROID)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    get_filename_component(POCKETAI_REPO "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." ABSOLUTE)
+    set(LLAMA_BUILD_SRC "${CMAKE_CURRENT_BINARY_DIR}/llama-vulkan-overlay")
+    execute_process(COMMAND "${Python3_EXECUTABLE}" "${POCKETAI_REPO}/scripts/prepare-vulkan-source.py"
+        "${LLAMA_SRC}" "${LLAMA_BUILD_SRC}" COMMAND_ERROR_IS_FATAL ANY)
+endif()
+add_subdirectory("${LLAMA_BUILD_SRC}" build-llama)
 
 add_library(${CMAKE_PROJECT_NAME} SHARED
         ai_chat.cpp)
 
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
+        POCKETAI_VULKAN=$<BOOL:${GGML_VULKAN}>
         GGML_SYSTEM_ARCH=${GGML_SYSTEM_ARCH}
         GGML_CPU_KLEIDIAI=$<BOOL:${GGML_CPU_KLEIDIAI}>
         GGML_OPENMP=$<BOOL:${GGML_OPENMP}>
@@ -73,8 +82,13 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
         ${LLAMA_SRC}/ggml/include
         ${LLAMA_SRC}/ggml/src)
 
+if(GGML_VULKAN)
+    target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "${VULKAN_HEADER_STAGE}")
+endif()
+
 target_link_libraries(${CMAKE_PROJECT_NAME}
         llama
         llama-common
         android
+        dl
         log)

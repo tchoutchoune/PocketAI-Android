@@ -18,7 +18,7 @@ class HardwareProfileTest {
     @Test fun ampleMemoryScalesContextWithoutIgnoringMode() {
         assertEquals(4096, capable.recommend(gib, "balanced").contextSize)
         assertEquals(4096, capable.recommend(gib, "cpu-performance").contextSize)
-        assertEquals(8192, capable.recommend(gib, "performance").contextSize)
+        assertEquals(2048, capable.recommend(gib, "performance").contextSize)
     }
 
     @Test fun balancedModeStaysCpuSafeEvenWithVulkanAvailable() {
@@ -94,5 +94,13 @@ class HardwareProfileTest {
     @Test fun inaccessibleCoreFrequenciesStillProduceValidThreadCount() {
         val options = capable.copy(cpuCores = 1, bigCores = 0).recommend(mode = "balanced")
         assertEquals(1, options.threads)
+    }
+
+    @Test fun vulkanMicroBatchIsBoundedSeparatelyFromLogicalBatch() {
+        val gpu = capable.recommend(3 * gib, "performance")
+        assertEquals(32, gpu.microBatchSize)
+        assertTrue(gpu.batchSize > gpu.microBatchSize)
+        val cpu = capable.recommend(3 * gib, "cpu-performance")
+        assertEquals(cpu.batchSize, cpu.microBatchSize)
     }
 }

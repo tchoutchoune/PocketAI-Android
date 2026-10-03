@@ -47,7 +47,7 @@ data class HardwareProfile(
 
         val context = when {
             eco || hugeModel || available < 768 * MIB -> 1024
-            vulkanExperimental && totalRamBytes >= 10 * GIB && available >= 2 * GIB -> 8192
+            vulkanExperimental && available >= 1536 * MIB -> 2048
             totalRamBytes >= 8 * GIB && available >= 1536 * MIB -> 4096
             totalRamBytes >= 6 * GIB && available >= 1024 * MIB -> 2048
             else -> 1024
@@ -68,8 +68,8 @@ data class HardwareProfile(
         }.coerceAtLeast(1)
 
         val gpuLayers = when {
-            // Vulkan remains explicit/experimental because Adreno 840 has produced
-            // corrupted logits in real-device testing. CPU modes never offload.
+            // GPU use stays explicit and is validated against a CPU reference.
+            // The tuner also tries all layers to reduce CPU/GPU transfers.
             !vulkanExperimental || eco || hot || vulkanVersion == null -> 0
             available < 1024 * MIB || totalRamBytes < 6 * GIB -> 0
             totalRamBytes >= 10 * GIB -> 16
@@ -87,6 +87,12 @@ data class HardwareProfile(
             },
             gpuLayers = gpuLayers,
             temperature = 0.6f,
+            microBatchSize = if (gpuLayers > 0) 32 else when {
+                context <= 1024 || eco -> 64
+                cpuPerformance -> 256
+                adaptive && !powerSave && !warm && context >= 2048 && modelBytes >= 1024 * MIB -> 256
+                else -> 128
+            },
         )
     }
 

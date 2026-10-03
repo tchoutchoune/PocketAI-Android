@@ -1,1 +1,3 @@
 PocketAI Android includes an Android JNI inference wrapper adapted from llama.cpp examples/llama.android, copyright the llama.cpp authors, under the MIT License. llama.cpp is fetched at the revision pinned in scripts/setup.sh and is not vendored in this repository.
+
+The Android Vulkan build uses an isolated shader overlay authored by PocketAI under MIT: packed-byte expansion through 32-bit shifts and explicit integer conversion. Upstream llama.cpp source revision is unchanged. Compatibility is validated on-device against CPU scores.

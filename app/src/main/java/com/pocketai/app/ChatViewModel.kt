@@ -29,6 +29,10 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import org.json.JSONObject
+import java.security.MessageDigest
 import java.io.File
 
 internal data class ChatUiState(
@@ -46,6 +50,7 @@ internal data class ChatUiState(
     val installedModels: List<InstalledModel> = emptyList(),
     val folderModels: FolderModels = FolderModels(),
     val indexingModels: Boolean = false,
+    val backendComparison: String = "",
 )
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
@@ -70,7 +75,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var activeFile: File? = null
     private var activeOptions = InferenceOptions()
     private var needsHistoryRestore = true
-    private val gpuUnstableModels = prefs.getStringSet("gpu_blacklist_v1", emptySet()).orEmpty().toMutableSet()
+    private val gpuUnstableModels = prefs.getStringSet("gpu_blacklist_v2", emptySet()).orEmpty().toMutableSet()
+    private var knownDriverFingerprint = "unavailable"
     private var backendOverrideNote: String? = null
     private var lastModelLoadWallMs = 0L
     private var lastCpuFallbackReloadMs = 0L
@@ -166,10 +172,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     init {
         // 4.1.1 migration: an old remembered Performance profile used Vulkan
         // automatically. Vulkan is now an explicit one-shot retry after failures.
-        if (prefs.getString("mode", "auto") == "performance" &&
+        if (!prefs.getBoolean("vulkan_compat_migrated", false) && prefs.getString("mode", "auto") == "performance" &&
             !prefs.getBoolean("vulkan_retry_once", false)) {
             prefs.edit().putString("mode", "cpu-performance").apply()
         }
+        prefs.edit().putBoolean("vulkan_compat_migrated", true).apply()
         logs.event("application_started gpu_blacklist_entries=${gpuUnstableModels.size}")
         thermalRegistered = runCatching {
             power.addThermalStatusListener(application.mainExecutor, thermalListener)
@@ -363,7 +370,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             .append("; effective-max ").append(effectiveMaxTokens())
     }
     private fun gpuStabilityKey(file: File): String =
-        listOf(Build.MANUFACTURER, Build.MODEL, Build.DEVICE, file.name, file.length().toString()).joinToString("|")
+        listOf(VulkanTuning.REVISION, Build.FINGERPRINT, knownDriverFingerprint, file.name, file.length(), file.lastModified()).joinToString("|")
 
     private fun isGpuBlacklisted(file: File): Boolean =
         gpuStabilityKey(file) in gpuUnstableModels
@@ -371,7 +378,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private fun persistGpuBlacklist(file: File, reason: String) {
         val key = gpuStabilityKey(file)
         if (gpuUnstableModels.add(key)) {
-            prefs.edit().putStringSet("gpu_blacklist_v1", gpuUnstableModels.toSet()).apply()
+            prefs.edit().putStringSet("gpu_blacklist_v2", gpuUnstableModels.toSet()).remove(vulkanRecipeKey(file)).apply()
         }
         logs.event("gpu_blacklist_added key_hash=${key.hashCode()} reason=$reason entries=${gpuUnstableModels.size}")
     }
@@ -379,7 +386,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun clearGpuBlacklist(): Int {
         val count = gpuUnstableModels.size
         gpuUnstableModels.clear()
-        prefs.edit().remove("gpu_blacklist_v1").putBoolean("vulkan_retry_once", false).apply()
+        prefs.edit().remove("gpu_blacklist_v1").remove("gpu_blacklist_v2").putBoolean("vulkan_retry_once", false).apply()
         logs.event("gpu_blacklist_cleared entries=$count")
         return count
     }
@@ -402,7 +409,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             options.batchSize,
             options.gpuLayers,
             options.threads,
-        ).joinToString("|").hashCode()
+        ).joinToString("|").hashCode().toString() + if (options.microBatchSize == options.batchSize) "" else "_micro${options.microBatchSize}"
 
     private fun restoredThreadLimit(file: File, options: InferenceOptions): Int {
         val stored = prefs.getInt(threadTuneKey(file, options), minOf(6, options.threads))
@@ -569,6 +576,191 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun clearHuggingFaceResults() = update { it.copy(hfResults = emptyList()) }
 
+    private fun vulkanRecipeKey(file: File): String {
+        val identity = gpuStabilityKey(file).toByteArray(Charsets.UTF_8)
+        return "vulkan_recipe_" + MessageDigest.getInstance("SHA-256").digest(identity).joinToString("") { "%02x".format(it) }
+    }
+
+    private fun actualOptions(requested: InferenceOptions, diagnostic: String): InferenceOptions {
+        fun number(pattern: String) = Regex(pattern).find(diagnostic)?.groupValues?.getOrNull(1)?.toIntOrNull()
+        return requested.copy(
+            contextSize = number("Context: (\\d+)")?.coerceIn(512, requested.contextSize) ?: requested.contextSize,
+            gpuLayers = number("GPU layers: (\\d+)")?.coerceIn(0, requested.gpuLayers) ?: 0,
+            microBatchSize = number("Micro-batch: (\\d+)")?.coerceIn(1, requested.batchSize) ?: requested.microBatchSize,
+        )
+    }
+
+    private fun savedVulkanOptions(file: File, base: InferenceOptions): InferenceOptions? = runCatching {
+        if (knownDriverFingerprint == "unavailable" || base.gpuLayers == 0) return@runCatching null
+        val value = prefs.getString(vulkanRecipeKey(file), null) ?: return@runCatching null
+        val data = JSONObject(value)
+        require(data.getBoolean("validated") && data.getInt("samples") == 12)
+        val layers = data.getInt("layers")
+        val micro = data.getInt("microBatch")
+        require(layers in 1..256 && micro in listOf(32, 64))
+        base.copy(gpuLayers = layers, microBatchSize = micro)
+    }.getOrNull()
+
+    private suspend fun prepareBackend(file: File, requested: InferenceOptions): InferenceOptions {
+        val inference = inference()
+        inference.cleanUp()
+        currentCoroutineContext().ensureActive()
+        val hardware = HardwareProfile.detect(getApplication())
+        require(hardware.canAttemptModelLoad(file.length())) { "Mémoire disponible insuffisante pour ce modèle." }
+        if (requested.gpuLayers == 256) require(hardware.availableRamBytes >= file.length() + 768L * 1024 * 1024) {
+            "Mémoire partagée insuffisante pour transférer toutes les couches GPU."
+        }
+        activeOptions = requested
+        preferredThreadLimit = restoredThreadLimit(file, requested)
+        preferredBatchThreadLimit = restoredBatchThreadLimit(file, requested)
+        thermalListener.onThermalStatusChanged(power.currentThermalStatus)
+        inference.configure(requested)
+        inference.loadModel(file.absolutePath)
+        val actual = actualOptions(requested, inference.diagnostics())
+        activeOptions = actual
+        return actual
+    }
+
+    private suspend fun publishPreparedModel(file: File, status: String, comparison: String) {
+        inference().setSystemPrompt(SYSTEM_PROMPT)
+        activeFile = file
+        activeRemote = null
+        needsHistoryRestore = true
+        thermalListener.onThermalStatusChanged(power.currentThermalStatus)
+        val info = diagnosticsWithSessionNote(inference().diagnostics())
+        prefs.edit().putString("lastModel", file.name).apply()
+        logs.event("model_ready options=$activeOptions diagnostics=$info")
+        update { it.copy(modelName = file.nameWithoutExtension, remote = false, status = status,
+            diagnostics = info, backendComparison = comparison, liveMetrics = liveMetrics(0, 0)) }
+    }
+
+    fun autoTuneVulkan() {
+        val file = activeFile ?: run {
+            update { it.copy(error = "Charge un modèle local pour comparer CPU et Vulkan.") }
+            return
+        }
+        task("Comparaison CPU / Vulkan…") { compareVulkanBackends(file) }
+    }
+
+    internal suspend fun compareVulkanBackends(file: File) {
+        val inference = inference()
+        fun requireCool() {
+            require(power.currentThermalStatus < PowerManager.THERMAL_STATUS_MODERATE && !power.isPowerSaveMode) {
+                "Laisse refroidir le téléphone et désactive l’économie d’énergie avant de comparer CPU et Vulkan."
+            }
+        }
+        requireCool()
+        knownDriverFingerprint = inference.diagnostics().lineSequence().firstOrNull { it.startsWith("Vulkan driver: ") }
+            ?.removePrefix("Vulkan driver: ") ?: "unavailable"
+        val profile = HardwareProfile.detect(getApplication())
+        require(profile.vulkanVersion != null && profile.recommend(file.length(), "performance").gpuLayers > 0) {
+            "Vulkan indisponible ou mémoire insuffisante pour lancer cette comparaison."
+        }
+        val previousMode = performanceMode
+        activeFile = null
+        activeRemote = null
+        update { it.copy(modelName = null, remote = false, backendComparison = "") }
+        var activated = false
+        val started = android.os.SystemClock.elapsedRealtime()
+        val report = mutableListOf<String>()
+        try {
+            val cpuOptions = prepareBackend(file, profile.recommend(file.length(), "cpu-performance"))
+            update { it.copy(status = "CPU · référence numérique et mesure de vitesse…") }
+            val reference = JSONObject(inference.validateBackend(true))
+            currentCoroutineContext().ensureActive()
+            require(reference.optBoolean("passed") && reference.optInt("samples") == 12) { "La référence CPU n’a pas pu être calculée." }
+            suspend fun measure(options: InferenceOptions): BackendMeasurement {
+                requireCool()
+                val output = inference.bench(128, 16, 1, 2)
+                currentCoroutineContext().ensureActive()
+                requireCool()
+                fun speed(label: String): Double = Regex("$label: ([0-9.eE+\\-]+)")
+                    .find(output)?.groupValues?.get(1)?.toDoubleOrNull()?.takeIf { it.isFinite() && it > 0 }
+                    ?: error("Le benchmark n’a pas retourné de vitesse exploitable.")
+                return BackendMeasurement(options, speed("Prompt"), speed("Generation"), true)
+            }
+            val cpu = measure(cpuOptions)
+            fun description(sample: BackendMeasurement): String = "préparation %.1f · génération %.1f tok/s".format(sample.promptTps, sample.generationTps)
+            report += "CPU : ${description(cpu)}"
+            val samples = mutableListOf<BackendMeasurement>()
+            for ((index, candidate) in VulkanTuning.candidates(profile.recommend(file.length(), "performance")).withIndex()) {
+                currentCoroutineContext().ensureActive()
+                requireCool()
+                update { it.copy(status = "Vulkan ${index + 1}/4 · ${if (candidate.gpuLayers == 256) "toutes les" else candidate.gpuLayers} couches · lot ${candidate.microBatchSize}…") }
+                try {
+                    val actual = prepareBackend(file, candidate)
+                    require(actual.gpuLayers > 0) { "Le backend est revenu au CPU ; essai GPU exclu." }
+                    val validation = JSONObject(inference.validateBackend(false))
+                    currentCoroutineContext().ensureActive()
+                    require(validation.optBoolean("passed") && validation.optInt("samples") == 12) { "Comparaison numérique CPU/GPU refusée." }
+                    val sample = measure(actual)
+                    // Check again after the timed workload to catch delayed corruption.
+                    val after = JSONObject(inference.validateBackend(false))
+                    currentCoroutineContext().ensureActive()
+                    require(after.optBoolean("passed") && after.optInt("samples") == 12) { "Sortie GPU instable après le benchmark." }
+                    requireCool()
+                    samples += sample
+                    report += "Vulkan ${actual.gpuLayers} couches · lot ${actual.microBatchSize} : ${description(sample)} · validé"
+                    logs.event("vulkan_candidate options=$actual prompt_tps=${sample.promptTps} generation_tps=${sample.generationTps} validation=$validation after=$after")
+                } catch (cancel: CancellationException) { throw cancel }
+                catch (failure: Exception) {
+                    currentCoroutineContext().ensureActive()
+                    requireCool()
+                    report += "Vulkan ${candidate.gpuLayers} couches · lot ${candidate.microBatchSize} : refusé (${failure.message})"
+                    logs.failure("vulkan_candidate_rejected", failure)
+                }
+                update { it.copy(backendComparison = report.joinToString("\n")) }
+            }
+            val bestGpu = VulkanTuning.bestGpu(cpu, samples)
+            val selected = VulkanTuning.preferred(cpu, samples)
+            if (bestGpu == null) persistGpuBlacklist(file, "numeric_validation_or_gpu_unavailable")
+            var actual = prepareBackend(file, selected.options)
+            var finalGpuValid = true
+            if (selected.options.gpuLayers > 0) {
+                val finalValidation = JSONObject(inference.validateBackend(false))
+                currentCoroutineContext().ensureActive()
+                if (actual.gpuLayers == 0 || !finalValidation.optBoolean("passed") || finalValidation.optInt("samples") != 12) {
+                    finalGpuValid = false
+                    if (actual.gpuLayers > 0) persistGpuBlacklist(file, "final_validation_failed")
+                    report += "Le dernier chargement GPU a échoué : CPU conservé."
+                    actual = prepareBackend(file, cpu.options)
+                }
+            }
+            val useGpu = actual.gpuLayers > 0
+            val status = when {
+                useGpu -> "Vulkan validé et plus rapide · ${actual.gpuLayers} couches GPU"
+                bestGpu != null -> "CPU conservé · meilleur compromis sur ce test"
+                else -> "CPU conservé · Vulkan n’a pas passé la validation"
+            }
+            backendOverrideNote = "Fixed CPU/GPU comparison: 3 public probes, 12 distributions; benchmark pp128/tg16 x2.\n" + report.joinToString("\n")
+            activeOptions = actual
+            lastModelLoadWallMs = android.os.SystemClock.elapsedRealtime() - started
+            lastCpuFallbackReloadMs = 0
+            publishPreparedModel(file, status, report.joinToString("\n"))
+            // Commit preferences only after the selected model/system prompt is ready.
+            val editor = prefs.edit().putString("mode", if (useGpu) "performance" else "cpu-performance").putBoolean("vulkan_retry_once", false)
+            if (bestGpu != null && finalGpuValid && knownDriverFingerprint != "unavailable") {
+                val cached = if (useGpu) selected else bestGpu
+                val recipe = JSONObject().put("validated", true).put("samples", 12)
+                    .put("layers", cached.options.gpuLayers).put("microBatch", cached.options.microBatchSize)
+                    .put("promptTps", cached.promptTps).put("generationTps", cached.generationTps)
+                editor.putString(vulkanRecipeKey(file), recipe.toString())
+                gpuUnstableModels.remove(gpuStabilityKey(file))
+                editor.putStringSet("gpu_blacklist_v2", gpuUnstableModels.toSet())
+            } else if (!finalGpuValid) editor.remove(vulkanRecipeKey(file))
+            editor.apply()
+            activated = true
+            logs.event("vulkan_comparison_selected gpu=$useGpu options=$actual report=${report.joinToString(";")}")
+        } finally {
+            if (!activated) withContext(kotlinx.coroutines.NonCancellable) {
+                inference.cleanUp()
+                activeFile = null
+                prefs.edit().putString("mode", previousMode).apply()
+                update { it.copy(modelName = null, diagnostics = "", liveMetrics = "") }
+            }
+        }
+    }
+
     fun loadModel(file: File) = task("Préparation de ${file.name}…") {
         val inference = inference()
         activeFile = null
@@ -576,6 +768,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         update { it.copy(modelName = null, remote = false, diagnostics = "") }
         try {
             inference.cleanUp()
+            knownDriverFingerprint = inference.diagnostics().lineSequence().firstOrNull { it.startsWith("Vulkan driver: ") }
+                ?.removePrefix("Vulkan driver: ") ?: "unavailable"
             val profile = HardwareProfile.detect(getApplication())
             require(profile.canAttemptModelLoad(file.length())) {
                 "Ce modèle est trop grand pour être chargé de façon sûre sur cet appareil, ou Android dispose de moins de 384 Mo de mémoire immédiatement disponible."
@@ -589,7 +783,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 else -> null
             }
 
-            val options = profile.recommend(file.length(), selectedMode).let {
+            var options = profile.recommend(file.length(), selectedMode).let {
                 if (forceCpu) {
                     val requestedContext = if (profile.totalRamBytes >= 8L * 1024 * 1024 * 1024) maxOf(4096, it.contextSize) else it.contextSize
                     it.copy(
@@ -600,34 +794,26 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 } else it
             }
-            activeOptions = options
-            preferredThreadLimit = restoredThreadLimit(file, options)
-            preferredBatchThreadLimit = restoredBatchThreadLimit(file, options)
-            thermalListener.onThermalStatusChanged(runCatching { power.currentThermalStatus }.getOrDefault(0))
+            if (options.gpuLayers > 0) {
+                val saved = savedVulkanOptions(file, options)
+                if (saved == null) {
+                    compareVulkanBackends(file)
+                    return@task
+                }
+                options = saved
+                backendOverrideNote = "Using a numerically validated Vulkan profile for this exact device/driver/model. Live nonfinite/repetition guards remain active."
+            }
             val loadWallStarted = android.os.SystemClock.elapsedRealtime()
-            inference.configure(options)
-            inference.loadModel(file.absolutePath)
-            inference.setSystemPrompt(SYSTEM_PROMPT)
+            var actual = prepareBackend(file, options)
+            if (options.gpuLayers > 0 && actual.gpuLayers == 0) {
+                backendOverrideNote = "Vulkan allocation unavailable; CPU performance retained."
+                actual = prepareBackend(file, profile.recommend(file.length(), "cpu-performance"))
+                prefs.edit().putString("mode", "cpu-performance").putBoolean("vulkan_retry_once", false).apply()
+            }
+            activeOptions = actual
             lastModelLoadWallMs = android.os.SystemClock.elapsedRealtime() - loadWallStarted
             lastCpuFallbackReloadMs = 0L
-            thermalListener.onThermalStatusChanged(runCatching { power.currentThermalStatus }.getOrDefault(0))
-            val rawInfo = inference.diagnostics()
-            val actualContext = Regex("Context: (\\d+)").find(rawInfo)?.groupValues?.getOrNull(1)?.toIntOrNull()
-                ?.coerceIn(512, options.contextSize) ?: options.contextSize
-            activeOptions = options.copy(contextSize = actualContext)
-            activeFile = file
-            needsHistoryRestore = true
-            val info = diagnosticsWithSessionNote(rawInfo)
-            logs.event("model_ready options=$activeOptions diagnostics=$info")
-            prefs.edit().putString("lastModel", file.name).apply()
-            update {
-                it.copy(
-                    modelName = file.nameWithoutExtension,
-                    status = "Prêt · ${activeOptions.threads} threads · ${activeOptions.contextSize} tokens",
-                    diagnostics = info,
-                    liveMetrics = liveMetrics(0, 0),
-                )
-            }
+            publishPreparedModel(file, "Prêt · ${if (actual.gpuLayers > 0) "Vulkan ${actual.gpuLayers} couches" else "CPU"} · ${actual.contextSize} tokens", "")
         } catch (error: Exception) {
             activeFile = null
             update { it.copy(modelName = null, diagnostics = "") }

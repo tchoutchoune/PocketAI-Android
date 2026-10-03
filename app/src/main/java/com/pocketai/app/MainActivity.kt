@@ -629,7 +629,7 @@ class MainActivity : AppCompatActivity() {
         settingsPanel.removeAllViews(); pad(settingsPanel)
         settingsPanel.addView(text("Ton PocketAI", 22f, true))
         settingsPanel.addView(text("Performances", 18f, true))
-        val modeLabels = arrayOf("Auto · adaptatif", "CPU · performance", "CPU · équilibré", "Autonomie", "Vulkan · expérimental")
+        val modeLabels = arrayOf("Auto · adaptatif", "CPU · performance", "CPU · équilibré", "Autonomie", "Vulkan · compatible")
         val modes = arrayOf("auto", "cpu-performance", "balanced", "eco", "performance")
         val selectedMode = modes.indexOf(model.performanceMode).coerceAtLeast(0)
         settingsPanel.addView(button("Profil : ${modeLabels[selectedMode]}") {
@@ -638,10 +638,10 @@ class MainActivity : AppCompatActivity() {
                     dialog.dismiss()
                     if (modes[index] == "performance") {
                         MaterialAlertDialogBuilder(this)
-                            .setTitle("Vulkan expérimental")
-                            .setMessage("Vulkan a déjà produit des sorties corrompues sur certains pilotes Adreno. PocketAI ne le reteste qu’après une action explicite et repasse automatiquement en CPU performance si une corruption est détectée.")
+                            .setTitle("Vulkan · vérifier et optimiser")
+                            .setMessage("Au premier chargement, PocketAI compare le GPU au CPU avec des textes de test fixes, puis mesure la vitesse. Cela peut prendre plusieurs minutes. Désactive l’économie d’énergie et laisse refroidir le téléphone. Le CPU est conservé si Vulkan est instable ou ne présente pas de gain. Un profil GPU déjà validé peut être réutilisé ; les protections restent actives.")
                             .setNegativeButton("Annuler", null)
-                            .setPositiveButton("Tester Vulkan une fois") { _, _ ->
+                            .setPositiveButton("Vérifier au chargement") { _, _ ->
                                 model.performanceMode = "performance"
                                 renderSettings()
                                 toast("Vulkan sera essayé au prochain chargement du modèle")
@@ -652,9 +652,12 @@ class MainActivity : AppCompatActivity() {
                         toast("Profil appliqué au prochain chargement du modèle")
                     }
                 }.setNegativeButton("Fermer", null).show()
-        })
+        }.apply { isEnabled = !model.state.value.busy })
         if (model.state.value.modelName != null && !model.state.value.remote) settingsPanel.addView(button("Recharger avec ce profil") { model.applyPerformanceProfile() }.apply { isEnabled = !model.state.value.busy })
-        settingsPanel.addView(text("Auto adapte CPU, batch et contexte à la taille du modèle et à l’état du téléphone. CPU · performance pousse davantage les cœurs pour les gros modèles. Vulkan reste expérimental et n’est retenté qu’après une action explicite. La chauffe peut toujours réduire les threads.", 14f))
+        settingsPanel.addView(text("Auto adapte le CPU à la mémoire et au modèle. Vulkan compatible utilise de petits lots GPU ; sur Adreno 840, le moteur applique des calculs plus conservateurs. Le réglage GPU est lié au modèle, à l’appareil et au pilote. La chauffe peut toujours réduire les threads.", 14f))
+        settingsPanel.addView(button("Comparer et optimiser CPU / Vulkan") { model.autoTuneVulkan() }
+            .apply { isEnabled = model.state.value.modelName != null && !model.state.value.remote && !model.state.value.busy })
+        model.state.value.backendComparison.takeIf { it.isNotBlank() }?.let { settingsPanel.addView(text(it, 14f)) }
         val lengthLabel = if (model.autoLength) {
             "Auto · jusqu’à ${model.effectiveMaxTokens()} tokens"
         } else {
@@ -747,7 +750,7 @@ class MainActivity : AppCompatActivity() {
             settingsPanel.addView(text("Vulkan désactivé automatiquement pour ${model.gpuBlacklistCount} combinaison(s) appareil/modèle après corruption détectée.", 13f))
             settingsPanel.addView(button("Réautoriser Vulkan pour les modèles bloqués") {
                 val count = model.clearGpuBlacklist()
-                toast("$count blocage(s) Vulkan effacé(s). Sélectionne ensuite Vulkan expérimental pour un nouveau test.")
+                toast("$count blocage(s) Vulkan effacé(s). Lance ensuite la comparaison CPU / Vulkan.")
                 renderSettings()
             })
         }
@@ -756,7 +759,7 @@ class MainActivity : AppCompatActivity() {
                 .setMessage(HardwareProfile.detect(this).summary + "\n\n" + model.state.value.diagnostics.ifBlank { "Charge un modèle pour confirmer le moteur utilisé." })
                 .setPositiveButton("Fermer", null).show()
         })
-        settingsPanel.addView(button("Benchmark CPU / modèle chargé") {
+        settingsPanel.addView(button("Benchmark du moteur chargé") {
             model.benchmarkActiveModel()
         }.apply { isEnabled = model.state.value.modelName != null && !model.state.value.busy })
         settingsPanel.addView(button("Auto-régler les threads CPU") {

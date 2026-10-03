@@ -51,6 +51,9 @@ interface InferenceEngine {
      */
     suspend fun bench(pp: Int, tg: Int, pl: Int, nr: Int = 1): String
 
+    /** Fixed public probes in an independent context; never reads or changes chat history. */
+    suspend fun validateBackend(captureCpuReference: Boolean): String
+
     /**
      * Unloads the currently loaded model.
      */

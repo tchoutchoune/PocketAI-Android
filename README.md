@@ -5,7 +5,7 @@ Assistant Android avec modèles GGUF locaux et catalogue de 21 modèles pour le 
 ## Installer et commencer
 
 - **Android 13 ou supérieur, téléphone ARM64** (`arm64-v8a`).
-- Dans les [Actions GitHub](https://github.com/tchoutchoune/PocketAI-Android/actions), ouvrir un build réussi de **Build PocketAI 4** sur la branche preview `codex/dynamic-context-budget`, télécharger l’artefact **PocketAI-4.4.0-smart-library-arm64-debug**, extraire le ZIP et installer `PocketAI-4.4.0-smart-library-arm64-debug.apk`. GitHub peut demander une connexion pour télécharger les artefacts.
+- Dans les [Actions GitHub](https://github.com/tchoutchoune/PocketAI-Android/actions), ouvrir un build réussi de **Build PocketAI 4** sur la branche preview `codex/dynamic-context-budget`, télécharger l’artefact **PocketAI-4.5.0-vulkan-compatible-arm64-debug**, extraire le ZIP et installer `PocketAI-4.5.0-vulkan-compatible-arm64-debug.apk`. GitHub peut demander une connexion pour télécharger les artefacts.
 - Autoriser l’installation depuis la source choisie si Android le demande. Cet APK est un build de développement signé avec une clé de débogage.
 
 La preview utilise le paquet **`io.github.tchoutchoune.pocketai.preview`** et la même signature que la preview 4.2.3 : elle met à jour cette application en conservant ses données. Les applications d’un autre paquet restent séparées.
@@ -29,6 +29,18 @@ Un GGUF personnel peut être importé. Son en-tête et sa taille sont contrôlé
 Dans **Réglages**, choisir **Auto · adaptatif**, **CPU · performance**, **CPU · équilibré**, **Autonomie** ou **Vulkan · expérimental**. La RAM disponible règle le contexte et les lots ; les cœurs CPU orientent le nombre de threads. Le chargement refuse les budgets mémoire insuffisants. Les réglages de profil s’appliquent au prochain chargement ; la chaleur réduit les threads pendant une génération.
 
 La déclaration Vulkan d’Android permet de tenter l’accélération GPU. Le moteur vérifie ensuite le backend et peut revenir au CPU si le GPU ou ses allocations échouent. **Voir le matériel et le moteur** indique le backend réellement actif, les couches GPU, les threads et les mesures de génération. La présence de Vulkan ne garantit pas un gain de vitesse sur chaque téléphone.
+
+## Vulkan compatible 4.5
+
+Le diagnostic du OnePlus CPH2747 identifie un Adreno 840. Un ancien essai Vulkan à 16 couches produisait une sortie corrompue ; la présence des bibliothèques et de Vulkan 1.4 ne prouve donc pas la fiabilité de l’inférence. Cette version propose une correction de compatibilité à vérifier sur l’appareil, sans annoncer de gain non mesuré.
+
+- Détection native du GPU et empreinte du pilote avant l’initialisation ggml. Sur Adreno 840 : calcul F32, matrices coopératives/dot2 et exécution asynchrone désactivées, soumissions sérialisées et Flash Attention désactivée. Le CPU conserve son chemin habituel.
+- Une copie de compilation isolée du llama.cpp épinglé remplace `unpack8` par des décalages 32 bits et des conversions signées explicites, pour éviter les bitcasts d’octets signalés sur certains pilotes Qualcomm. Le test de shader vérifie le SPIR-V généré ; la correction sur Adreno 840 reste à confirmer avec les mesures du téléphone.
+- **Réglages → Comparer et optimiser CPU / Vulkan** : trois textes publics fixes produisent douze distributions de scores CPU. Chaque configuration GPU doit les reproduire dans les tolérances avant et après un benchmark indépendant. Quatre essais combinent 16 ou toutes les couches avec des lots physiques de 32 ou 64 ; le batch logique reste séparé. Le contexte GPU initial est limité à 2 048 tokens.
+- Vulkan est retenu si la génération atteint au moins le CPU, la préparation reste à au moins 90 % du CPU, et le score pondéré atteint 105 %. Ces courts tests ne couvrent pas toutes les conversations ni une utilisation prolongée. Les scores non finis et les répétitions dégénérées déclenchent encore un retour au CPU pendant l’utilisation.
+- Le résultat validé est lié au modèle (taille/date), à la version du correctif, à Android et au pilote. Une mise à jour invalide le réglage. Un modèle revenu silencieusement au CPU est exclu des résultats GPU. La chauffe ou l’économie d’énergie interrompent la comparaison ; la conversation est conservée.
+
+Installer la mise à jour, désactiver l’économie d’énergie, laisser refroidir l’appareil, charger le GGUF puis lancer la comparaison dans Réglages. Elle peut prendre plusieurs minutes et charger le modèle plusieurs fois. Exporter ensuite le diagnostic pour vérifier les couches réellement actives, les validations et les tokens/s.
 
 ## Moteur 4.4 et mesures réelles
 
@@ -82,7 +94,7 @@ Le script de préparation installe dans le répertoire d’outils le **JDK 17**,
 
 `scripts/build.sh` construit l’APK ARM64 avec CPU et Vulkan, lance les tests unitaires de `app` et `lib`, puis contrôle le ZIP, la signature, le paquet et les bibliothèques natives. Résultats :
 
-- `out/PocketAI-4.4.0-smart-library-arm64-debug.apk` et `out/SHA256.txt` ;
+- `out/PocketAI-4.5.0-vulkan-compatible-arm64-debug.apk` et `out/SHA256.txt` ;
 - preuves de vérification dans `out/` ;
 - rapports dans `app/build/reports/tests/` et `lib/build/reports/tests/`.
 
