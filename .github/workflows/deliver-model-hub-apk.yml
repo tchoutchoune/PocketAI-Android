@@ -1,0 +1,52 @@
+name: Deliver verified PocketAI 4.3 APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['codex/model-hub']
+    paths: ['.github/workflows/deliver-model-hub-apk.yml']
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  transfer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download the verified signed build
+        uses: actions/download-artifact@v5
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 37120771005
+          name: PocketAI-4.3.0-model-hub-arm64-debug
+          path: verified-apk
+      - name: Validate evidence and split into bounded transfer files
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd verified-apk
+          sha256sum --check SHA256.txt
+          grep -Fq 'a0f04583b124e77b5ea2c739e7206d8c92d9a06615166f94fe26c245c2985e77' SIGNATURE.txt
+          grep -Fq "versionCode='430'" PACKAGE.txt
+          split --bytes=24M --numeric-suffixes=0 --suffix-length=2 \
+            PocketAI-4.3.0-model-hub-arm64-debug.apk PocketAI.apk.part-
+          test -s PocketAI.apk.part-00
+          test -s PocketAI.apk.part-01
+          test ! -e PocketAI.apk.part-02
+          cat PocketAI.apk.part-00 PocketAI.apk.part-01 | sha256sum
+      - name: Publish first transfer file
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-4.3.0-apk-transfer-00
+          path: verified-apk/PocketAI.apk.part-00
+          retention-days: 14
+          if-no-files-found: error
+      - name: Publish second transfer file
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-4.3.0-apk-transfer-01
+          path: verified-apk/PocketAI.apk.part-01
+          retention-days: 14
+          if-no-files-found: error
