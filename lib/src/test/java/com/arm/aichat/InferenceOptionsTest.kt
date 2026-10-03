@@ -10,6 +10,8 @@ class InferenceOptionsTest {
         assertThrows(IllegalArgumentException::class.java) { InferenceOptions(contextSize = 512, batchSize = 1024) }
         assertThrows(IllegalArgumentException::class.java) { InferenceOptions(threads = 0) }
         assertThrows(IllegalArgumentException::class.java) { InferenceOptions(gpuLayers = -1) }
+        assertThrows(IllegalArgumentException::class.java) { InferenceOptions(batchSize = 64, microBatchSize = 128) }
+        assertThrows(IllegalArgumentException::class.java) { InferenceOptions(microBatchSize = 0) }
         assertThrows(IllegalArgumentException::class.java) { InferenceOptions(temperature = Float.NaN) }
         assertThrows(IllegalArgumentException::class.java) { InferenceOptions(temperature = Float.POSITIVE_INFINITY) }
     }

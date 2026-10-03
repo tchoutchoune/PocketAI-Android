@@ -7,16 +7,30 @@ android {
     compileSdk = 36
     ndkVersion = "29.0.13113456"
     defaultConfig {
-        applicationId = "com.pocketai.app"
+        applicationId = "io.github.tchoutchoune.pocketai.preview"
         minSdk = 33
         targetSdk = 36
-        versionCode = 400
-        versionName = "4.0"
+        versionCode = 451
+        versionName = "4.5.1-vulkan-probes"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk { abiFilters += "arm64-v8a" }
     }
+    val previewKeystore = rootProject.file(".ci-signing/preview-debug.keystore")
+    signingConfigs {
+        if (previewKeystore.exists()) {
+            create("preview") {
+                storeFile = previewKeystore
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
+    }
     buildTypes {
-        debug { isMinifyEnabled = false }
+        debug {
+            isMinifyEnabled = false
+            if (previewKeystore.exists()) signingConfig = signingConfigs.getByName("preview")
+        }
         release {
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
@@ -36,6 +50,8 @@ dependencies {
     implementation("io.noties.markwon:core:4.6.2")
     implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.8.7")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+    implementation("com.google.mlkit:text-recognition:16.0.1")
+    implementation("com.google.mlkit:image-labeling:17.0.9")
     testImplementation(libs.junit)
     testImplementation("org.json:json:20240303")
     testImplementation("org.robolectric:robolectric:4.16")

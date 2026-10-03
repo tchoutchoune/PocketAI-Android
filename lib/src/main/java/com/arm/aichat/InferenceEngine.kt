@@ -3,6 +3,7 @@ package com.arm.aichat
 import com.arm.aichat.InferenceEngine.State
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
+import java.io.IOException
 
 /**
  * Interface defining the core LLM inference operations.
@@ -19,11 +20,14 @@ interface InferenceEngine {
     /** Hardware, backend selection, fallback reason, and last generation throughput. */
     suspend fun diagnostics(): String
 
+    /** Lock-free native progress snapshot safe to poll while prompt/generation work is running. */
+    fun fastMetrics(): String
+
     /** Cancel a native decode or model load without waiting for the inference dispatcher. */
     fun cancelGeneration()
 
     /** Thread-safe thermal limit, applied between native decode steps. */
-    fun setThreadLimit(threads: Int)
+    fun setThreadLimit(threads: Int, batchThreads: Int = threads)
 
     /**
      * Load a model from the given path.
@@ -46,6 +50,9 @@ interface InferenceEngine {
      * Runs a benchmark with the specified parameters.
      */
     suspend fun bench(pp: Int, tg: Int, pl: Int, nr: Int = 1): String
+
+    /** Fixed public probes in an independent context; never reads or changes chat history. */
+    suspend fun validateBackend(captureCpuReference: Boolean): String
 
     /**
      * Unloads the currently loaded model.
@@ -99,3 +106,7 @@ val State.isModelLoaded: Boolean
         this is State.Generating
 
 class UnsupportedArchitectureException : Exception()
+
+/** Raised when native GPU inference returns a degenerate repeated-token stream. */
+class GpuOutputCorruptionException(cause: Throwable? = null) :
+    IOException("GPU output corruption detected", cause)

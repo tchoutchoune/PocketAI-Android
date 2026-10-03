@@ -3,6 +3,8 @@ name: Build PocketAI 4
 on:
   workflow_dispatch:
   push:
+    # The model-hub branch carries source; the established preview branch retains its signing cache.
+    branches-ignore: ['codex/model-hub']
     paths:
       - 'app/**'
       - 'lib/**'
@@ -15,18 +17,22 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: pocketai-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   android:
     runs-on: ubuntu-24.04
     container: debian:trixie
-    timeout-minutes: 90
+    timeout-minutes: 30
     env:
       DEBIAN_FRONTEND: noninteractive
     steps:
       - name: Install verified build prerequisites
         run: |
           apt-get update
-          apt-get install -y ca-certificates curl git unzip python3 gcc g++ make glslc libshaderc1 libvulkan-dev spirv-headers
+          apt-get install -y ca-certificates curl git unzip python3 python3-jinja2 gcc g++ make ccache glslc libshaderc1 libvulkan-dev spirv-headers
       - name: Checkout PocketAI
         uses: actions/checkout@v6
       - name: Checkout pinned llama.cpp
@@ -37,11 +43,32 @@ jobs:
           path: llama.cpp
           fetch-depth: 1
           lfs: false
+      - name: Restore native compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: pocketai-ccache-${{ runner.os }}-ndk29-db00347-${{ hashFiles('lib/src/main/cpp/**', 'lib/build.gradle.kts') }}
+          restore-keys: |
+            pocketai-ccache-${{ runner.os }}-ndk29-db00347-
       - name: Set up JDK 17
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
+      - name: Restore stable preview signing key
+        uses: actions/cache@v4
+        with:
+          path: .ci-signing/preview-debug.keystore
+          key: pocketai-preview-debug-signing-v2
+      - name: Ensure stable preview signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .ci-signing
+          if [ ! -s .ci-signing/preview-debug.keystore ]; then
+            keytool -genkeypair -noprompt               -keystore .ci-signing/preview-debug.keystore               -storetype PKCS12               -storepass android               -alias androiddebugkey               -keypass android               -keyalg RSA               -keysize 2048               -validity 10000               -dname "CN=PocketAI Preview,O=PocketAI,C=FR"
+          fi
+          keytool -list -v             -keystore .ci-signing/preview-debug.keystore             -storepass android             -alias androiddebugkey | sed -n '/SHA256:/p'
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
         with:
@@ -60,12 +87,106 @@ jobs:
           POCKETAI_LLAMA_DIR: ${{ github.workspace }}/llama.cpp
           POCKETAI_VULKAN_DIR: /usr
           CMAKE_BUILD_PARALLEL_LEVEL: '4'
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_MAXSIZE: 2G
         run: bash scripts/build.sh
       - name: Upload APK and verification evidence
         uses: actions/upload-artifact@v6
         with:
-          name: PocketAI-4.0-arm64-debug
+          name: PocketAI-4.5.1-vulkan-probes-arm64-debug
           path: out/*
+          retention-days: 14
+          if-no-files-found: error
+      - name: Prepare bounded APK transfer files
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd out
+          sha256sum --check SHA256.txt
+          cat SHA256.txt
+          mkdir transfers
+          split --bytes=24M --numeric-suffixes=0 --suffix-length=2 \
+            PocketAI-4.5.1-vulkan-probes-arm64-debug.apk transfers/PocketAI.apk.part-
+          test -s transfers/PocketAI.apk.part-00
+          test ! -e transfers/PocketAI.apk.part-10
+      - name: Upload APK transfer file 00
+        if: ${{ hashFiles('out/transfers/PocketAI.apk.part-00') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-4.5.1-vulkan-probes-transfer-00
+          path: out/transfers/PocketAI.apk.part-00
+          retention-days: 14
+          if-no-files-found: error
+      - name: Upload APK transfer file 01
+        if: ${{ hashFiles('out/transfers/PocketAI.apk.part-01') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-4.5.1-vulkan-probes-transfer-01
+          path: out/transfers/PocketAI.apk.part-01
+          retention-days: 14
+          if-no-files-found: error
+      - name: Upload APK transfer file 02
+        if: ${{ hashFiles('out/transfers/PocketAI.apk.part-02') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-4.5.1-vulkan-probes-transfer-02
+          path: out/transfers/PocketAI.apk.part-02
+          retention-days: 14
+          if-no-files-found: error
+      - name: Upload APK transfer file 03
+        if: ${{ hashFiles('out/transfers/PocketAI.apk.part-03') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-4.5.1-vulkan-probes-transfer-03
+          path: out/transfers/PocketAI.apk.part-03
+          retention-days: 14
+          if-no-files-found: error
+      - name: Upload APK transfer file 04
+        if: ${{ hashFiles('out/transfers/PocketAI.apk.part-04') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-4.5.1-vulkan-probes-transfer-04
+          path: out/transfers/PocketAI.apk.part-04
+          retention-days: 14
+          if-no-files-found: error
+      - name: Upload APK transfer file 05
+        if: ${{ hashFiles('out/transfers/PocketAI.apk.part-05') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-4.5.1-vulkan-probes-transfer-05
+          path: out/transfers/PocketAI.apk.part-05
+          retention-days: 14
+          if-no-files-found: error
+      - name: Upload APK transfer file 06
+        if: ${{ hashFiles('out/transfers/PocketAI.apk.part-06') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-4.5.1-vulkan-probes-transfer-06
+          path: out/transfers/PocketAI.apk.part-06
+          retention-days: 14
+          if-no-files-found: error
+      - name: Upload APK transfer file 07
+        if: ${{ hashFiles('out/transfers/PocketAI.apk.part-07') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-4.5.1-vulkan-probes-transfer-07
+          path: out/transfers/PocketAI.apk.part-07
+          retention-days: 14
+          if-no-files-found: error
+      - name: Upload APK transfer file 08
+        if: ${{ hashFiles('out/transfers/PocketAI.apk.part-08') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-4.5.1-vulkan-probes-transfer-08
+          path: out/transfers/PocketAI.apk.part-08
+          retention-days: 14
+          if-no-files-found: error
+      - name: Upload APK transfer file 09
+        if: ${{ hashFiles('out/transfers/PocketAI.apk.part-09') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-4.5.1-vulkan-probes-transfer-09
+          path: out/transfers/PocketAI.apk.part-09
           retention-days: 14
           if-no-files-found: error
       - name: Upload test reports
@@ -74,6 +195,8 @@ jobs:
         with:
           name: PocketAI-4-test-results
           path: |
+            out/BUILD.log
             app/build/reports/tests/
             lib/build/reports/tests/
           retention-days: 14
+          if-no-files-found: warn

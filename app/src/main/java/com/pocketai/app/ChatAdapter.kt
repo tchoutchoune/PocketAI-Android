@@ -25,8 +25,11 @@ class ChatAdapter(
     private val context: Context,
     private val messages: MutableList<ChatMessage>,
     private val onExport: (ChatMessage) -> Unit,
-    private val onCopy: (ChatMessage) -> Unit
+    private val onCopy: (ChatMessage) -> Unit,
+    private val onSpeak: (ChatMessage) -> Unit,
 ) : RecyclerView.Adapter<ChatAdapter.MessageHolder>() {
+    init { setHasStableIds(true) }
+
     private val markdown = Markwon.builder(context).usePlugin(object : AbstractMarkwonPlugin() {
         override fun configureConfiguration(builder: MarkwonConfiguration.Builder) {
             builder.linkResolver { view, destination ->
@@ -45,6 +48,7 @@ class ChatAdapter(
     }).build()
 
     override fun getItemCount(): Int = messages.size
+    override fun getItemId(position: Int): Long = messages[position].id.hashCode().toLong()
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): MessageHolder {
         val root = FrameLayout(context).apply {
@@ -85,20 +89,51 @@ class ChatAdapter(
             gravity = Gravity.START
         }
         val copy = action("Copier")
+        val speak = action("Lire")
         val export = action("Enregistrer")
         val share = action("Partager")
         actions.addView(copy, LinearLayout.LayoutParams(0, dp(48), 1f))
+        actions.addView(speak, LinearLayout.LayoutParams(0, dp(48), 1f))
         actions.addView(export, LinearLayout.LayoutParams(0, dp(48), 1f))
         actions.addView(share, LinearLayout.LayoutParams(0, dp(48), 1f))
         content.addView(heading)
         content.addView(body)
         content.addView(progress)
         content.addView(actions)
-        return MessageHolder(root, card, heading, body, progress, actions, copy, export, share)
+        return MessageHolder(root, card, heading, body, progress, actions, copy, speak, export, share)
     }
 
     override fun onBindViewHolder(holder: MessageHolder, position: Int) {
+        bindFull(holder, messages[position])
+    }
+
+    override fun onBindViewHolder(holder: MessageHolder, position: Int, payloads: MutableList<Any>) {
         val message = messages[position]
+        if (payloads.contains(PAYLOAD_STREAM) && !message.isUser && message.isStreaming) {
+            bindStreamingText(holder, message)
+        } else {
+            bindFull(holder, message)
+        }
+    }
+
+    private fun bindStreamingText(holder: MessageHolder, message: ChatMessage) {
+        val visible = ResponseText.visible(message.content)
+        holder.body.setTextIsSelectable(false)
+        holder.body.movementMethod = null
+        val target = visible.ifBlank { "Préparation de la réponse…" }
+        val previous = holder.body.text?.toString().orEmpty()
+        // Most streaming updates only append text. Appending the delta avoids rebuilding
+        // a large TextView and reduces layout churn on long local generations.
+        if (visible.isNotBlank() && previous.isNotBlank() && target.startsWith(previous) && target.length > previous.length) {
+            holder.body.append(target.substring(previous.length))
+        } else if (previous != target) {
+            holder.body.text = target
+        }
+        holder.progress.visibility = View.VISIBLE
+        holder.actions.visibility = View.GONE
+    }
+
+    private fun bindFull(holder: MessageHolder, message: ChatMessage) {
         val visible = if (message.isUser) message.content else ResponseText.visible(message.content)
         val layout = holder.card.layoutParams as FrameLayout.LayoutParams
         layout.marginStart = if (message.isUser) dp(36) else 0
@@ -109,18 +144,21 @@ class ChatAdapter(
         holder.heading.text = if (message.isUser) "Vous" else "PocketAI"
         if (message.isUser) {
             holder.body.setTextIsSelectable(true)
+            holder.body.movementMethod = null
             holder.body.text = visible
+        } else if (message.isStreaming) {
+            bindStreamingText(holder, message)
         } else {
-            // Selectable TextViews install ArrowKeyMovementMethod; Markwon does not replace it.
-            // The explicit movement method makes source citations open in the browser.
             holder.body.setTextIsSelectable(false)
             holder.body.movementMethod = LinkMovementMethod.getInstance()
-            markdown.setMarkdown(holder.body, visible.ifBlank { if (message.isStreaming) "Préparation de la réponse…" else "Aucune réponse reçue." })
+            markdown.setMarkdown(holder.body, visible.ifBlank { "Aucune réponse reçue." })
         }
         holder.progress.visibility = if (message.isStreaming) View.VISIBLE else View.GONE
         holder.actions.visibility = if (message.isStreaming || visible.isBlank()) View.GONE else View.VISIBLE
         holder.export.visibility = if (message.isUser) View.GONE else View.VISIBLE
+        holder.speak.visibility = if (message.isUser) View.GONE else View.VISIBLE
         holder.copy.setOnClickListener { onCopy(message) }
+        holder.speak.setOnClickListener { onSpeak(message) }
         holder.export.setOnClickListener { onExport(message) }
         holder.share.setOnClickListener {
             val shareIntent = Intent(Intent.ACTION_SEND).apply {
@@ -155,6 +193,10 @@ class ChatAdapter(
 
     private fun dp(value: Int): Int = (value * context.resources.displayMetrics.density).toInt()
 
+    companion object {
+        const val PAYLOAD_STREAM = "stream"
+    }
+
     class MessageHolder(
         view: View,
         val card: MaterialCardView,
@@ -163,6 +205,7 @@ class ChatAdapter(
         val progress: TextView,
         val actions: LinearLayout,
         val copy: MaterialButton,
+        val speak: MaterialButton,
         val export: MaterialButton,
         val share: MaterialButton
     ) : RecyclerView.ViewHolder(view)

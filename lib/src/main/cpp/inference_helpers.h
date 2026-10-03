@@ -5,19 +5,130 @@
 #include <vector>
 
 namespace pocketai {
+/** Keep Qwen3's *empty* disabled-thinking scaffold on previous assistant turns.
+ * Changing it between turns otherwise invalidates the whole answer's KV prefix.
+ * Only the known condition is adapted; enabled-thinking behavior is untouched.
+ */
+inline std::string stable_qwen3_template(const std::string &source) {
+    if (source.find("enable_thinking") == std::string::npos ||
+        source.find("reasoning_content.strip") == std::string::npos) return source;
+    for (const auto *variable : {"ns.last_query_index", "ns.last_user_index"}) {
+        const std::string condition = std::string("{%- if loop.index0 > ") + variable + " %}";
+        const auto start = source.find(condition);
+        if (start == std::string::npos || source.find(condition, start + condition.size()) != std::string::npos) continue;
+        auto adapted = source;
+        adapted.replace(start, condition.size(), std::string("{%- if loop.index0 > ") + variable +
+            " or (enable_thinking is defined and enable_thinking is false) %}");
+        return adapted;
+    }
+    return source;
+}
+
 struct GenerationBudget {
+    int requested = 0;
     int limit = 0;
     int produced = 0;
-    void start(int maximum) { limit = maximum; produced = 0; }
+
+    void start(int maximum, int effective = -1) {
+        requested = std::max(0, maximum);
+        limit = effective < 0 ? requested : std::min(requested, std::max(0, effective));
+        produced = 0;
+    }
+
     bool exhausted() const { return produced >= limit; }
+    bool context_limited() const { return limit < requested; }
     void consume() { ++produced; }
 };
 
-inline int discard_count(int position, int system, int required, int capacity) {
-    if (position + required <= capacity) return 0;
-    const int history = position - system;
-    if (history < 1 || system + required > capacity) return -1;
-    return std::min(history, std::max(position + required - capacity, std::max(1, history / 2)));
+/**
+ * Compute a safe generation budget from the real tokenized prompt.
+ * capacity is the usable context after native safety headroom.
+ */
+inline int generation_limit(int capacity, int system, int prompt_tokens, int requested, int minimum = 1) {
+    if (capacity <= 0 || system < 0 || prompt_tokens < 1 || requested < 1 || minimum < 1) return 0;
+    const int available = capacity - system - prompt_tokens;
+    if (available < minimum) return 0;
+    return std::min(requested, available);
+}
+
+/**
+ * Return an exact token-identical prefix safe for KV reuse. If the entire new
+ * prompt is already cached, leave its final token to be decoded again so logits
+ * correspond to the current prompt end.
+ */
+inline size_t token_prefix_length(
+    const std::vector<int32_t> &left,
+    const std::vector<int32_t> &right
+) {
+    const size_t limit = std::min(left.size(), right.size());
+    size_t prefix = 0;
+    while (prefix < limit && left[prefix] == right[prefix]) ++prefix;
+    return prefix;
+}
+
+inline size_t reusable_token_prefix(
+    const std::vector<int32_t> &prompt,
+    const std::vector<int32_t> &cached
+) {
+    size_t prefix = token_prefix_length(prompt, cached);
+    if (!prompt.empty() && prefix >= prompt.size()) --prefix;
+    return prefix;
+}
+
+/** Remove <think>...</think> sections without exposing their contents. */
+inline std::string strip_thinking(const std::string &text) {
+    std::string result;
+    result.reserve(text.size());
+    size_t cursor = 0;
+    int depth = 0;
+    while (cursor < text.size()) {
+        const auto open = text.find("<think>", cursor);
+        const auto close = text.find("</think>", cursor);
+        if (depth == 0) {
+            if (open == std::string::npos) {
+                result.append(text, cursor, std::string::npos);
+                break;
+            }
+            result.append(text, cursor, open - cursor);
+            cursor = open + 7;
+            depth = 1;
+        } else {
+            if (close == std::string::npos) break;
+            cursor = close + 8;
+            depth = 0;
+        }
+    }
+    return result;
+}
+
+inline std::string thinking_content(const std::string &text) {
+    std::string result;
+    size_t cursor = 0;
+    while (cursor < text.size()) {
+        const auto open = text.find("<think>", cursor);
+        if (open == std::string::npos) break;
+        const auto content_start = open + 7;
+        const auto close = text.find("</think>", content_start);
+        if (close == std::string::npos) {
+            result.append(text, content_start, std::string::npos);
+            break;
+        }
+        if (!result.empty()) result.push_back('\n');
+        result.append(text, content_start, close - content_start);
+        cursor = close + 8;
+    }
+    return result;
+}
+
+inline size_t utf8_codepoints(const std::string &text) {
+    size_t count = 0;
+    for (size_t i = 0; i < text.size();) {
+        const auto first = static_cast<unsigned char>(text[i]);
+        const size_t width = first < 0x80 ? 1 : first < 0xE0 ? 2 : first < 0xF0 ? 3 : 4;
+        i += std::min(width, text.size() - i);
+        ++count;
+    }
+    return count;
 }
 
 // Complete UTF-8 prefixes only; an unfinished multibyte token waits for the next token.

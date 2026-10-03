@@ -37,14 +37,16 @@ class MainActivityTest {
         val activity = start()
         val tabs = tabs(activity)
         assertEquals(4, tabs.tabCount)
-        assertEquals(listOf("Chat", "Modèles", "Créer", "Réglages"), (0 until 4).map { tabs.getTabAt(it)?.text.toString() })
+        assertEquals(listOf("Discuter", "Modèles", "Outils", "Réglages"), (0 until 4).map { tabs.getTabAt(it)?.text.toString() })
         assertFalse(ViewModelProvider(activity)[ChatViewModel::class.java].state.value.busy)
         assertNull(ViewModelProvider(activity)[ChatViewModel::class.java].state.value.modelName)
     }
 
     @Test fun webCannotBeEnabledWithoutExplicitCredentialConfiguration() {
         val activity = start()
-        val toggle = views(activity).filterIsInstance<SwitchMaterial>().single()
+        val toggle = views(activity)
+            .filterIsInstance<SwitchMaterial>()
+            .first { it.text.toString() == "Compléter avec le web" }
         toggle.isChecked = true
         assertFalse(toggle.isChecked)
         assertFalse(ViewModelProvider(activity)[ChatViewModel::class.java].settings.webSearchEnabled)
@@ -59,6 +61,24 @@ class MainActivityTest {
         assertNotNull(started)
         assertEquals(Intent.ACTION_OPEN_DOCUMENT, started.intent.action)
         assertEquals("*/*", started.intent.type)
+    }
+
+    @Test fun folderDetectionUsesTheSystemFolderPicker() {
+        val activity = start()
+        tabs(activity).getTabAt(1)!!.select()
+        button(activity, "Choisir un dossier").performClick()
+        val started = shadowOf(activity).nextStartedActivityForResult
+        assertEquals(Intent.ACTION_OPEN_DOCUMENT_TREE, started.intent.action)
+        assertTrue(views(activity).filterIsInstance<TextView>().any { it.text.toString() == "✓ Mes modèles" })
+    }
+
+    @Test fun catalogueAndServersAreSeparated() {
+        val activity = start()
+        tabs(activity).getTabAt(1)!!.select()
+        button(activity, "Catalogue").performClick()
+        assertFalse(views(activity).filterIsInstance<MaterialButton>().any { it.text.toString() == "Tester le serveur" })
+        button(activity, "Serveurs").performClick()
+        assertFalse(views(activity).filterIsInstance<MaterialButton>().any { it.text.toString().startsWith("Télécharger ·") })
     }
 
     @Test fun imageCreationRequiresProviderBeforeAnyGeneration() {
@@ -76,5 +96,14 @@ class MainActivityTest {
         button(activity, "Envoyer").performClick()
         assertEquals("Bonjour", input.text.toString())
         assertTrue(ViewModelProvider(activity)[ChatViewModel::class.java].state.value.messages.isEmpty())
+    }
+
+    @Test fun specializedModelActionRequiresConfigurationBeforeAnyUpload() {
+        val activity = start()
+        tabs(activity).getTabAt(2)!!.select()
+        button(activity, "Transcrire un audio · Whisper").performClick()
+        assertNull(shadowOf(activity).nextStartedActivityForResult)
+        assertFalse(ViewModelProvider(activity)[ChatViewModel::class.java].state.value.busy)
+        assertTrue(ViewModelProvider(activity)[ChatViewModel::class.java].settings.inferenceUrl("whisper-small").isBlank())
     }
 }

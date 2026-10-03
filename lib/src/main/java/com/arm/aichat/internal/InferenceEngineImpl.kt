@@ -3,6 +3,7 @@ package com.arm.aichat.internal
 import android.content.Context
 import android.util.Log
 import com.arm.aichat.InferenceEngine
+import com.arm.aichat.GpuOutputCorruptionException
 import com.arm.aichat.InferenceOptions
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -42,10 +43,12 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
     }
 
     private external fun init(nativeLibDir: String)
-    private external fun configureNative(threads: Int, contextSize: Int, batchSize: Int, gpuLayers: Int, temperature: Float)
+    private external fun configureNative(threads: Int, contextSize: Int, batchSize: Int, gpuLayers: Int, temperature: Float, microBatchSize: Int)
+    private external fun validateBackendNative(captureCpuReference: Boolean): String
     private external fun load(modelPath: String): Int
     private external fun prepare(): Int
     private external fun nativeDiagnostics(): String
+    private external fun nativeFastMetrics(): String
     private external fun benchModel(pp: Int, tg: Int, pl: Int, nr: Int): String
     private external fun processSystemPrompt(systemPrompt: String): Int
     private external fun processUserPrompt(userPrompt: String, predictLength: Int): Int
@@ -53,7 +56,7 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
     private external fun finishGeneration()
     private external fun requestCancel()
     private external fun resetCancellation()
-    private external fun setThreadLimitNative(threads: Int)
+    private external fun setThreadLimitNative(threads: Int, batchThreads: Int)
     private external fun unload()
     private external fun shutdown()
 
@@ -69,6 +72,7 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
     @Volatile private var destroyed = false
     @Volatile private var closing = false
     @Volatile private var thermalThreadLimit = 32
+    @Volatile private var thermalBatchThreadLimit = 32
     private var modelLoaded = false
 
     private val initialization = scope.async {
@@ -77,7 +81,7 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
             System.loadLibrary("ai-chat")
             init(nativeLibDir)
             synchronized(nativeControlLock) { nativeLoaded = true }
-            setThreadLimitNative(thermalThreadLimit)
+            setThreadLimitNative(thermalThreadLimit, thermalBatchThreadLimit)
             _state.value = InferenceEngine.State.Initialized
             Log.i(TAG, "Native inference initialized")
         } catch (e: Throwable) {
@@ -97,8 +101,8 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
         mutex.withLock {
             check(!closing && !destroyed) { "Inference engine is closing or has been destroyed" }
             check(!modelLoaded) { "Unload the model before changing inference options" }
-            configureNative(options.threads, options.contextSize, options.batchSize, options.gpuLayers, options.temperature)
-            setThreadLimitNative(thermalThreadLimit)
+            configureNative(options.threads, options.contextSize, options.batchSize, options.gpuLayers, options.temperature, options.microBatchSize)
+            setThreadLimitNative(thermalThreadLimit, thermalBatchThreadLimit)
             _state.value = InferenceEngine.State.Initialized
         }
     }
@@ -111,15 +115,21 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
         }
     }
 
+    override fun fastMetrics(): String = synchronized(nativeControlLock) {
+        if (!nativeLoaded || closing || destroyed) "" else runCatching { nativeFastMetrics() }.getOrDefault("")
+    }
+
     override fun cancelGeneration() {
         cancelled = true
         synchronized(nativeControlLock) { if (nativeLoaded) requestCancel() }
     }
 
-    override fun setThreadLimit(threads: Int) {
+    override fun setThreadLimit(threads: Int, batchThreads: Int) {
         require(threads in 1..32) { "Thread limit must be between 1 and 32" }
+        require(batchThreads in 1..32) { "Batch thread limit must be between 1 and 32" }
         thermalThreadLimit = threads
-        synchronized(nativeControlLock) { if (nativeLoaded && !closing) setThreadLimitNative(threads) }
+        thermalBatchThreadLimit = batchThreads
+        synchronized(nativeControlLock) { if (nativeLoaded && !closing) setThreadLimitNative(threads, batchThreads) }
     }
 
     private fun startOperation() {
@@ -197,7 +207,14 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
                 _state.value = InferenceEngine.State.Generating
                 while (!cancelled) {
                     currentCoroutineContext().ensureActive()
-                    val token = generateNextToken() ?: break
+                    val token = try {
+                        generateNextToken()
+                    } catch (e: IOException) {
+                        if (e.message?.contains("Sortie GPU incoherente detectee") == true) {
+                            throw GpuOutputCorruptionException(e)
+                        }
+                        throw e
+                    } ?: break
                     if (token.isNotEmpty()) emit(token)
                 }
             } catch (e: CancellationException) {
@@ -220,6 +237,17 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
             startOperation()
             _state.value = InferenceEngine.State.Benchmarking
             try { benchModel(pp, tg, pl, nr) }
+            finally { _state.value = InferenceEngine.State.ModelReady }
+        }
+    }
+
+    override suspend fun validateBackend(captureCpuReference: Boolean): String = withContext(dispatcher) {
+        awaitInitialization()
+        mutex.withLock {
+            check(!closing && !destroyed && modelLoaded && _state.value is InferenceEngine.State.ModelReady)
+            startOperation()
+            _state.value = InferenceEngine.State.Benchmarking
+            try { validateBackendNative(captureCpuReference) }
             finally { _state.value = InferenceEngine.State.ModelReady }
         }
     }

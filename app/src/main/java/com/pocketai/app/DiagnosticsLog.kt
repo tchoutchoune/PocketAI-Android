@@ -52,8 +52,8 @@ class DiagnosticsLog(context: Context) {
     }
 
     companion object {
-        private const val MAX_LOG_BYTES = 256 * 1024
-        private const val MAX_EVENT_CHARS = 2048
+        private const val MAX_LOG_BYTES = 2 * 1024 * 1024
+        private const val MAX_EVENT_CHARS = 16 * 1024
         private val url = Regex("https?://[^\\s<>]+", RegexOption.IGNORE_CASE)
         private val bearer = Regex("(?i)\\bBearer\\s+[^\\s,;]+")
         private val keyValue = Regex(

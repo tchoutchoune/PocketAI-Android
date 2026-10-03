@@ -8,22 +8,29 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <cstdlib>
+#include <sys/stat.h>
 #include "chat.h"
 #include "common.h"
 #include "sampling.h"
 #include "log.h"
 #include "llama.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "inference_helpers.h"
+#include "backend_validation.h"
+#include "vulkan_probe.h"
 
 namespace {
-constexpr int HEADROOM = 8;
+constexpr int HEADROOM = 64;
+constexpr int MIN_GENERATION_TOKENS = 64;
 struct Options {
     int threads = 4;
     int context = 2048;
     int batch = 256;
     int gpu_layers = 0;
     float temperature = 0.6f;
+    int micro_batch = 256;
 } options;
 llama_model *model = nullptr;
 llama_context *context = nullptr;
@@ -31,13 +38,27 @@ llama_batch batch{};
 bool batch_allocated = false;
 common_chat_templates_ptr templates;
 common_sampler *sampler = nullptr;
+bool template_supports_thinking = false;
+bool stable_thinking_scaffold = false;
 std::vector<common_chat_msg> messages;
+std::vector<llama_token> kv_tokens;
 std::string system_prompt;
 std::string model_path;
 std::string cached_bytes;
 std::string assistant_text;
 std::string fallback;
 std::string gpu_description;
+pocketai::VulkanProbe vulkan_probe;
+std::string validation_summary = "not compared with CPU";
+std::string last_validation_record;
+std::string last_validation_path;
+struct ValidationProbe {
+    std::vector<llama_token> input;
+    std::vector<llama_token> continuation;
+    std::vector<std::vector<float>> logits;
+};
+std::vector<ValidationProbe> validation_reference;
+std::string validation_model_key;
 ggml_backend_dev_t gpu = nullptr;
 int gpu_layers = 0;
 int active_threads = 4;
@@ -45,18 +66,47 @@ llama_pos position = 0;
 llama_pos system_position = 0;
 std::atomic<bool> cancelled{false};
 std::atomic<int> thread_limit{32};
+std::atomic<int> batch_thread_limit{32};
+ggml_threadpool_t cpu_threadpool = nullptr;
+decltype(ggml_threadpool_free) *free_threadpool = nullptr;
 std::atomic<int> backend_warnings{0};
 std::atomic<int> backend_errors{0};
+std::atomic<int> live_phase{0}; // 0 idle, 1 prompt/prefill, 2 generation
+std::atomic<int> live_prompt_total{0};
+std::atomic<int> live_prompt_done{0};
+std::atomic<int> live_generated{0};
+std::atomic<int> live_threads{0};
+std::atomic<int> live_batch_threads{0};
+std::atomic<int> live_gpu_layers{0};
+std::atomic<int64_t> live_phase_start_us{0};
 pocketai::GenerationBudget budget;
 bool generating = false;
 bool generation_eog = false;
 bool needs_end_of_turn = false;
 bool context_dirty = false;
-int shifts = 0;
+int history_resets = 0;
 int64_t generation_start = 0;
 int64_t generation_end = 0;
+int64_t model_load_us = 0;
+int64_t context_prepare_us = 0;
+int64_t system_prompt_us = 0;
+int64_t prompt_render_us = 0;
+int64_t prompt_tokenize_us = 0;
 int64_t prompt_us = 0;
 int prompt_tokens = 0;
+int prompt_reused_tokens = 0;
+int prompt_decoded_tokens = 0;
+int history_alignment_tokens = 0;
+int history_alignment_kv_tokens = 0;
+int history_alignment_plain_tokens = 0;
+int history_alignment_empty_tokens = 0;
+int history_divergence_index = -1;
+std::string history_alignment_mode = "none";
+std::string history_divergence_window = "none";
+int fallback_events = 0;
+llama_token last_generated_token = -1;
+int repeated_token_streak = 0;
+bool generation_degenerate = false;
 
 void log_event(int priority, const char *message) {
     __android_log_write(priority, "PocketAI.Native", message);
@@ -108,13 +158,36 @@ jstring android_text(JNIEnv *env, const std::string &text) {
 
 void apply_threads(llama_context *target = nullptr) {
     active_threads = std::max(1, std::min(options.threads, thread_limit.load(std::memory_order_relaxed)));
-    if (target || context) llama_set_n_threads(target ? target : context, active_threads, active_threads);
+    live_threads.store(active_threads, std::memory_order_relaxed);
+    const int batch_threads = std::max(1, std::min(options.threads, batch_thread_limit.load(std::memory_order_relaxed)));
+    live_batch_threads.store(batch_threads, std::memory_order_relaxed);
+    auto *selected = target ? target : context;
+    if (selected && (llama_n_threads(selected) != active_threads || llama_n_threads_batch(selected) != batch_threads))
+        llama_set_n_threads(selected, active_threads, batch_threads);
+}
+
+/** Resolve against the selected CPU variant; never link a generic CPU backend by mistake. */
+void attach_cpu_threadpool(llama_context *target) {
+    if (!target) return;
+    if (!cpu_threadpool) {
+        const auto device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (!device) return;
+        const auto reg = ggml_backend_dev_backend_reg(device);
+        auto create = reinterpret_cast<decltype(ggml_threadpool_new) *>(ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new"));
+        free_threadpool = reinterpret_cast<decltype(ggml_threadpool_free) *>(ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free"));
+        if (!create || !free_threadpool) return; // llama.cpp's automatic pool remains available.
+        auto params = ggml_threadpool_params_default(options.threads);
+        cpu_threadpool = create(&params);
+    }
+    // Inference and benchmark contexts are serialized by the Kotlin engine mutex.
+    if (cpu_threadpool) llama_attach_threadpool(target, cpu_threadpool, cpu_threadpool);
 }
 
 void clear_conversation() {
     if (context) llama_memory_clear(llama_get_memory(context), false);
     if (sampler) common_sampler_reset(sampler);
     messages.clear();
+    kv_tokens.clear();
     position = system_position = 0;
     cached_bytes.clear();
     assistant_text.clear();
@@ -122,6 +195,13 @@ void clear_conversation() {
     generation_eog = false;
     needs_end_of_turn = false;
     context_dirty = false;
+    last_generated_token = -1;
+    repeated_token_streak = 0;
+    generation_degenerate = false;
+    live_phase.store(0, std::memory_order_relaxed);
+    live_prompt_total.store(0, std::memory_order_relaxed);
+    live_prompt_done.store(0, std::memory_order_relaxed);
+    live_generated.store(0, std::memory_order_relaxed);
 }
 
 void free_context() {
@@ -130,13 +210,24 @@ void free_context() {
     needs_end_of_turn = false;
     if (sampler) { common_sampler_free(sampler); sampler = nullptr; }
     templates.reset();
+    template_supports_thinking = false;
+    stable_thinking_scaffold = false;
     if (batch_allocated) { llama_batch_free(batch); batch = {}; batch_allocated = false; }
     if (context) { llama_free(context); context = nullptr; }
+    if (cpu_threadpool && free_threadpool) { free_threadpool(cpu_threadpool); cpu_threadpool = nullptr; }
     messages.clear();
+    kv_tokens.clear();
     position = system_position = 0;
     cached_bytes.clear();
     assistant_text.clear();
     context_dirty = false;
+    last_generated_token = -1;
+    repeated_token_streak = 0;
+    generation_degenerate = false;
+    live_phase.store(0, std::memory_order_relaxed);
+    live_prompt_total.store(0, std::memory_order_relaxed);
+    live_prompt_done.store(0, std::memory_order_relaxed);
+    live_generated.store(0, std::memory_order_relaxed);
 }
 
 void free_model() {
@@ -145,6 +236,24 @@ void free_model() {
     model_path.clear();
     system_prompt.clear();
     gpu_layers = 0;
+    live_gpu_layers.store(0, std::memory_order_relaxed);
+    model_load_us = 0;
+    context_prepare_us = 0;
+    system_prompt_us = 0;
+    prompt_render_us = 0;
+    prompt_tokenize_us = 0;
+    prompt_us = 0;
+    prompt_tokens = 0;
+    prompt_reused_tokens = 0;
+    prompt_decoded_tokens = 0;
+    history_alignment_tokens = 0;
+    history_alignment_kv_tokens = 0;
+    history_alignment_plain_tokens = 0;
+    history_alignment_empty_tokens = 0;
+    history_divergence_index = -1;
+    history_alignment_mode = "none";
+    history_divergence_window = "none";
+    fallback_events = 0;
 }
 
 bool load_selected_model(bool use_gpu) {
@@ -156,7 +265,10 @@ bool load_selected_model(bool use_gpu) {
     params.progress_callback = load_progress;
     params.progress_callback_user_data = nullptr;
     model = llama_model_load_from_file(model_path.c_str(), params);
-    if (model) gpu_layers = use_gpu ? std::min(options.gpu_layers, llama_model_n_layer(model) + 1) : 0;
+    if (model) {
+        gpu_layers = use_gpu ? std::min(options.gpu_layers, llama_model_n_layer(model) + 1) : 0;
+        live_gpu_layers.store(gpu_layers, std::memory_order_relaxed);
+    }
     return model != nullptr;
 }
 
@@ -165,64 +277,195 @@ llama_context *new_context(int requested = 0) {
     const int trained = llama_model_n_ctx_train(model);
     params.n_ctx = std::min(requested ? requested : options.context, trained > 0 ? trained : options.context);
     params.n_batch = std::min(options.batch, static_cast<int>(params.n_ctx));
-    params.n_ubatch = params.n_batch;
+    params.n_ubatch = std::min(options.micro_batch, static_cast<int>(params.n_batch));
     active_threads = std::max(1, std::min(options.threads, thread_limit.load(std::memory_order_relaxed)));
-    params.n_threads = params.n_threads_batch = active_threads;
+    params.n_threads = active_threads;
+    params.n_threads_batch = std::max(1, std::min(options.threads, batch_thread_limit.load(std::memory_order_relaxed)));
     params.offload_kqv = gpu_layers > 0;
     params.op_offload = gpu_layers > 0;
-    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+    params.flash_attn_type = gpu_layers > 0 && vulkan_probe.adreno840
+        ? LLAMA_FLASH_ATTN_TYPE_DISABLED : LLAMA_FLASH_ATTN_TYPE_AUTO;
     params.abort_callback = abort_decode;
     params.abort_callback_data = nullptr;
     params.no_perf = false;
-    return llama_init_from_model(model, params);
+    auto *created = llama_init_from_model(model, params);
+    attach_cpu_threadpool(created);
+    return created;
 }
 
-bool make_room(int required) {
+int desired_context_size() {
+    const int trained = llama_model_n_ctx_train(model);
+    return std::max(512, std::min(options.context, trained > 0 ? trained : options.context));
+}
+
+llama_context *new_context_with_fallback(int &selected) {
+    const int desired = desired_context_size();
+    std::vector<int> candidates{desired};
+    for (const int candidate : {16384, 8192, 4096, 2048, 1024, 512}) {
+        if (candidate < desired && std::find(candidates.begin(), candidates.end(), candidate) == candidates.end())
+            candidates.push_back(candidate);
+    }
+
+    for (const int candidate : candidates) {
+        if (cancelled.load()) break;
+        try {
+            auto *attempt = new_context(candidate);
+            if (attempt) {
+                selected = static_cast<int>(llama_n_ctx(attempt));
+                return attempt;
+            }
+        } catch (...) {
+            // Try the next conservative context size.
+        }
+    }
+    selected = 0;
+    return nullptr;
+}
+
+void append_fallback(const std::string &message) {
+    if (message.empty()) return;
+    if (!fallback.empty()) fallback += "; ";
+    fallback += message;
+}
+
+/**
+ * Reserve the whole current turn before decoding it. When the existing history
+ * no longer leaves enough room, drop the old conversational KV tail at once
+ * instead of sliding the context during the assistant response. The system
+ * prompt remains pinned.
+ */
+bool make_turn_room(int required) {
     const int capacity = static_cast<int>(llama_n_ctx(context)) - HEADROOM;
-    const int discard = pocketai::discard_count(position, system_position, required, capacity);
-    if (!discard) return true;
-    if (discard < 0 || !llama_memory_can_shift(llama_get_memory(context))) return false;
-    if (!llama_memory_seq_rm(llama_get_memory(context), 0, system_position, system_position + discard)) return false;
-    llama_memory_seq_add(llama_get_memory(context), 0, system_position + discard, position, -discard);
-    position -= discard;
-    ++shifts;
+    if (position + required <= capacity) return true;
+    if (system_position + required > capacity) return false;
+
+    auto memory = llama_get_memory(context);
+    if (!memory || !llama_memory_seq_rm(memory, 0, system_position, position)) return false;
+    position = system_position;
+    if (kv_tokens.size() >= static_cast<size_t>(system_position))
+        kv_tokens.resize(static_cast<size_t>(system_position));
+    else
+        kv_tokens.clear();
+
+    if (!messages.empty() && messages.front().role == "system") messages.resize(1);
+    else messages.clear();
+
+    ++history_resets;
     return true;
 }
 
 int decode_prompt(const llama_tokens &tokens, bool last_logit) {
+    live_phase.store(1, std::memory_order_relaxed);
+    live_prompt_total.store(static_cast<int>(tokens.size()), std::memory_order_relaxed);
+    live_prompt_done.store(0, std::memory_order_relaxed);
+    live_generated.store(0, std::memory_order_relaxed);
+    live_phase_start_us.store(ggml_time_us(), std::memory_order_relaxed);
     for (size_t offset = 0; offset < tokens.size();) {
         if (cancelled.load()) { context_dirty = true; return 3; }
         const int count = std::min(options.batch, static_cast<int>(tokens.size() - offset));
-        if (!make_room(count)) { context_dirty = true; return 1; }
+        const int capacity = static_cast<int>(llama_n_ctx(context)) - HEADROOM;
+        if (position + count > capacity) { context_dirty = true; return 1; }
         apply_threads();
         common_batch_clear(batch);
         for (int i = 0; i < count; ++i)
             common_batch_add(batch, tokens[offset + i], position + i, {0}, last_logit && offset + i + 1 == tokens.size());
         const int result = llama_decode(context, batch);
         if (result) { context_dirty = true; return cancelled.load() ? 3 : 2; }
+        kv_tokens.insert(kv_tokens.end(), tokens.begin() + static_cast<std::ptrdiff_t>(offset),
+                         tokens.begin() + static_cast<std::ptrdiff_t>(offset + count));
         position += count;
         offset += count;
+        live_prompt_done.store(static_cast<int>(offset), std::memory_order_relaxed);
     }
     return 0;
+}
+
+/**
+ * Keep an exact token-identical KV prefix. Re-evaluate at least the final prompt
+ * token afterwards so llama.cpp exposes logits for the current prompt rather than
+ * stale logits from an older, longer sequence.
+ */
+size_t trim_kv_to_prefix(size_t requested_prefix) {
+    if (!context || kv_tokens.size() != static_cast<size_t>(position)) {
+        if (context) {
+            auto memory = llama_get_memory(context);
+            if (memory) llama_memory_clear(memory, false);
+        }
+        kv_tokens.clear();
+        position = 0;
+        return 0;
+    }
+
+    const size_t prefix = std::min(requested_prefix, kv_tokens.size());
+    if (prefix == kv_tokens.size()) return prefix;
+
+    auto memory = llama_get_memory(context);
+    if (!memory || !llama_memory_seq_rm(memory, 0, static_cast<llama_pos>(prefix), position)) {
+        if (memory) llama_memory_clear(memory, false);
+        kv_tokens.clear();
+        position = 0;
+        return 0;
+    }
+
+    position = static_cast<llama_pos>(prefix);
+    kv_tokens.resize(prefix);
+    return prefix;
 }
 
 std::string format_message(const std::string &role, const std::string &content, bool add_assistant) {
     common_chat_msg message;
     message.role = role;
     message.content = content;
-    return common_chat_format_single(templates.get(), messages, message, add_assistant, false);
+
+    // Keep legacy formatting for ordinary instruct models. Reasoning-capable
+    // templates (for example Qwen3) are rendered through Jinja with thinking
+    // explicitly disabled because PocketAI intentionally hides private reasoning.
+    if (!template_supports_thinking)
+        return common_chat_format_single(templates.get(), messages, message, add_assistant, false);
+
+    const auto vocab = llama_model_get_vocab(model);
+    common_chat_templates_inputs inputs;
+    inputs.use_jinja = true;
+    inputs.enable_thinking = false;
+    inputs.add_bos = llama_vocab_get_add_bos(vocab);
+    inputs.add_eos = llama_vocab_get_add_eos(vocab);
+
+    std::string formatted_past;
+    if (!messages.empty()) {
+        inputs.messages = messages;
+        inputs.add_generation_prompt = false;
+        formatted_past = common_chat_templates_apply(templates.get(), inputs).prompt;
+    }
+
+    std::ostringstream result;
+    if (add_assistant && !formatted_past.empty() && formatted_past.back() == '\n')
+        result << '\n';
+
+    inputs.messages.push_back(message);
+    inputs.add_generation_prompt = add_assistant;
+    const auto formatted = common_chat_templates_apply(templates.get(), inputs).prompt;
+    if (formatted.size() < formatted_past.size() ||
+        formatted.compare(0, formatted_past.size(), formatted_past) != 0)
+        throw std::runtime_error("Chat template did not preserve history prefix");
+
+    result << formatted.substr(formatted_past.size());
+    return result.str();
+}
+
+void add_message(common_chat_msg message) {
+    messages.push_back(std::move(message));
+    // Templates need recent role ordering; keep native bookkeeping bounded.
+    if (messages.size() > 64) {
+        const size_t first = messages.front().role == "system" ? 1 : 0;
+        messages.erase(messages.begin() + first, messages.begin() + first + 2);
+    }
 }
 
 void add_message(const std::string &role, const std::string &content) {
     common_chat_msg message;
     message.role = role;
     message.content = content;
-    messages.push_back(std::move(message));
-    // Templates need recent role ordering; keep the native history bounded as the KV cache slides.
-    if (messages.size() > 64) {
-        const size_t first = messages.front().role == "system" ? 1 : 0;
-        messages.erase(messages.begin() + first, messages.begin() + first + 2);
-    }
+    add_message(std::move(message));
 }
 
 llama_tokens tokenize_input(const std::string &text, bool parse_special) {
@@ -232,6 +475,219 @@ llama_tokens tokenize_input(const std::string &text, bool parse_special) {
     if (!position && llama_vocab_get_add_bos(vocab) && bos >= 0 && (tokens.empty() || tokens.front() != bos))
         tokens.insert(tokens.begin(), bos);
     return tokens;
+}
+
+llama_tokens tokenize_from_start(const std::string &text, bool parse_special) {
+    auto tokens = common_tokenize(context, text, false, parse_special);
+    const auto vocab = llama_model_get_vocab(model);
+    const auto bos = llama_vocab_bos(vocab);
+    if (llama_vocab_get_add_bos(vocab) && bos >= 0 && (tokens.empty() || tokens.front() != bos))
+        tokens.insert(tokens.begin(), bos);
+    return tokens;
+}
+
+std::string render_reasoning_chat(
+    const std::vector<common_chat_msg> &chat,
+    bool add_generation_prompt
+) {
+    const auto vocab = llama_model_get_vocab(model);
+    common_chat_templates_inputs inputs;
+    inputs.messages = chat;
+    inputs.use_jinja = true;
+    inputs.enable_thinking = false;
+    inputs.add_generation_prompt = add_generation_prompt;
+    inputs.add_bos = llama_vocab_get_add_bos(vocab);
+    inputs.add_eos = llama_vocab_get_add_eos(vocab);
+    return common_chat_templates_apply(templates.get(), inputs).prompt;
+}
+
+std::string render_full_reasoning_chat(const std::vector<common_chat_msg> &chat) {
+    return render_reasoning_chat(chat, true);
+}
+
+std::string token_id_window(
+    const std::vector<llama_token> &cached,
+    const llama_tokens &rendered,
+    size_t pivot
+) {
+    const size_t start = pivot > 4 ? pivot - 4 : 0;
+    const size_t limit = std::max(cached.size(), rendered.size());
+    const size_t end = std::min(limit, pivot + 5);
+    std::ostringstream out;
+    for (size_t i = start; i < end; ++i) {
+        if (i > start) out << " ";
+        out << i << ":";
+        if (i < cached.size()) out << cached[i]; else out << "-";
+        out << "/";
+        if (i < rendered.size()) out << rendered[i]; else out << "-";
+    }
+    return out.str().empty() ? "none" : out.str();
+}
+
+/**
+ * Some reasoning templates emit an empty <think> block only in their generation
+ * prompt, but omit it when the completed assistant message is rendered again.
+ * That tiny rewrite invalidates the KV state of the whole assistant answer.
+ *
+ * Try representations that are semantically identical to PocketAI (no private
+ * reasoning) and keep the one whose rendered history matches the live KV for the
+ * longest exact token prefix. Qwen3 accepts a newline-only reasoning_content:
+ * it is truthy to the template but strips to empty inside the think block.
+ */
+common_chat_msg aligned_assistant_message(const std::string &content) {
+    common_chat_msg plain;
+    plain.role = "assistant";
+    plain.content = content;
+
+    history_alignment_tokens = 0;
+    history_alignment_kv_tokens = 0;
+    history_alignment_plain_tokens = 0;
+    history_alignment_empty_tokens = 0;
+    history_divergence_index = -1;
+    history_alignment_mode = "plain";
+    history_divergence_window = "none";
+
+    if (!template_supports_thinking || !context || kv_tokens.empty()) return plain;
+
+    std::vector<common_chat_msg> variants;
+    variants.push_back(plain);
+    common_chat_msg empty_reasoning = plain;
+    empty_reasoning.reasoning_content = "\n";
+    variants.push_back(std::move(empty_reasoning));
+
+    common_chat_msg best = variants.front();
+    size_t best_prefix = 0;
+    size_t best_total = 0;
+    std::string best_mode = "plain";
+
+    for (size_t index = 0; index < variants.size(); ++index) {
+        try {
+            auto candidate = messages;
+            candidate.push_back(variants[index]);
+
+            // Probe the representation as a *previous* assistant turn. Qwen3 renders
+            // the last assistant differently from an assistant followed by a new
+            // user message, which is exactly what caused the next-turn KV mismatch.
+            common_chat_msg probe_user;
+            probe_user.role = "user";
+            probe_user.content = "__pocketai_alignment_probe__";
+            candidate.push_back(std::move(probe_user));
+
+            const auto rendered = render_reasoning_chat(candidate, false);
+            const auto rendered_tokens = tokenize_from_start(rendered, true);
+            const size_t prefix = pocketai::token_prefix_length(rendered_tokens, kv_tokens);
+            if (index == 0) history_alignment_plain_tokens = static_cast<int>(prefix);
+            else history_alignment_empty_tokens = static_cast<int>(prefix);
+            if (prefix > best_prefix || (prefix == best_prefix && index == 0)) {
+                best = variants[index];
+                best_prefix = prefix;
+                best_total = kv_tokens.size();
+                best_mode = index == 0 ? "plain" : "empty-reasoning";
+                history_divergence_index = prefix < kv_tokens.size() ? static_cast<int>(prefix) : -1;
+                history_divergence_window = prefix < kv_tokens.size()
+                    ? token_id_window(kv_tokens, rendered_tokens, prefix)
+                    : "none";
+            }
+        } catch (...) {
+            // Keep the ordinary assistant representation if alignment probing fails.
+        }
+    }
+
+    history_alignment_tokens = static_cast<int>(best_prefix);
+    history_alignment_kv_tokens = static_cast<int>(best_total);
+    history_alignment_mode = best_mode;
+    return best;
+}
+
+bool drop_oldest_history_turn(std::vector<common_chat_msg> &chat) {
+    const size_t first = (!chat.empty() && chat.front().role == "system") ? 1 : 0;
+    // Keep at least the current user message, which is always the final element.
+    if (chat.size() <= first + 1) return false;
+
+    size_t end = first + 1;
+    if (end < chat.size() - 1 && chat[end].role == "assistant") ++end;
+    chat.erase(chat.begin() + first, chat.begin() + end);
+    return true;
+}
+
+int process_reasoning_user(const std::string &user, int maximum) {
+    const int capacity = static_cast<int>(llama_n_ctx(context)) - HEADROOM;
+    const int minimum = std::min(maximum, MIN_GENERATION_TOKENS);
+
+    std::vector<common_chat_msg> candidate = messages;
+    common_chat_msg current;
+    current.role = "user";
+    current.content = user;
+    candidate.push_back(std::move(current));
+
+    std::string formatted;
+    llama_tokens tokens;
+    int effective = 0;
+    int dropped_turns = 0;
+    prompt_render_us = 0;
+    prompt_tokenize_us = 0;
+    prompt_reused_tokens = 0;
+    prompt_decoded_tokens = 0;
+
+    for (;;) {
+        const auto render_start = ggml_time_us();
+        formatted = render_full_reasoning_chat(candidate);
+        prompt_render_us += ggml_time_us() - render_start;
+
+        const auto tokenize_start = ggml_time_us();
+        tokens = tokenize_from_start(formatted, true);
+        prompt_tokenize_us += ggml_time_us() - tokenize_start;
+        if (tokens.empty()) return 1;
+
+        effective = pocketai::generation_limit(
+            capacity,
+            0,
+            static_cast<int>(tokens.size()),
+            maximum,
+            minimum
+        );
+        if (effective > 0) break;
+
+        if (!drop_oldest_history_turn(candidate)) return 1;
+        ++dropped_turns;
+    }
+
+    // Reuse only a token-identical prefix. Qwen3 templates may rewrite the tail
+    // between turns, so byte/string assumptions are unsafe. Exact token comparison
+    // lets us keep the stable KV prefix and recompute only the changed/new suffix.
+    size_t reusable = pocketai::reusable_token_prefix(tokens, kv_tokens);
+    reusable = trim_kv_to_prefix(reusable);
+
+    common_sampler_reset(sampler);
+    system_position = 0; // reasoning turns are managed as complete templated prompts
+    cached_bytes.clear();
+    assistant_text.clear();
+    needs_end_of_turn = false;
+    context_dirty = false;
+
+    llama_tokens suffix(tokens.begin() + static_cast<std::ptrdiff_t>(reusable), tokens.end());
+    const auto start = ggml_time_us();
+    const int result = decode_prompt(suffix, true);
+    prompt_us = ggml_time_us() - start;
+    prompt_tokens = static_cast<int>(tokens.size());
+    prompt_reused_tokens = static_cast<int>(reusable);
+    prompt_decoded_tokens = static_cast<int>(suffix.size());
+    if (result) return result;
+
+    messages = std::move(candidate);
+    history_resets += dropped_turns;
+    budget.start(maximum, effective);
+    last_generated_token = -1;
+    repeated_token_streak = 0;
+    generation_degenerate = false;
+    generation_start = ggml_time_us();
+    generation_end = 0;
+    generation_eog = false;
+    live_generated.store(0, std::memory_order_relaxed);
+    live_phase_start_us.store(generation_start, std::memory_order_relaxed);
+    live_phase.store(2, std::memory_order_relaxed);
+    generating = true;
+    return 0;
 }
 
 int install_system_prompt() {
@@ -252,10 +708,12 @@ void finish_generation() {
     if (!generating) return;
     generation_end = ggml_time_us();
     if (!context_dirty && common_chat_templates_was_explicit(templates.get())) {
-        add_message("assistant", assistant_text);
+        if (template_supports_thinking) add_message(aligned_assistant_message(assistant_text));
+        else add_message("assistant", assistant_text);
         needs_end_of_turn = !generation_eog;
     }
     generating = false;
+    live_phase.store(0, std::memory_order_relaxed);
     cached_bytes.clear();
     log_event(ANDROID_LOG_INFO, cancelled.load() ? "Generation cancelled" : "Generation complete");
 }
@@ -264,6 +722,15 @@ void finish_generation() {
 extern "C" JNIEXPORT void JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_init(JNIEnv *env, jobject, jstring directory) {
     try {
+        // Apply driver workarounds BEFORE Vulkan registry/device initialization.
+        // These flags are process-wide; changing them after first use has no effect.
+        vulkan_probe = pocketai::probe_vulkan();
+        if (vulkan_probe.adreno840) {
+            for (const auto *flag : {"GGML_VK_DISABLE_F16", "GGML_VK_DISABLE_COOPMAT", "GGML_VK_DISABLE_COOPMAT2",
+                                     "GGML_VK_DISABLE_DOT2", "GGML_VK_DISABLE_ASYNC", "GGML_VK_SERIALIZE_SUBMISSIONS"}) {
+                setenv(flag, "1", 1);
+            }
+        }
         common_log_set_verbosity_thold(-1);
         llama_log_set(private_backend_log, nullptr);
         ggml_log_set(private_backend_log, nullptr);
@@ -300,19 +767,22 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_init(JNIEnv *env, jobject, jstr
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_arm_aichat_internal_InferenceEngineImpl_configureNative(JNIEnv *env, jobject, jint threads, jint ctx, jint bs, jint layers, jfloat temp) {
-    if (model || threads < 1 || threads > 32 || ctx < 512 || ctx > 32768 || bs < 32 || bs > 1024 || bs > ctx || layers < 0 || layers > 256 || !std::isfinite(temp) || temp < 0 || temp > 2) {
+Java_com_arm_aichat_internal_InferenceEngineImpl_configureNative(JNIEnv *env, jobject, jint threads, jint ctx, jint bs, jint layers, jfloat temp, jint micro_batch) {
+    if (model || threads < 1 || threads > 32 || ctx < 512 || ctx > 32768 || bs < 32 || bs > 1024 || bs > ctx || layers < 0 || layers > 256 || micro_batch < 1 || micro_batch > bs || !std::isfinite(temp) || temp < 0 || temp > 2) {
         throw_io(env, "Invalid inference configuration or model still loaded"); return;
     }
-    options = {threads, ctx, bs, layers, temp};
+    options = {threads, ctx, bs, layers, temp, micro_batch};
+    validation_summary = "not compared with CPU";
     thread_limit.store(threads);
+    batch_thread_limit.store(threads);
     active_threads = threads;
     fallback.clear();
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_arm_aichat_internal_InferenceEngineImpl_setThreadLimitNative(JNIEnv *, jobject, jint threads) {
+Java_com_arm_aichat_internal_InferenceEngineImpl_setThreadLimitNative(JNIEnv *, jobject, jint threads, jint batch_threads) {
     thread_limit.store(std::clamp(static_cast<int>(threads), 1, 32));
+    batch_thread_limit.store(std::clamp(static_cast<int>(batch_threads), 1, 32));
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -324,35 +794,72 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_resetCancellation(JNIEnv *, job
 extern "C" JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstring path) {
     free_model();
+    const auto load_start = ggml_time_us();
     model_path = java_text(env, path);
     fallback.clear();
     const bool want_gpu = options.gpu_layers > 0 && gpu;
-    if (options.gpu_layers > 0 && !gpu) fallback = "Vulkan device unavailable; CPU selected";
-    try { if (load_selected_model(want_gpu)) return 0; }
-    catch (...) { log_event(ANDROID_LOG_WARN, "Model backend load failed"); }
-    if (cancelled.load()) return 3;
+    if (options.gpu_layers > 0 && !gpu) {
+        fallback = "Vulkan device unavailable; CPU selected";
+        ++fallback_events;
+    }
+    try {
+        if (load_selected_model(want_gpu)) {
+            model_load_us = ggml_time_us() - load_start;
+            return 0;
+        }
+    } catch (...) { log_event(ANDROID_LOG_WARN, "Model backend load failed"); }
+    if (cancelled.load()) {
+        model_load_us = ggml_time_us() - load_start;
+        return 3;
+    }
     if (want_gpu) {
         if (model) { llama_model_free(model); model = nullptr; }
         gpu_layers = 0;
         fallback = "GPU model allocation failed; CPU fallback";
+        ++fallback_events;
         log_event(ANDROID_LOG_WARN, "Retrying model on CPU");
-        try { if (load_selected_model(false)) return 0; } catch (...) { }
+        try {
+            if (load_selected_model(false)) {
+                model_load_us = ggml_time_us() - load_start;
+                return 0;
+            }
+        } catch (...) { }
     }
+    model_load_us = ggml_time_us() - load_start;
     return 1;
 }
 
 extern "C" JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv *, jobject) {
     if (!model) return 1;
+    const auto prepare_start = ggml_time_us();
     free_context();
-    try { context = new_context(); } catch (...) { context = nullptr; }
+
+    int selected_context = 0;
+    const int requested_context = desired_context_size();
+    context = new_context_with_fallback(selected_context);
+
     if (!context && gpu_layers > 0 && !cancelled.load()) {
         llama_model_free(model); model = nullptr;
         gpu_layers = 0;
         fallback = "GPU context allocation failed; CPU fallback";
+        ++fallback_events;
         log_event(ANDROID_LOG_WARN, "Retrying context on CPU");
-        try { if (load_selected_model(false)) context = new_context(); } catch (...) { context = nullptr; }
+        try {
+            if (load_selected_model(false)) {
+                const int cpu_requested_context = desired_context_size();
+                context = new_context_with_fallback(selected_context);
+                if (context && selected_context < cpu_requested_context) {
+                    append_fallback("context reduced to " + std::to_string(selected_context) + " tokens");
+                    ++fallback_events;
+                }
+            }
+        } catch (...) { context = nullptr; }
+    } else if (context && selected_context < requested_context) {
+        append_fallback("context reduced to " + std::to_string(selected_context) + " tokens");
+        ++fallback_events;
     }
+
     if (!context || cancelled.load()) { free_context(); return 1; }
     try {
         batch = llama_batch_init(options.batch, 0, 1);
@@ -363,12 +870,33 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv *, jobject) {
         sampling.temp = options.temperature;
         sampler = common_sampler_init(model, sampling);
         if (!sampler || !templates) { free_context(); return 1; }
+        try { template_supports_thinking = common_chat_templates_support_enable_thinking(templates.get()); }
+        catch (...) { template_supports_thinking = false; }
+        if (template_supports_thinking) {
+            char architecture[128]{};
+            llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture));
+            if (std::string(architecture) == "qwen3") {
+                const auto original = common_chat_templates_source(templates.get());
+                const auto adapted = pocketai::stable_qwen3_template(original);
+                if (adapted != original) {
+                    // Retain the stock template if the model's adapted template cannot initialize.
+                    try {
+                        auto stable = common_chat_templates_init(model, adapted);
+                        if (stable && common_chat_templates_support_enable_thinking(stable.get())) {
+                            templates = std::move(stable);
+                            stable_thinking_scaffold = true;
+                        }
+                    } catch (...) { log_event(ANDROID_LOG_WARN, "Stock reasoning template retained"); }
+                }
+            }
+        }
         clear_conversation();
-        shifts = 0;
+        history_resets = 0;
         budget.start(0);
         prompt_tokens = 0;
         prompt_us = 0;
         generation_start = generation_end = 0;
+        context_prepare_us = ggml_time_us() - prepare_start;
         log_event(ANDROID_LOG_INFO, gpu_layers > 0 ? "Vulkan model ready" : "CPU model ready");
         return 0;
     } catch (...) { free_context(); return 1; }
@@ -377,8 +905,18 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv *, jobject) {
 extern "C" JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(JNIEnv *env, jobject, jstring text) {
     if (!context) return 2;
-    try { system_prompt = java_text(env, text); return install_system_prompt(); }
-    catch (...) { context_dirty = true; return 2; }
+    const auto start = ggml_time_us();
+    try {
+        system_prompt = java_text(env, text);
+        const int result = install_system_prompt();
+        system_prompt_us = ggml_time_us() - start;
+        live_phase.store(0, std::memory_order_relaxed);
+        return result;
+    } catch (...) {
+        system_prompt_us = ggml_time_us() - start;
+        context_dirty = true;
+        return 2;
+    }
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -387,49 +925,155 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(JNIEnv *env, 
     finish_generation();
     try {
         if (context_dirty && install_system_prompt()) return 2;
-        if (needs_end_of_turn) {
-            const auto vocab = llama_model_get_vocab(model);
-            auto eot = llama_vocab_eot(vocab);
-            if (eot < 0) eot = llama_vocab_eos(vocab);
-            if (eot < 0) { context_dirty = true; return 2; }
-            const int result = decode_prompt({eot}, false);
-            if (result) return result;
-            needs_end_of_turn = false;
-        }
+
         const auto user = java_text(env, text);
         const bool chat_template = common_chat_templates_was_explicit(templates.get());
-        const auto formatted = chat_template ? format_message("user", user, true) : user;
-        const auto tokens = tokenize_input(formatted, chat_template);
-        if (tokens.empty() || tokens.size() > llama_n_ctx(context) - system_position - HEADROOM - 1) return 1;
+
+        // Reasoning-capable templates such as Qwen3 can rewrite their rendered tail
+        // between turns. The reasoning path renders the complete structured chat, then
+        // reuses only the exact token-identical KV prefix and decodes the changed suffix.
+        if (chat_template && template_supports_thinking)
+            return process_reasoning_user(user, static_cast<int>(maximum));
+
+        if (needs_end_of_turn) {
+            const int capacity = static_cast<int>(llama_n_ctx(context)) - HEADROOM;
+            if (position + 1 > capacity) {
+                const int resets_before = history_resets;
+                if (!make_turn_room(1)) { context_dirty = true; return 2; }
+                if (history_resets == resets_before) { context_dirty = true; return 2; }
+                needs_end_of_turn = false;
+            } else {
+                const auto vocab = llama_model_get_vocab(model);
+                auto eot = llama_vocab_eot(vocab);
+                if (eot < 0) eot = llama_vocab_eos(vocab);
+                if (eot < 0) { context_dirty = true; return 2; }
+                const int result = decode_prompt({eot}, false);
+                if (result) return result;
+                needs_end_of_turn = false;
+            }
+        }
+
+        prompt_render_us = 0;
+        prompt_tokenize_us = 0;
+        prompt_reused_tokens = 0;
+        prompt_decoded_tokens = 0;
+
+        const auto render_start = ggml_time_us();
+        auto formatted = chat_template ? format_message("user", user, true) : user;
+        prompt_render_us += ggml_time_us() - render_start;
+
+        const auto tokenize_start = ggml_time_us();
+        auto tokens = tokenize_input(formatted, chat_template);
+        prompt_tokenize_us += ggml_time_us() - tokenize_start;
+        if (tokens.empty()) return 1;
+
+        const int capacity = static_cast<int>(llama_n_ctx(context)) - HEADROOM;
+        const int minimum = std::min(static_cast<int>(maximum), MIN_GENERATION_TOKENS);
+        int effective = pocketai::generation_limit(
+            capacity,
+            static_cast<int>(position),
+            static_cast<int>(tokens.size()),
+            static_cast<int>(maximum),
+            minimum
+        );
+
+        if (!effective) {
+            const int resets_before = history_resets;
+            if (!make_turn_room(static_cast<int>(tokens.size()) + minimum)) return 1;
+
+            if (history_resets != resets_before) {
+                const auto rerender_start = ggml_time_us();
+                formatted = chat_template ? format_message("user", user, true) : user;
+                prompt_render_us += ggml_time_us() - rerender_start;
+                const auto retokenize_start = ggml_time_us();
+                tokens = tokenize_input(formatted, chat_template);
+                prompt_tokenize_us += ggml_time_us() - retokenize_start;
+                if (tokens.empty()) return 1;
+            }
+
+            effective = pocketai::generation_limit(
+                capacity,
+                system_position,
+                static_cast<int>(tokens.size()),
+                static_cast<int>(maximum),
+                minimum
+            );
+            if (!effective || !make_turn_room(static_cast<int>(tokens.size()) + effective)) return 1;
+        } else if (!make_turn_room(static_cast<int>(tokens.size()) + effective)) {
+            return 1;
+        }
+
         cached_bytes.clear();
         assistant_text.clear();
         common_sampler_reset(sampler);
         const auto start = ggml_time_us();
-        if (!make_room(static_cast<int>(tokens.size()))) { context_dirty = true; return 1; }
         const int result = decode_prompt(tokens, true);
         prompt_us = ggml_time_us() - start;
-        prompt_tokens = tokens.size();
+        prompt_tokens = static_cast<int>(tokens.size());
+        prompt_reused_tokens = 0;
+        prompt_decoded_tokens = static_cast<int>(tokens.size());
         if (result) return result;
         if (chat_template) add_message("user", user);
-        budget.start(maximum);
+        budget.start(maximum, effective);
         generation_start = ggml_time_us();
         generation_end = 0;
         generation_eog = false;
+        live_generated.store(0, std::memory_order_relaxed);
+        live_phase_start_us.store(generation_start, std::memory_order_relaxed);
+        live_phase.store(2, std::memory_order_relaxed);
         generating = true;
         return 0;
-    } catch (...) { context_dirty = true; return 2; }
+    } catch (...) {
+        context_dirty = true;
+        return 2;
+    }
 }
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(JNIEnv *env, jobject) {
     if (!context || !generating || cancelled.load() || budget.exhausted()) { finish_generation(); return nullptr; }
     try {
-        if (!make_room(1)) {
+        const int capacity = static_cast<int>(llama_n_ctx(context)) - HEADROOM;
+        if (position >= capacity) {
+            // The turn is pre-budgeted, so reaching this guard indicates an unexpected
+            // accounting mismatch. Stop cleanly rather than deleting the active prompt.
+            log_event(ANDROID_LOG_WARN, "Generation reached reserved context boundary");
             finish_generation();
-            throw_io(env, "This model cannot slide its context; reset the conversation"); return nullptr;
+            return nullptr;
         }
         apply_threads();
+        if (!pocketai::finite_logits(llama_get_logits_ith(context, -1), llama_vocab_n_tokens(llama_model_get_vocab(model)))) {
+            generation_degenerate = true;
+            context_dirty = true;
+            finish_generation();
+            throw_io(env, gpu_layers > 0 ? "Sortie GPU incoherente detectee; logits non finis" : "Logits CPU non finis");
+            return nullptr;
+        }
         const auto token = common_sampler_sample(sampler, context, -1);
+
+        if (token == last_generated_token) ++repeated_token_streak;
+        else {
+            last_generated_token = token;
+            repeated_token_streak = 1;
+        }
+
+        // Identical-token runs of this length are practically never intentional in
+        // normal chat, but are a known symptom of corrupted GPU logits on some
+        // Android Vulkan/Adreno stacks. Stop before filling the UI with garbage.
+        if (repeated_token_streak >= 32) {
+            generation_degenerate = true;
+            context_dirty = true;
+            log_event(ANDROID_LOG_ERROR, "Degenerate repeated-token output detected");
+            finish_generation();
+            throw_io(
+                env,
+                gpu_layers > 0
+                    ? "Sortie GPU incoherente detectee; recharge le modele en profil Equilibre ou CPU"
+                    : "Boucle de tokens detectee; reinitialise la conversation ou change de modele"
+            );
+            return nullptr;
+        }
+
         common_sampler_accept(sampler, token, true);
         common_batch_clear(batch);
         common_batch_add(batch, token, position, {0}, true);
@@ -440,8 +1084,10 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(JNIEnv *env, 
             return nullptr;
         }
         ++position;
+        kv_tokens.push_back(token);
         if (llama_vocab_is_eog(llama_model_get_vocab(model), token)) { generation_eog = true; finish_generation(); return nullptr; }
         budget.consume();
+        live_generated.store(budget.produced, std::memory_order_relaxed);
         cached_bytes += common_token_to_piece(context, token);
         if (pocketai::complete_utf8(cached_bytes)) {
             assistant_text += cached_bytes;
@@ -466,17 +1112,101 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_finishGeneration(JNIEnv *, jobject) { finish_generation(); }
 
 extern "C" JNIEXPORT jstring JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_nativeFastMetrics(JNIEnv *env, jobject) {
+    const int phase = live_phase.load(std::memory_order_relaxed);
+    const int threads = (phase == 1 ? live_batch_threads : live_threads).load(std::memory_order_relaxed);
+    const int layers = live_gpu_layers.load(std::memory_order_relaxed);
+    const int64_t started = live_phase_start_us.load(std::memory_order_relaxed);
+    const int64_t elapsed = started > 0 ? std::max<int64_t>(1, ggml_time_us() - started) : 1;
+    std::ostringstream out;
+    out.precision(3);
+    if (phase == 1) {
+        const int done = live_prompt_done.load(std::memory_order_relaxed);
+        const int total = live_prompt_total.load(std::memory_order_relaxed);
+        out << "Préfill " << done << "/" << total
+            << " · " << (done > 0 ? done * 1e6 / elapsed : 0.0) << " tok/s";
+    } else if (phase == 2) {
+        const int produced = live_generated.load(std::memory_order_relaxed);
+        out << "Génération " << produced
+            << " · " << (produced > 0 ? produced * 1e6 / elapsed : 0.0) << " tok/s";
+    } else {
+        out << "Moteur prêt";
+    }
+    out << " · " << (layers > 0 ? "CPU+Vulkan" : "CPU")
+        << " · threads " << threads
+        << " · GPU layers " << layers
+        << " · " << elapsed / 1000.0 << " ms";
+    return android_text(env, out.str());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_nativeDiagnostics(JNIEnv *env, jobject) {
     std::ostringstream out;
     out.precision(3);
     out << "Vulkan GPU: " << (gpu_description.empty() ? "unavailable (device/driver unsupported or backend absent)" : gpu_description) << '\n';
+    out << "Vulkan driver: " << (vulkan_probe.fingerprint.empty() ? "unavailable" : vulkan_probe.fingerprint) << '\n';
+    out << "Vulkan compatibility: " << (vulkan_probe.adreno840 ? "Adreno 840 FP32, scalar matmul, synchronous queues, flash attention off" : "standard") << '\n';
+    out << "Current context validation: " << validation_summary << '\n';
+    out << "Last probe attempt for this model: "
+        << (last_validation_path == model_path && !last_validation_record.empty() ? last_validation_record : "none") << '\n';
     out << "Requested: " << (options.gpu_layers ? "Vulkan" : "CPU") << "; active: " << (context ? gpu_layers > 0 ? "Vulkan + CPU" : "CPU" : "no model") << '\n';
     out << "GPU layers: " << gpu_layers << "; fallback: " << (fallback.empty() ? "none" : fallback) << '\n';
-    out << "Threads: " << active_threads << " / " << options.threads << "; thermal limit: " << thread_limit.load() << '\n';
+    out << "Micro-batch: " << (context ? llama_n_ubatch(context) : options.micro_batch) << '\n';
+    out << "Threads: " << active_threads << " / " << options.threads << "; runtime limit: " << thread_limit.load()
+        << "; prompt threads: " << (context ? llama_n_threads_batch(context) : 0) << '\n';
+    out << "CPU threadpool: " << (cpu_threadpool ? "persistent" : "automatic") << '\n';
+    out << "Disabled-thinking scaffold: " << (stable_thinking_scaffold ? "stable Qwen3 history" : "stock template") << '\n';
     out << "Context: " << (context ? llama_n_ctx(context) : options.context) << "; batch: " << options.batch << "; temperature: " << options.temperature << '\n';
-    out << "Generated: " << budget.produced << " / " << budget.limit << "; context shifts: " << shifts << '\n';
+    out << "Generated: " << budget.produced << " / " << budget.limit
+        << "; requested: " << budget.requested
+        << "; context-limited: " << (budget.context_limited() ? "yes" : "no")
+        << "; history resets: " << history_resets << '\n';
+    out << "Reasoning template: " << (template_supports_thinking ? "detected; thinking disabled" : "not detected") << '\n';
+    out << "Degenerate output guard: " << (generation_degenerate ? "triggered" : "clear")
+        << "; repeated-token streak: " << repeated_token_streak << '\n';
+
+    const auto visible_text = pocketai::strip_thinking(assistant_text);
+    const auto hidden_thinking_text = pocketai::thinking_content(assistant_text);
+    int visible_tokens_estimate = 0;
+    int hidden_thinking_tokens_estimate = 0;
+    if (context) {
+        try {
+            if (!visible_text.empty())
+                visible_tokens_estimate = static_cast<int>(common_tokenize(context, visible_text, false, false).size());
+            if (!hidden_thinking_text.empty())
+                hidden_thinking_tokens_estimate = static_cast<int>(common_tokenize(context, hidden_thinking_text, false, false).size());
+        } catch (...) {
+            visible_tokens_estimate = 0;
+            hidden_thinking_tokens_estimate = 0;
+        }
+    }
+
     const int64_t duration = generation_start ? (generation_end ? generation_end : ggml_time_us()) - generation_start : 0;
-    out << "Generation: " << (duration > 0 ? budget.produced * 1e6 / duration : 0.0) << " tokens/s; prompt: " << (prompt_us > 0 ? prompt_tokens * 1e6 / prompt_us : 0.0) << " tokens/s\n";
+    out << "Load timing: model " << model_load_us / 1000.0
+        << " ms; context " << context_prepare_us / 1000.0
+        << " ms; system-prompt " << system_prompt_us / 1000.0
+        << " ms; fallback-events " << fallback_events << '\n';
+    out << "Prompt timing: total " << prompt_tokens
+        << " tokens; reused " << prompt_reused_tokens
+        << "; decoded " << prompt_decoded_tokens
+        << "; render " << prompt_render_us / 1000.0
+        << " ms; tokenize " << prompt_tokenize_us / 1000.0
+        << " ms; decode " << prompt_us / 1000.0
+        << " ms; " << (prompt_us > 0 ? prompt_decoded_tokens * 1e6 / prompt_us : 0.0)
+        << " decoded tokens/s\n";
+    out << "History alignment: " << history_alignment_tokens << " / "
+        << history_alignment_kv_tokens << " cached tokens; mode " << history_alignment_mode << '\n';
+    out << "History alignment variants: plain " << history_alignment_plain_tokens
+        << "; empty-reasoning " << history_alignment_empty_tokens << '\n';
+    out << "KV divergence: index " << history_divergence_index
+        << "; token-ids cached/rendered " << history_divergence_window << '\n';
+    out << "Output metrics: raw-tokens " << budget.produced
+        << "; visible-tokens-est " << visible_tokens_estimate
+        << "; hidden-thinking-tokens-est " << hidden_thinking_tokens_estimate
+        << "; raw-chars " << pocketai::utf8_codepoints(assistant_text)
+        << "; visible-chars " << pocketai::utf8_codepoints(visible_text) << '\n';
+    out << "Generation: " << (duration > 0 ? budget.produced * 1e6 / duration : 0.0)
+        << " tokens/s; generation-time " << duration / 1000.0 << " ms\n";
     out << "Backend warnings: " << backend_warnings.load() << "; errors: " << backend_errors.load() << '\n';
     out << "Prompt/content logging: disabled\n" << llama_print_system_info();
     return android_text(env, out.str());
@@ -490,7 +1220,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_benchModel(JNIEnv *env, jobject
     llama_batch bench_batch{};
     bool allocated = false;
     try {
-        bench_context = new_context();
+        // The benchmark needs only its own short sequences, not a second full chat KV cache.
+        bench_context = new_context(std::max(512, std::max(static_cast<int>(pp), static_cast<int>(tg)) + HEADROOM));
         if (!bench_context) return android_text(env, "Benchmark context allocation failed");
         if (pp > static_cast<int>(llama_n_ctx(bench_context)) - HEADROOM || tg > static_cast<int>(llama_n_ctx(bench_context)) - HEADROOM) {
             llama_free(bench_context);
@@ -503,29 +1234,31 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_benchModel(JNIEnv *env, jobject
         const auto vocab = llama_model_get_vocab(model);
         auto token = llama_vocab_bos(vocab);
         if (token < 0) token = 0;
-        for (int repeat = 0; repeat < nr; ++repeat) {
+        for (int repeat = -1; repeat < nr; ++repeat) {
+            const int prompt_count = repeat < 0 ? std::min(static_cast<int>(pp), 32) : pp;
+            const int generation_count = repeat < 0 ? std::min(static_cast<int>(tg), 4) : tg;
             llama_memory_clear(llama_get_memory(bench_context), false);
             const auto start = ggml_time_us();
-            for (int offset = 0; offset < pp;) {
+            for (int offset = 0; offset < prompt_count;) {
                 if (cancelled.load()) throw std::runtime_error("cancelled");
                 apply_threads(bench_context);
                 common_batch_clear(bench_batch);
-                const int count = std::min(options.batch, pp - offset);
-                for (int i = 0; i < count; ++i) common_batch_add(bench_batch, token, offset + i, {0}, offset + i + 1 == pp);
+                const int count = std::min(options.batch, prompt_count - offset);
+                for (int i = 0; i < count; ++i) common_batch_add(bench_batch, token, offset + i, {0}, offset + i + 1 == prompt_count);
                 if (llama_decode(bench_context, bench_batch)) throw std::runtime_error("decode");
                 offset += count;
             }
-            prompt_speed += pp * 1e6 / std::max<int64_t>(1, ggml_time_us() - start);
+            if (repeat >= 0) prompt_speed += pp * 1e6 / std::max<int64_t>(1, ggml_time_us() - start);
             llama_memory_clear(llama_get_memory(bench_context), false);
             const auto generation = ggml_time_us();
-            for (int i = 0; i < tg; ++i) {
+            for (int i = 0; i < generation_count; ++i) {
                 if (cancelled.load()) throw std::runtime_error("cancelled");
                 apply_threads(bench_context);
                 common_batch_clear(bench_batch);
                 common_batch_add(bench_batch, token, i, {0}, true);
                 if (llama_decode(bench_context, bench_batch)) throw std::runtime_error("decode");
             }
-            generation_speed += tg * 1e6 / std::max<int64_t>(1, ggml_time_us() - generation);
+            if (repeat >= 0) generation_speed += tg * 1e6 / std::max<int64_t>(1, ggml_time_us() - generation);
         }
         llama_batch_free(bench_batch);
         llama_free(bench_context);
@@ -546,5 +1279,156 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_unload(JNIEnv *, jobject) {
     log_event(ANDROID_LOG_INFO, "Model resources released");
 }
 
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_validateBackendNative(JNIEnv *env, jobject, jboolean capture) {
+    struct Resources {
+        llama_context *ctx = nullptr;
+        llama_batch batch{};
+        bool allocated = false;
+        ~Resources() {
+            if (allocated) llama_batch_free(batch);
+            if (ctx) llama_free(ctx);
+        }
+    } resources;
+    int checked = 0, top_matches = 0, failure_mask = 0, failed_comparisons = 0;
+    int probe_index = -1, step_index = -1, first_bad_probe = -1, first_bad_step = -1;
+    int decode_status = 0, nonfinite_count = 0;
+    double max_js = 0, max_rmse = 0;
+    const char *stage = "model_check";
+    const char *reason = "model_unavailable";
+    auto json_number = [](double value) {
+        if (!std::isfinite(value)) return std::string("null");
+        std::ostringstream number;
+        number.precision(8);
+        number << value;
+        return number.str();
+    };
+    auto record = [&](bool passed) {
+        std::ostringstream out;
+        out.precision(8);
+        out << "{\"passed\":" << (passed ? "true" : "false") << ",\"samples\":" << checked
+            << ",\"reason\":\"" << reason << "\",\"stage\":\"" << stage
+            << "\",\"backend\":\"" << (gpu_layers > 0 ? "Vulkan" : "CPU") << "\",\"gpuLayers\":" << gpu_layers
+            << ",\"microBatch\":" << options.micro_batch << ",\"maxJs\":" << json_number(max_js)
+            << ",\"maxRelativeRmse\":" << json_number(max_rmse)
+            << ",\"topMatches\":" << top_matches << ",\"failureMask\":" << failure_mask
+            << ",\"failedComparisons\":" << failed_comparisons << ",\"firstFailureProbe\":" << first_bad_probe
+            << ",\"firstFailureStep\":" << first_bad_step << ",\"probe\":" << probe_index << ",\"step\":" << step_index
+            << ",\"decodeStatus\":" << decode_status << ",\"nonfiniteCount\":" << nonfinite_count << "}";
+        last_validation_record = out.str();
+        last_validation_path = model_path;
+        return android_text(env, last_validation_record);
+    };
+    try {
+        if (!model || (capture && gpu_layers > 0)) throw std::runtime_error("reference requires CPU");
+        stage = "model_metadata"; reason = "metadata_failed";
+        struct stat metadata{};
+        if (stat(model_path.c_str(), &metadata)) throw std::runtime_error("model metadata");
+        const int vocab_size = llama_vocab_n_tokens(llama_model_get_vocab(model));
+        const auto key = model_path + "|" + std::to_string(metadata.st_size) + "|" +
+            std::to_string(metadata.st_mtim.tv_sec) + "|" + std::to_string(metadata.st_mtim.tv_nsec) + "|" + std::to_string(vocab_size);
+        if (capture) {
+            stage = "reference_input"; reason = "reference_input_failed";
+            validation_reference.clear();
+            validation_model_key.clear();
+            for (const auto *text : {
+                    "Bonjour. La capitale de la France est Paris. Une semaine compte sept jours. Explique simplement les saisons. ",
+                    "Calcule : 2 + 3 = 5. 7 fois 8 = 56. Les nombres pairs sont divisibles par deux. ",
+                    "Un programme Python : def addition(a, b): return a + b. La fonction additionne deux nombres. "}) {
+                std::string repeated;
+                for (int i = 0; i < 12; ++i) repeated += text;
+                auto input = common_tokenize(llama_model_get_vocab(model), repeated, true, true);
+                const size_t length = validation_reference.empty() ? 128 : validation_reference.size() == 1 ? 97 : 33;
+                if (input.size() < length) throw std::runtime_error("short probe");
+                input.resize(length);
+                validation_reference.push_back({std::move(input), {}, {}});
+            }
+        } else if (validation_model_key != key || validation_reference.size() != 3) {
+            reason = "reference_unavailable";
+            throw std::runtime_error("matching CPU reference missing");
+        }
+        stage = "context_allocation"; reason = "context_allocation_failed";
+        resources.ctx = new_context(512);
+        if (!resources.ctx || llama_n_ctx(resources.ctx) < 192) throw std::runtime_error("probe context");
+        stage = "batch_allocation"; reason = "batch_allocation_failed";
+        resources.batch = llama_batch_init(options.batch, 0, 1);
+        resources.allocated = true;
+        if (!resources.batch.token || !resources.batch.pos || !resources.batch.n_seq_id || !resources.batch.seq_id || !resources.batch.logits) throw std::runtime_error("probe batch");
+        bool passed = true;
+        for (auto &probe : validation_reference) {
+            ++probe_index;
+            step_index = -1;
+            stage = "memory_reset"; reason = "memory_reset_failed";
+            llama_memory_clear(llama_get_memory(resources.ctx), false);
+            for (size_t offset = 0; offset < probe.input.size();) {
+                stage = "prompt_decode"; reason = "prompt_decode_failed";
+                if (cancelled.load()) throw std::runtime_error("cancelled");
+                apply_threads(resources.ctx);
+                common_batch_clear(resources.batch);
+                const size_t count = std::min(size_t(options.batch), probe.input.size() - offset);
+                for (size_t i = 0; i < count; ++i) common_batch_add(resources.batch, probe.input[offset + i], offset + i, {0}, offset + i + 1 == probe.input.size());
+                decode_status = llama_decode(resources.ctx, resources.batch);
+                if (decode_status) throw std::runtime_error("probe decode");
+                offset += count;
+            }
+            for (int step = 0; step < 4; ++step) {
+                step_index = step;
+                stage = "logits"; reason = "logits_unavailable";
+                if (cancelled.load()) throw std::runtime_error("cancelled");
+                const float *logits = llama_get_logits_ith(resources.ctx, -1);
+                if (!logits) throw std::runtime_error("missing probe logits");
+                if (!pocketai::finite_logits(logits, vocab_size)) {
+                    reason = "nonfinite_logits";
+                    for (int i = 0; i < vocab_size; ++i) if (!std::isfinite(logits[i])) ++nonfinite_count;
+                    throw std::runtime_error("nonfinite probe");
+                }
+                if (capture) {
+                    stage = "reference_capture"; reason = "reference_capture_failed";
+                    probe.logits.emplace_back(logits, logits + vocab_size);
+                    probe.continuation.push_back(std::max_element(logits, logits + vocab_size) - logits);
+                } else {
+                    stage = "logit_comparison"; reason = "reference_incomplete";
+                    if (probe.logits.size() != 4 || probe.continuation.size() != 4) throw std::runtime_error("incomplete reference");
+                    const auto comparison = pocketai::compare_logits(probe.logits[step], logits, vocab_size);
+                    failure_mask |= comparison.failures;
+                    if (!comparison.passed) {
+                        ++failed_comparisons;
+                        if (first_bad_probe < 0) { first_bad_probe = probe_index; first_bad_step = step; }
+                    }
+                    passed = passed && comparison.passed;
+                    max_js = std::max(max_js, comparison.js);
+                    max_rmse = std::max(max_rmse, comparison.relative_rmse);
+                    if (comparison.top_match) ++top_matches;
+                }
+                ++checked;
+                if (step < 3) {
+                    stage = "continuation_decode"; reason = "continuation_decode_failed";
+                    common_batch_clear(resources.batch);
+                    common_batch_add(resources.batch, probe.continuation[step], probe.input.size() + step, {0}, true);
+                    apply_threads(resources.ctx);
+                    decode_status = llama_decode(resources.ctx, resources.batch);
+                    if (decode_status) throw std::runtime_error("probe continuation");
+                }
+            }
+        }
+        if (capture) validation_model_key = key;
+        stage = "completed";
+        reason = capture ? "cpu_reference_captured" : passed ? "matched" : "numeric_mismatch";
+        validation_summary = capture ? "CPU reference captured (12 distributions)" : passed ? "CPU comparison passed (12 distributions)" : "CPU comparison FAILED";
+        return record(passed);
+    } catch (...) {
+        if (capture) { validation_reference.clear(); validation_model_key.clear(); }
+        validation_summary = cancelled.load() ? "comparison cancelled" : "comparison unavailable or failed";
+        if (cancelled.load()) reason = "cancelled";
+        return record(false);
+    }
+}
+
 extern "C" JNIEXPORT void JNICALL
-Java_com_arm_aichat_internal_InferenceEngineImpl_shutdown(JNIEnv *, jobject) { llama_backend_free(); }
+Java_com_arm_aichat_internal_InferenceEngineImpl_shutdown(JNIEnv *, jobject) {
+    last_validation_record.clear();
+    last_validation_path.clear();
+    validation_reference.clear();
+    validation_model_key.clear();
+    llama_backend_free();
+}

@@ -7,7 +7,11 @@ TASK_APK="$TASK_REPO/app/build/outputs/apk/debug/app-debug.apk"
 test -s "$TASK_APK"
 mkdir -p "$TASK_REPO/out"
 unzip -t "$TASK_APK" > "$TASK_REPO/out/ZIP-CHECK.txt"
-"$TASK_SDK/build-tools/35.0.0/apksigner" verify --verbose "$TASK_APK" > "$TASK_REPO/out/SIGNATURE.txt"
+"$TASK_SDK/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$TASK_APK" > "$TASK_REPO/out/SIGNATURE.txt"
+EXPECTED_PREVIEW_CERT_SHA256="a0f04583b124e77b5ea2c739e7206d8c92d9a06615166f94fe26c245c2985e77"
+ACTUAL_PREVIEW_CERT_SHA256=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$TASK_REPO/out/SIGNATURE.txt" | tr '[:upper:]' '[:lower:]' | tr -d ':')
+test "$ACTUAL_PREVIEW_CERT_SHA256" = "$EXPECTED_PREVIEW_CERT_SHA256"
+printf 'Preview signing certificate SHA-256: %s\n' "$ACTUAL_PREVIEW_CERT_SHA256" >> "$TASK_REPO/out/SIGNATURE.txt"
 "$TASK_SDK/build-tools/35.0.0/aapt" dump badging "$TASK_APK" > "$TASK_REPO/out/PACKAGE.txt"
 python3 - "$TASK_APK" "$TASK_REPO/out" <<'PY'
 from pathlib import Path
@@ -31,10 +35,11 @@ with ZipFile(apk) as z:
     (out/'NATIVE-LIBS.txt').write_text('\n'.join(libs)+'\n')
     (out/'PAGE-ALIGNMENT.txt').write_text(f'All {len(libs)} ARM64 native libraries support 16 KB page alignment.\n')
 badging=(out/'PACKAGE.txt').read_text()
-assert "name='com.pocketai.app'" in badging
-assert "versionCode='400'" in badging
+assert "name='io.github.tchoutchoune.pocketai.preview'" in badging
+assert "versionCode='451'" in badging
+assert "application-label:'PocketAI'" in badging
 print(f'Validated {len(libs)} ARM64 native libraries, including Vulkan')
 PY
-cp "$TASK_APK" "$TASK_REPO/out/PocketAI-4.0-arm64-debug.apk"
+cp "$TASK_APK" "$TASK_REPO/out/PocketAI-4.5.1-vulkan-probes-arm64-debug.apk"
 cd "$TASK_REPO/out"
-sha256sum PocketAI-4.0-arm64-debug.apk > SHA256.txt
+sha256sum PocketAI-4.5.1-vulkan-probes-arm64-debug.apk > SHA256.txt
