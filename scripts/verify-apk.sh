@@ -37,6 +37,7 @@ with ZipFile(apk) as z:
 badging=(out/'PACKAGE.txt').read_text()
 assert "name='io.github.tchoutchoune.pocketai.preview'" in badging
 assert "versionCode='440'" in badging
+assert "application-label:'PocketAI'" in badging
 print(f'Validated {len(libs)} ARM64 native libraries, including Vulkan')
 PY
 cp "$TASK_APK" "$TASK_REPO/out/PocketAI-4.4.0-smart-library-arm64-debug.apk"
