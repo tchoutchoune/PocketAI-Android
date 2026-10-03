@@ -28,6 +28,9 @@ jobs:
           set -euo pipefail
           cd verified-apk
           sha256sum --check SHA256.txt
+          cat SHA256.txt
+          cat SIGNATURE.txt
+          head -n 3 PACKAGE.txt
           grep -Fq 'a0f04583b124e77b5ea2c739e7206d8c92d9a06615166f94fe26c245c2985e77' SIGNATURE.txt
           grep -Fq "versionCode='430'" PACKAGE.txt
           split --bytes=24M --numeric-suffixes=0 --suffix-length=2 \
