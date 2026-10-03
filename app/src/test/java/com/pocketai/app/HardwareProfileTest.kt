@@ -37,7 +37,7 @@ class HardwareProfileTest {
         assertEquals(128, balanced.batchSize)
         assertTrue(eco.threads <= 2)
         assertEquals(64, eco.batchSize)
-        assertEquals(6, fastCpu.threads)
+        assertEquals(8, fastCpu.threads)
         assertEquals(0, fastCpu.gpuLayers)
         assertEquals(256, fastCpu.batchSize)
         assertEquals(4096, fastCpu.contextSize)
@@ -71,7 +71,7 @@ class HardwareProfileTest {
     @Test fun cpuPerformanceUsesAvailableCoresNotOnlyHighestFrequencyCluster() {
         val phone = capable.copy(cpuCores = 8, bigCores = 2)
         val options = phone.recommend(gib, "cpu-performance")
-        assertEquals(6, options.threads)
+        assertEquals(8, options.threads)
         assertEquals(256, options.batchSize)
         assertEquals(0, options.gpuLayers)
     }

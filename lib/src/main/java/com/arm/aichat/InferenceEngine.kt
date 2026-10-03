@@ -27,7 +27,7 @@ interface InferenceEngine {
     fun cancelGeneration()
 
     /** Thread-safe thermal limit, applied between native decode steps. */
-    fun setThreadLimit(threads: Int)
+    fun setThreadLimit(threads: Int, batchThreads: Int = threads)
 
     /**
      * Load a model from the given path.

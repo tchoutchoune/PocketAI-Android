@@ -22,5 +22,6 @@ fi
 g++ -std=c++17 -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined \
     lib/src/test/cpp/inference_helpers_test.cpp -o build/native-tests/inference-helpers
 build/native-tests/inference-helpers
-printf '%s\n' 'Generation limits, context shifts and Unicode: passed with ASan/UBSan.' > out/NATIVE-TESTS.txt
+POCKETAI_LLAMA_DIR="$TASK_LLAMA_DIR" python3 scripts/test-qwen-template.py
+printf '%s\n' 'Generation limits, context shifts and Unicode: passed with ASan/UBSan.' 'Pinned Qwen3 template: stable KV prefix across 3 turns; enabled-thinking behavior unchanged.' > out/NATIVE-TESTS.txt
 bash scripts/verify-apk.sh

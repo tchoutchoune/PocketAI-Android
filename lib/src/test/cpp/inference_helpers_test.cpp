@@ -1,7 +1,14 @@
 #include "../../main/cpp/inference_helpers.h"
 #include <cassert>
+#include <iostream>
+#include <iterator>
 
-int main() {
+int main(int argc, char **argv) {
+    if (argc == 2 && std::string(argv[1]) == "adapt-template") {
+        const std::string source((std::istreambuf_iterator<char>(std::cin)), std::istreambuf_iterator<char>());
+        std::cout << pocketai::stable_qwen3_template(source);
+        return 0;
+    }
     pocketai::GenerationBudget budget;
     budget.start(3);
     for (int i = 0; i < 3; ++i) {

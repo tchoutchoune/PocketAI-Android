@@ -53,6 +53,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var input: TextInputEditText
     private lateinit var webToggle: SwitchMaterial
     private lateinit var attachmentButton: MaterialButton
+    private lateinit var cameraButton: MaterialButton
     private lateinit var attachmentStatus: TextView
     private lateinit var chat: LinearLayout
     private lateinit var modelsPanel: LinearLayout
@@ -63,13 +64,15 @@ class MainActivity : AppCompatActivity() {
     private lateinit var adapter: ChatAdapter
     private var pendingSave: GeneratedArtifact? = null
     private var pendingCameraFile: File? = null
-    private var lastModelsKey: Pair<Boolean, String?>? = null
+    private var lastModelsKey: List<Any?>? = null
     private var lastCreationKey: Pair<Boolean, Int>? = null
     private var exportInProgress = false
     private lateinit var stopButton: MaterialButton
     private lateinit var newButton: MaterialButton
     private var selectedTab = 0
     private var hubFilter: ModelUse? = null
+    private var modelSection = 0
+    private var showMetrics = false
     private var followStreaming = true
     private var tts: TextToSpeech? = null
     private var ttsReady = false
@@ -78,6 +81,9 @@ class MainActivity : AppCompatActivity() {
 
     private val importPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let(model::importModel)
+    }
+    private val modelFolderPicker = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        uri?.let(model::selectModelFolder)
     }
     private val attachmentPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let(model::prepareAttachment)
@@ -128,6 +134,8 @@ class MainActivity : AppCompatActivity() {
             }
         }
         selectedTab = savedInstanceState?.getInt("tab") ?: 0
+        modelSection = savedInstanceState?.getInt("modelSection") ?: 0
+        showMetrics = savedInstanceState?.getBoolean("showMetrics") ?: false
         val root = column().apply { setBackgroundColor(Color.parseColor("#10171E")) }
         ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
@@ -144,6 +152,10 @@ class MainActivity : AppCompatActivity() {
                 .setNegativeButton("Annuler", null).setPositiveButton("Effacer") { _, _ -> model.clearConversation() }.show()
         }
         heading.addView(newButton)
+        heading.addView(button("Infos") {
+            showMetrics = !showMetrics
+            liveMetricsView.visibility = if (selectedTab == 0 && showMetrics && model.state.value.liveMetrics.isNotBlank()) View.VISIBLE else View.GONE
+        }.apply { contentDescription = "Afficher ou masquer les mesures du moteur" })
         root.addView(heading)
         modelBadge = text("Un assistant local, à ton rythme", 13f).apply { maxLines = 2; ellipsize = android.text.TextUtils.TruncateAt.END; setPadding(dp(16), 0, dp(16), dp(6)) }
         root.addView(modelBadge)
@@ -179,7 +191,7 @@ class MainActivity : AppCompatActivity() {
             setBackgroundColor(Color.parseColor("#18212A"))
             setTabTextColors(Color.parseColor("#B7C7D3"), Color.parseColor("#9DE3C5"))
             setSelectedTabIndicatorColor(Color.parseColor("#9DE3C5"))
-            listOf("Chat", "Modèles", "Créer", "Réglages").forEach { addTab(newTab().setText(it)) }
+            listOf("Discuter", "Modèles", "Outils", "Réglages").forEach { addTab(newTab().setText(it)) }
             addOnTabSelectedListener(object : TabLayout.OnTabSelectedListener {
                 override fun onTabSelected(tab: TabLayout.Tab) { selectedTab = tab.position; showTab() }
                 override fun onTabUnselected(tab: TabLayout.Tab) = Unit
@@ -198,7 +210,7 @@ class MainActivity : AppCompatActivity() {
                     status.text = state.status
                     modelBadge.text = state.modelName?.let { "${if (state.remote) "Serveur" else "Local"} · $it" } ?: "Choisis un modèle dans l’onglet Modèles"
                     liveMetricsView.text = state.liveMetrics
-                    liveMetricsView.visibility = if (state.liveMetrics.isBlank()) View.GONE else View.VISIBLE
+                    liveMetricsView.visibility = if (!showMetrics || selectedTab != 0 || state.liveMetrics.isBlank()) View.GONE else View.VISIBLE
                     progress.visibility = if (state.busy) View.VISIBLE else View.GONE
                     stopButton.visibility = if (state.busy) View.VISIBLE else View.GONE
                     newButton.isEnabled = !state.busy
@@ -206,6 +218,7 @@ class MainActivity : AppCompatActivity() {
                     input.isEnabled = !state.busy
                     webToggle.isEnabled = !state.busy
                     attachmentButton.isEnabled = !state.busy
+                    cameraButton.isEnabled = !state.busy
                     attachmentStatus.text = state.attachment?.let { "📎 ${it.summary} · reste joint aux prochaines questions · toucher pour retirer" }.orEmpty()
                     attachmentStatus.visibility = if (state.attachment == null) View.GONE else View.VISIBLE
                     val oldCount = shownMessages.size
@@ -242,10 +255,11 @@ class MainActivity : AppCompatActivity() {
                             }
                         }
                     }
-                    val key = state.busy to state.modelName
-                    if (key != lastModelsKey) { renderModels(); lastModelsKey = key }
+                    val key = listOf(state.busy, state.modelName, state.remote, state.installedModels,
+                        state.folderModels, state.indexingModels, state.hfResults)
+                    if (selectedTab == 1 && key != lastModelsKey) { renderModels(); lastModelsKey = key }
                     val creationKey = state.busy to state.artifacts.size
-                    if (lastCreationKey != creationKey) { renderCreation(); lastCreationKey = creationKey }
+                    if (selectedTab == 2 && lastCreationKey != creationKey) { renderCreation(); lastCreationKey = creationKey }
                     state.error?.let { showError(it); model.dismissError() }
                 }
             }
@@ -284,7 +298,8 @@ class MainActivity : AppCompatActivity() {
             ))
         }
         attachmentRow.addView(attachmentButton, LinearLayout.LayoutParams(0, -2, 1f))
-        attachmentRow.addView(button("📷 Appareil photo") { startCameraCapture() }, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(6) })
+        cameraButton = button("📷 Appareil photo") { startCameraCapture() }
+        attachmentRow.addView(cameraButton, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(6) })
         chat.addView(attachmentRow)
         attachmentStatus = text("", 11f).apply {
             visibility = View.GONE
@@ -349,119 +364,137 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderModels() {
         modelsPanel.removeAllViews(); pad(modelsPanel)
-        modelsPanel.addView(text("Le bon modèle pour ton téléphone", 22f, true))
-        modelsPanel.addView(text(HardwareProfile.detect(this).summary, 14f))
-        modelsPanel.addView(text("Commence par un petit modèle pour la rapidité. PocketAI peut charger d’autres familles (Qwen, Gemma, DeepSeek, Mistral, Phi, etc.) dès lors que le fichier GGUF et son architecture sont pris en charge par la version intégrée de llama.cpp. Les fichiers restent sur ton téléphone.", 14f))
-        modelsPanel.addView(button("Importer un fichier GGUF") { importPicker.launch(arrayOf("*/*")) }.apply { isEnabled = !model.state.value.busy })
-        modelsPanel.addView(button("Rechercher un GGUF sur Hugging Face") { huggingFaceSearchDialog() }.apply { isEnabled = !model.state.value.busy })
-        modelsPanel.addView(button("Explorer Hugging Face dans le navigateur") {
-            openLink("https://huggingface.co/models?library=gguf&sort=trending")
-        })
-        modelsPanel.addView(text("Modèles installés", 18f, true))
-        val installed = model.models.installed()
-        if (installed.isEmpty()) modelsPanel.addView(text("Aucun modèle pour l’instant. Importe un GGUF ou télécharge un modèle ci-dessous.", 14f))
-        installed.forEach { file ->
-            val contents = column()
-            contents.addView(text(file.nameWithoutExtension, 16f, true))
-            contents.addView(text("${"%.2f".format(file.length() / (1024.0 * 1024 * 1024))} Go · GGUF local", 13f))
-            val controls = row()
-            val loaded = model.state.value.modelName == file.nameWithoutExtension
-            controls.addView(button(if (loaded) "Chargé" else "Charger") { model.loadModel(file); tabs.getTabAt(0)?.select() }.apply { isEnabled = !model.state.value.busy && !loaded })
-            controls.addView(button("Supprimer") {
-                MaterialAlertDialogBuilder(this).setTitle("Supprimer ce modèle ?").setMessage(file.name)
-                    .setNegativeButton("Annuler", null).setPositiveButton("Supprimer") { _, _ ->
-                        if (file.delete()) renderModels() else showError("Impossible de supprimer ce modèle.")
-                    }.show()
-            }.apply { isEnabled = !model.state.value.busy && !loaded })
-            contents.addView(controls); modelsPanel.addView(card(contents))
+        modelsPanel.addView(text("Choisir un modèle", 22f, true))
+        modelsPanel.addView(text("Mes modèles : prêts sur ce téléphone. Catalogue : modèles à télécharger. Serveurs : services en ligne à configurer.", 13f))
+        val navigation = row()
+        listOf("Mes modèles", "Catalogue", "Serveurs").forEachIndexed { index, title ->
+            navigation.addView(button(if (index == modelSection) "✓ $title" else title) {
+                modelSection = index; renderModels()
+            }, LinearLayout.LayoutParams(0, -2, 1f))
         }
-        if (model.state.value.modelName != null) modelsPanel.addView(button("Décharger et libérer la mémoire") { model.unloadModel() }.apply { isEnabled = !model.state.value.busy })
-        renderHubCatalogue()
-        if (hubFilter == null || hubFilter == ModelUse.CHAT) {
-        modelsPanel.addView(text("Modèles historiques", 18f, true))
-        ModelRepository.catalogue.filter { entry -> ModelHub.models.none { it.local?.id == entry.id } }.forEach { entry ->
-            val contents = column()
-            contents.addView(text(entry.title, 17f, true))
-            contents.addView(text(entry.description, 14f))
-            contents.addView(text("${"%.2f".format(entry.sizeBytes / (1024.0 * 1024 * 1024))} Go · intégrité SHA-256 vérifiée", 12f))
-            val controls = row()
-            controls.addView(button("Télécharger") {
-                MaterialAlertDialogBuilder(this).setTitle("Télécharger ${entry.title} ?")
-                    .setMessage("Le téléchargement utilise Internet et ${"%.2f".format(entry.sizeBytes / (1024.0 * 1024 * 1024))} Go de stockage. Consulte la licence du modèle avant utilisation.")
-                    .setNegativeButton("Annuler", null).setPositiveButton("Télécharger") { _, _ -> model.downloadModel(entry) }.show()
-            }.apply { isEnabled = !model.state.value.busy })
-            controls.addView(button("Licence") { openLink(entry.licenseUrl) })
-            contents.addView(controls); modelsPanel.addView(card(contents))
-        }
-        }
-
-        val hf = model.state.value.hfResults
-        if (hf.isNotEmpty()) {
-            modelsPanel.addView(text("Résultats Hugging Face vérifiés", 18f, true))
-            modelsPanel.addView(text("PocketAI n’affiche ici que des fichiers GGUF publics non découpés dont Hugging Face fournit la taille et le SHA-256 LFS. La compatibilité de l’architecture est ensuite vérifiée par llama.cpp au chargement.", 13f))
-            hf.forEach { entry ->
-                val contents = column()
-                contents.addView(text(entry.title, 15f, true))
-                contents.addView(text(entry.description, 12f))
-                val controls = row()
-                controls.addView(button("Télécharger") {
-                    MaterialAlertDialogBuilder(this)
-                        .setTitle("Télécharger ce GGUF ?")
-                        .setMessage("${entry.title}\n\n${entry.description}\n\nLe fichier est épinglé au commit Hugging Face trouvé et son SHA-256 sera vérifié avant installation. Vérifie aussi la licence du dépôt.")
-                        .setNegativeButton("Annuler", null)
-                        .setPositiveButton("Télécharger") { _, _ -> model.downloadModel(entry) }
-                        .show()
-                }.apply { isEnabled = !model.state.value.busy })
-                controls.addView(button("Dépôt") { openLink(entry.licenseUrl) })
-                contents.addView(controls)
-                modelsPanel.addView(card(contents))
-            }
-            modelsPanel.addView(button("Effacer les résultats") { model.clearHuggingFaceResults(); renderModels() })
+        modelsPanel.addView(navigation)
+        when (modelSection) {
+            0 -> renderInstalledModels()
+            1 -> renderHubCatalogue(false)
+            else -> renderHubCatalogue(true)
         }
     }
 
-    private fun renderHubCatalogue() {
-        modelsPanel.addView(text("Catalogue des modèles", 18f, true))
+    private fun renderInstalledModels() {
+        val state = model.state.value
+        modelsPanel.addView(text("Sur ce téléphone", 18f, true))
+        modelsPanel.addView(text(HardwareProfile.detect(this).summary, 13f))
+        val importActions = row()
+        importActions.addView(button("Importer un fichier GGUF") { importPicker.launch(arrayOf("*/*")) }.apply { isEnabled = !state.busy }, LinearLayout.LayoutParams(0, -2, 1f))
+        importActions.addView(button("Choisir un dossier") { modelFolderPicker.launch(null) }.apply { isEnabled = !state.busy }, LinearLayout.LayoutParams(0, -2, 1f))
+        modelsPanel.addView(importActions)
+        modelsPanel.addView(button(if (state.indexingModels) "Détection en cours…" else "Actualiser les modèles") { model.refreshModels() }.apply { isEnabled = !state.busy && !state.indexingModels })
+        if (state.installedModels.isEmpty()) modelsPanel.addView(text("Aucun modèle importé. Choisis un fichier ou un dossier contenant tes GGUF, ou ouvre le Catalogue.", 14f))
+        state.installedModels.forEach { installed ->
+            val file = installed.file
+            val contents = column()
+            val entry = ModelRepository.catalogue.find { it.id in installed.catalogueIds }
+            contents.addView(text(entry?.title ?: file.nameWithoutExtension, 16f, true))
+            contents.addView(text("${sizeLabel(file.length())} · local hors ligne${if (entry != null) " · modèle du catalogue reconnu" else ""}", 13f))
+            if (entry != null) contents.addView(text(file.name, 12f))
+            val loaded = !state.remote && state.modelName == file.nameWithoutExtension
+            val controls = row()
+            controls.addView(button(if (loaded) "Actif" else "Utiliser") { model.loadModel(file); tabs.getTabAt(0)?.select() }.apply { isEnabled = !state.busy && !loaded })
+            controls.addView(button("Supprimer") {
+                MaterialAlertDialogBuilder(this).setTitle("Supprimer ce modèle ?").setMessage(file.name)
+                    .setNegativeButton("Annuler", null).setPositiveButton("Supprimer") { _, _ -> model.deleteModel(file) }.show()
+            }.apply { isEnabled = !state.busy && !loaded })
+            contents.addView(controls); modelsPanel.addView(card(contents))
+        }
+        if (state.modelName != null) modelsPanel.addView(button("Décharger et libérer la mémoire") { model.unloadModel() }.apply { isEnabled = !state.busy })
+        if (model.modelFolders.folder != null) {
+            modelsPanel.addView(text("Repérés dans ton dossier", 18f, true))
+            modelsPanel.addView(text("Ce dossier est rescanné au retour dans l’application. Importer copie le fichier dans PocketAI ; les fichiers identiques sont reconnus et ne sont pas ajoutés deux fois.", 13f))
+            if (state.folderModels.note.isNotBlank()) modelsPanel.addView(text(state.folderModels.note, 13f))
+            if (state.folderModels.files.isEmpty() && !state.indexingModels) modelsPanel.addView(text("Aucun fichier GGUF accessible dans ce dossier.", 14f))
+            state.folderModels.files.forEach { file ->
+                val contents = column()
+                contents.addView(text(file.name, 15f, true))
+                contents.addView(text("${sizeLabel(file.sizeBytes)} · disponible à importer", 12f))
+                contents.addView(button("Importer ce modèle") { model.importModel(file.uri) }.apply { isEnabled = !state.busy })
+                modelsPanel.addView(card(contents))
+            }
+            modelsPanel.addView(button("Oublier ce dossier") { model.forgetModelFolder(); renderModels() }.apply { isEnabled = !state.busy })
+        }
+    }
+
+    private fun sizeLabel(bytes: Long): String = if (bytes < 0) "Taille inconnue" else "${"%.2f".format(bytes / (1024.0 * 1024 * 1024))} Go"
+
+    private fun localModelAction(entry: ModelEntry): MaterialButton {
+        val state = model.state.value
+        val installed = state.installedModels.find { entry.id in it.catalogueIds }
+        val loaded = installed != null && !state.remote && state.modelName == installed.file.nameWithoutExtension
+        return button(when {
+            loaded -> "Actif sur ce téléphone"
+            installed != null -> "Déjà installé · utiliser"
+            state.indexingModels -> "Vérification des modèles présents…"
+            else -> "Télécharger · ${sizeLabel(entry.sizeBytes)}"
+        }) {
+            if (installed != null) {
+                model.loadModel(installed.file); tabs.getTabAt(0)?.select()
+            } else {
+                MaterialAlertDialogBuilder(this).setTitle("Télécharger ${entry.title} ?")
+                    .setMessage("${entry.description}\n\n${sizeLabel(entry.sizeBytes)} de stockage. La taille et le SHA-256 seront vérifiés. Consulte la licence du modèle.")
+                    .setNegativeButton("Annuler", null).setPositiveButton("Télécharger") { _, _ -> model.downloadModel(entry) }.show()
+            }
+        }.apply { isEnabled = !state.busy && !loaded && !state.indexingModels }
+    }
+
+    private fun renderHubCatalogue(servers: Boolean) {
+        modelsPanel.addView(text(if (servers) "Services sur serveur" else "Modèles à télécharger", 18f, true))
+        modelsPanel.addView(text(if (servers) "Ces fonctions envoient leurs demandes au serveur que tu configures. Aucun serveur ni abonnement n’est inclus."
+            else "Les GGUF ci-dessous fonctionnent localement pour le texte. Un fichier déjà présent est reconnu par son empreinte, même s’il a été renommé.", 13f))
         modelsPanel.addView(button("Usage : ${hubFilter?.label ?: "Tous"}") {
             val labels = arrayOf("Tous") + ModelUse.entries.map { it.label }.toTypedArray()
             MaterialAlertDialogBuilder(this).setTitle("Choisir un usage").setItems(labels) { _, index ->
                 hubFilter = if (index == 0) null else ModelUse.entries[index - 1]; renderModels()
             }.show()
         })
-        ModelHub.models.filter { hubFilter == null || it.use == hubFilter ||
-            (hubFilter == ModelUse.VISION && it.vision) }.forEach { entry ->
+        if (!servers) {
+            modelsPanel.addView(button("Rechercher un GGUF sur Hugging Face") { huggingFaceSearchDialog() }.apply { isEnabled = !model.state.value.busy })
+            val hubEntries = ModelHub.models.filter { it.local != null && (hubFilter == null || it.use == hubFilter) }.mapNotNull { it.local }
+            val historical = ModelRepository.catalogue.filter { entry -> ModelHub.models.none { it.local?.id == entry.id } }
+                .filter { hubFilter == null || hubFilter == ModelUse.CHAT }
+            val entries = (model.state.value.hfResults + hubEntries + historical).distinctBy { it.sha256 }
+            if (entries.isEmpty()) modelsPanel.addView(text("Cet usage nécessite un moteur spécialisé. Ouvre Serveurs pour voir les options disponibles.", 14f))
+            entries.forEach { entry ->
+                val contents = column()
+                contents.addView(text(entry.title, 17f, true))
+                contents.addView(text(entry.description, 14f))
+                contents.addView(localModelAction(entry))
+                contents.addView(button("Fiche / licence") { openLink(entry.licenseUrl) })
+                modelsPanel.addView(card(contents))
+            }
+            if (model.state.value.hfResults.isNotEmpty()) modelsPanel.addView(button("Effacer les résultats Hugging Face") { model.clearHuggingFaceResults(); renderModels() })
+            return
+        }
+        modelsPanel.addView(button("Configurer un modèle du catalogue") { chooseHubConfiguration() }.apply { isEnabled = !model.state.value.busy })
+        ModelHub.models.filter { hubFilter == null || it.use == hubFilter || (hubFilter == ModelUse.VISION && it.vision) }.forEach { entry ->
             val contents = column()
+            val configured = model.settings.inferenceUrl(entry.id).isNotBlank()
             contents.addView(text(entry.title, 17f, true))
             contents.addView(text(entry.description, 14f))
-            entry.local?.let { local ->
-                contents.addView(text("${"%.2f".format(local.sizeBytes / (1024.0 * 1024 * 1024))} Go · GGUF texte local · SHA-256 vérifié", 12f))
-                contents.addView(button("Télécharger le GGUF texte") {
-                    MaterialAlertDialogBuilder(this).setTitle("Télécharger ${entry.title} ?")
-                        .setMessage("${local.description}\n\n${"%.2f".format(local.sizeBytes / (1024.0 * 1024 * 1024))} Go de stockage, plus la mémoire du contexte. Ce téléchargement contient le texte seul. Consulte la licence du modèle.")
-                        .setNegativeButton("Annuler", null).setPositiveButton("Télécharger") { _, _ -> model.downloadModel(local) }.show()
-                }.apply { isEnabled = !model.state.value.busy })
-            }
-            contents.addView(text(if (entry.supportsChat) "Serveur : ${if (entry.vision) "texte + photo" else "texte"}"
-                else "Serveur nécessaire · ${entry.use.label}", 12f))
+            contents.addView(text("${entry.use.label} · ${if (configured) "serveur configuré" else "à configurer"}${if (entry.vision) " · photos prises en charge" else ""}", 12f))
             val controls = row()
             controls.addView(button("Configurer") { hubServerDialog(entry) }.apply { isEnabled = !model.state.value.busy })
             controls.addView(button("Fiche / licence") { openLink(entry.pageUrl) })
             contents.addView(controls)
             val actions = row()
-            actions.addView(button("Tester le serveur") {
-                hubAction(entry.id) { model.checkRemoteModel(entry) }
-            }.apply { isEnabled = !model.state.value.busy })
-            actions.addView(button(if (entry.supportsChat) "Utiliser" else "Ouvrir l’usage") {
+            actions.addView(button("Tester le serveur") { hubAction(entry.id) { model.checkRemoteModel(entry) } }.apply { isEnabled = !model.state.value.busy && configured })
+            actions.addView(button(if (entry.supportsChat) "Utiliser dans Discuter" else "Ouvrir l’usage") {
                 if (entry.supportsChat) hubAction(entry.id) {
                     MaterialAlertDialogBuilder(this).setTitle("Utiliser ${entry.title} sur serveur ?")
-                        .setMessage("Les questions, l’historique récent et les extraits joints seront envoyés au serveur configuré. ${if (entry.vision) "Les photos jointes seront aussi transmises, réduites à 1 280 pixels." else "Les photos fournissent seulement leur OCR local."} Reviens à un GGUF installé pour utiliser le chat local.")
-                        .setNegativeButton("Annuler", null).setPositiveButton("Utiliser") { _, _ ->
-                            model.selectRemoteModel(entry); tabs.getTabAt(0)?.select()
-                        }.show()
+                        .setMessage("Les questions, l’historique récent et les extraits joints seront envoyés au serveur configuré.${if (entry.vision) " Les photos jointes seront aussi transmises, réduites à 1 280 pixels." else ""}")
+                        .setNegativeButton("Annuler", null).setPositiveButton("Utiliser") { _, _ -> model.selectRemoteModel(entry); tabs.getTabAt(0)?.select() }.show()
                 } else tabs.getTabAt(if (entry.use == ModelUse.EMBEDDING) 3 else 2)?.select()
             }.apply { isEnabled = !model.state.value.busy })
-            contents.addView(actions)
-            modelsPanel.addView(card(contents))
+            for (index in 0 until actions.childCount) actions.getChildAt(index).layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+            contents.addView(actions); modelsPanel.addView(card(contents))
         }
     }
 
@@ -544,9 +577,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderCreation() {
         creationPanel.removeAllViews(); pad(creationPanel)
-        creationPanel.addView(text("Créer et télécharger", 22f, true))
+        creationPanel.addView(text("Outils et fichiers", 22f, true))
         creationPanel.addView(text("Documents et code : modèle de chat sélectionné, local ou serveur. Vision, Whisper, Kokoro et Qwen Image : serveur à configurer, avec ses conditions et tarifs.", 14f))
+        creationPanel.addView(text("Avec ton assistant sélectionné", 18f, true))
         creationPanel.addView(button("Créer un fichier avec le modèle sélectionné") { createFileDialog() }.apply { isEnabled = !model.state.value.busy })
+        creationPanel.addView(text("Audio et images · services en ligne", 18f, true))
         creationPanel.addView(button("Transcrire un audio · Whisper") {
             hubAction("whisper-small") { audioPicker.launch(arrayOf("audio/*")) }
         }.apply { isEnabled = !model.state.value.busy })
@@ -593,33 +628,6 @@ class MainActivity : AppCompatActivity() {
     private fun renderSettings() {
         settingsPanel.removeAllViews(); pad(settingsPanel)
         settingsPanel.addView(text("Ton PocketAI", 22f, true))
-        settingsPanel.addView(text("Serveurs des modèles", 18f, true))
-        settingsPanel.addView(button("Configurer un modèle du catalogue") { chooseHubConfiguration() }.apply { isEnabled = !model.state.value.busy })
-        settingsPanel.addView(text("Chaque modèle a son URL HTTPS et son alias serveur. Il doit être déployé côté serveur ; une fiche Hugging Face n’est pas un endpoint d’inférence. Les clés restent chiffrées sur le téléphone.", 13f))
-        settingsPanel.addView(SwitchMaterial(this).apply {
-            text = "Recherche sémantique · serveur Qwen Embedding"
-            setTextColor(Color.parseColor("#D6E2EA"))
-            isChecked = model.settings.embeddingEnabled
-            isEnabled = !model.state.value.busy
-            setOnCheckedChangeListener { _, checked ->
-                if (checked) {
-                    isChecked = false
-                    hubAction("qwen3-embedding") {
-                        MaterialAlertDialogBuilder(this@MainActivity).setTitle("Activer les embeddings ?")
-                            .setMessage("Les passages de chaque document joint et tes questions seront envoyés au serveur d’embeddings, y compris avec un chat local. La recherche est limitée à 64 passages répartis dans le document.")
-                            .setNegativeButton("Annuler", null).setPositiveButton("Activer") { _, _ ->
-                                model.settings.embeddingEnabled = true; renderSettings()
-                            }.show()
-                    }
-                } else model.settings.embeddingEnabled = false
-            }
-        })
-        settingsPanel.addView(button("Voix Kokoro : ${model.settings.speechVoice}") {
-            MaterialAlertDialogBuilder(this).setTitle("Voix française du serveur")
-                .setItems(arrayOf("ff_siwis · féminin", "fm_gilles · masculin")) { _, index ->
-                    model.settings.speechVoice = if (index == 0) "ff_siwis" else "fm_gilles"; renderSettings()
-                }.show()
-        }.apply { isEnabled = !model.state.value.busy })
         settingsPanel.addView(text("Performances", 18f, true))
         val modeLabels = arrayOf("Auto · adaptatif", "CPU · performance", "CPU · équilibré", "Autonomie", "Vulkan · expérimental")
         val modes = arrayOf("auto", "cpu-performance", "balanced", "eco", "performance")
@@ -645,6 +653,7 @@ class MainActivity : AppCompatActivity() {
                     }
                 }.setNegativeButton("Fermer", null).show()
         })
+        if (model.state.value.modelName != null && !model.state.value.remote) settingsPanel.addView(button("Recharger avec ce profil") { model.applyPerformanceProfile() }.apply { isEnabled = !model.state.value.busy })
         settingsPanel.addView(text("Auto adapte CPU, batch et contexte à la taille du modèle et à l’état du téléphone. CPU · performance pousse davantage les cœurs pour les gros modèles. Vulkan reste expérimental et n’est retenté qu’après une action explicite. La chauffe peut toujours réduire les threads.", 14f))
         val lengthLabel = if (model.autoLength) {
             "Auto · jusqu’à ${model.effectiveMaxTokens()} tokens"
@@ -702,6 +711,32 @@ class MainActivity : AppCompatActivity() {
         })
         settingsPanel.addView(text("PocketAI utilise en priorité une voix Android disponible hors ligne dans la langue du téléphone. Les longues réponses sont lues par morceaux pour éviter les limites du moteur TTS.", 13f))
 
+        settingsPanel.addView(text("Connexions et usages avancés", 18f, true))
+        settingsPanel.addView(button("Gérer les serveurs des modèles") { modelSection = 2; tabs.getTabAt(1)?.select(); renderModels() })
+        settingsPanel.addView(SwitchMaterial(this).apply {
+            text = "Recherche sémantique · serveur Qwen Embedding"
+            setTextColor(Color.parseColor("#D6E2EA"))
+            isChecked = model.settings.embeddingEnabled
+            isEnabled = !model.state.value.busy
+            setOnCheckedChangeListener { _, checked ->
+                if (checked) {
+                    isChecked = false
+                    hubAction("qwen3-embedding") {
+                        MaterialAlertDialogBuilder(this@MainActivity).setTitle("Activer les embeddings ?")
+                            .setMessage("Les passages de chaque document joint et tes questions seront envoyés au serveur d’embeddings, y compris avec un chat local. La recherche est limitée à 64 passages répartis dans le document.")
+                            .setNegativeButton("Annuler", null).setPositiveButton("Activer") { _, _ ->
+                                model.settings.embeddingEnabled = true; renderSettings()
+                            }.show()
+                    }
+                } else model.settings.embeddingEnabled = false
+            }
+        })
+        settingsPanel.addView(button("Voix Kokoro : ${model.settings.speechVoice}") {
+            MaterialAlertDialogBuilder(this).setTitle("Voix française du serveur")
+                .setItems(arrayOf("ff_siwis · féminin", "fm_gilles · masculin")) { _, index ->
+                    model.settings.speechVoice = if (index == 0) "ff_siwis" else "fm_gilles"; renderSettings()
+                }.show()
+        }.apply { isEnabled = !model.state.value.busy })
         settingsPanel.addView(text("Services en ligne facultatifs", 18f, true))
         settingsPanel.addView(text("Aucun envoi en ligne sans action explicite. La recherche transmet la question à Brave. Les générations d’image/vidéo transmettent leur description au fournisseur. Les clés sont chiffrées sur ce téléphone et exclues des sauvegardes.", 14f))
         settingsPanel.addView(button("Recherche web · ${if (model.settings.hasBraveKey) "configurée" else "à configurer"}") { onlineDialog("web") })
@@ -908,14 +943,23 @@ class MainActivity : AppCompatActivity() {
         listOf(chat, modelsPanel.parent as View, creationPanel.parent as View, settingsPanel.parent as View).forEachIndexed { index, view ->
             view.visibility = if (index == selectedTab) View.VISIBLE else View.GONE
         }
+        newButton.visibility = if (selectedTab == 0) View.VISIBLE else View.GONE
+        liveMetricsView.visibility = if (selectedTab == 0 && showMetrics && model.state.value.liveMetrics.isNotBlank()) View.VISIBLE else View.GONE
         if (selectedTab == 1) renderModels()
         if (selectedTab == 2) renderCreation()
         if (selectedTab == 3) renderSettings()
     }
 
+    override fun onResume() {
+        super.onResume()
+        if (::model.isInitialized) model.refreshModels()
+    }
+
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         outState.putInt("tab", selectedTab)
+        outState.putInt("modelSection", modelSection)
+        outState.putBoolean("showMetrics", showMetrics)
         outState.putString("draft", input.text?.toString().orEmpty())
         pendingSave?.let { outState.putString("pendingPath", it.file.absolutePath); outState.putString("pendingMime", it.mimeType); outState.putString("pendingName", it.displayName) }
         pendingCameraFile?.let { outState.putString("pendingCameraPath", it.absolutePath) }

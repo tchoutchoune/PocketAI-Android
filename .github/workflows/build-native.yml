@@ -3,6 +3,8 @@ name: Build PocketAI 4
 on:
   workflow_dispatch:
   push:
+    # The model-hub branch carries source; the established preview branch retains its signing cache.
+    branches-ignore: ['codex/model-hub']
     paths:
       - 'app/**'
       - 'lib/**'
@@ -30,7 +32,7 @@ jobs:
       - name: Install verified build prerequisites
         run: |
           apt-get update
-          apt-get install -y ca-certificates curl git unzip python3 gcc g++ make ccache glslc libshaderc1 libvulkan-dev spirv-headers
+          apt-get install -y ca-certificates curl git unzip python3 python3-jinja2 gcc g++ make ccache glslc libshaderc1 libvulkan-dev spirv-headers
       - name: Checkout PocketAI
         uses: actions/checkout@v6
       - name: Checkout pinned llama.cpp
@@ -91,8 +93,100 @@ jobs:
       - name: Upload APK and verification evidence
         uses: actions/upload-artifact@v6
         with:
-          name: PocketAI-4.3.0-model-hub-arm64-debug
+          name: PocketAI-4.4.0-smart-library-arm64-debug
           path: out/*
+          retention-days: 14
+          if-no-files-found: error
+      - name: Prepare bounded APK transfer files
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd out
+          sha256sum --check SHA256.txt
+          cat SHA256.txt
+          mkdir transfers
+          split --bytes=24M --numeric-suffixes=0 --suffix-length=2 \
+            PocketAI-4.4.0-smart-library-arm64-debug.apk transfers/PocketAI.apk.part-
+          test -s transfers/PocketAI.apk.part-00
+          test ! -e transfers/PocketAI.apk.part-10
+      - name: Upload APK transfer file 00
+        if: ${{ hashFiles('out/transfers/PocketAI.apk.part-00') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-4.4.0-smart-library-transfer-00
+          path: out/transfers/PocketAI.apk.part-00
+          retention-days: 14
+          if-no-files-found: error
+      - name: Upload APK transfer file 01
+        if: ${{ hashFiles('out/transfers/PocketAI.apk.part-01') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-4.4.0-smart-library-transfer-01
+          path: out/transfers/PocketAI.apk.part-01
+          retention-days: 14
+          if-no-files-found: error
+      - name: Upload APK transfer file 02
+        if: ${{ hashFiles('out/transfers/PocketAI.apk.part-02') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-4.4.0-smart-library-transfer-02
+          path: out/transfers/PocketAI.apk.part-02
+          retention-days: 14
+          if-no-files-found: error
+      - name: Upload APK transfer file 03
+        if: ${{ hashFiles('out/transfers/PocketAI.apk.part-03') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-4.4.0-smart-library-transfer-03
+          path: out/transfers/PocketAI.apk.part-03
+          retention-days: 14
+          if-no-files-found: error
+      - name: Upload APK transfer file 04
+        if: ${{ hashFiles('out/transfers/PocketAI.apk.part-04') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-4.4.0-smart-library-transfer-04
+          path: out/transfers/PocketAI.apk.part-04
+          retention-days: 14
+          if-no-files-found: error
+      - name: Upload APK transfer file 05
+        if: ${{ hashFiles('out/transfers/PocketAI.apk.part-05') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-4.4.0-smart-library-transfer-05
+          path: out/transfers/PocketAI.apk.part-05
+          retention-days: 14
+          if-no-files-found: error
+      - name: Upload APK transfer file 06
+        if: ${{ hashFiles('out/transfers/PocketAI.apk.part-06') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-4.4.0-smart-library-transfer-06
+          path: out/transfers/PocketAI.apk.part-06
+          retention-days: 14
+          if-no-files-found: error
+      - name: Upload APK transfer file 07
+        if: ${{ hashFiles('out/transfers/PocketAI.apk.part-07') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-4.4.0-smart-library-transfer-07
+          path: out/transfers/PocketAI.apk.part-07
+          retention-days: 14
+          if-no-files-found: error
+      - name: Upload APK transfer file 08
+        if: ${{ hashFiles('out/transfers/PocketAI.apk.part-08') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-4.4.0-smart-library-transfer-08
+          path: out/transfers/PocketAI.apk.part-08
+          retention-days: 14
+          if-no-files-found: error
+      - name: Upload APK transfer file 09
+        if: ${{ hashFiles('out/transfers/PocketAI.apk.part-09') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-4.4.0-smart-library-transfer-09
+          path: out/transfers/PocketAI.apk.part-09
           retention-days: 14
           if-no-files-found: error
       - name: Upload test reports

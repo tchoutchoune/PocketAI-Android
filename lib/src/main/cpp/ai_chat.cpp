@@ -14,6 +14,7 @@
 #include "log.h"
 #include "llama.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "inference_helpers.h"
 
 namespace {
@@ -33,6 +34,7 @@ bool batch_allocated = false;
 common_chat_templates_ptr templates;
 common_sampler *sampler = nullptr;
 bool template_supports_thinking = false;
+bool stable_thinking_scaffold = false;
 std::vector<common_chat_msg> messages;
 std::vector<llama_token> kv_tokens;
 std::string system_prompt;
@@ -48,6 +50,9 @@ llama_pos position = 0;
 llama_pos system_position = 0;
 std::atomic<bool> cancelled{false};
 std::atomic<int> thread_limit{32};
+std::atomic<int> batch_thread_limit{32};
+ggml_threadpool_t cpu_threadpool = nullptr;
+decltype(ggml_threadpool_free) *free_threadpool = nullptr;
 std::atomic<int> backend_warnings{0};
 std::atomic<int> backend_errors{0};
 std::atomic<int> live_phase{0}; // 0 idle, 1 prompt/prefill, 2 generation
@@ -55,6 +60,7 @@ std::atomic<int> live_prompt_total{0};
 std::atomic<int> live_prompt_done{0};
 std::atomic<int> live_generated{0};
 std::atomic<int> live_threads{0};
+std::atomic<int> live_batch_threads{0};
 std::atomic<int> live_gpu_layers{0};
 std::atomic<int64_t> live_phase_start_us{0};
 pocketai::GenerationBudget budget;
@@ -137,7 +143,28 @@ jstring android_text(JNIEnv *env, const std::string &text) {
 void apply_threads(llama_context *target = nullptr) {
     active_threads = std::max(1, std::min(options.threads, thread_limit.load(std::memory_order_relaxed)));
     live_threads.store(active_threads, std::memory_order_relaxed);
-    if (target || context) llama_set_n_threads(target ? target : context, active_threads, active_threads);
+    const int batch_threads = std::max(1, std::min(options.threads, batch_thread_limit.load(std::memory_order_relaxed)));
+    live_batch_threads.store(batch_threads, std::memory_order_relaxed);
+    auto *selected = target ? target : context;
+    if (selected && (llama_n_threads(selected) != active_threads || llama_n_threads_batch(selected) != batch_threads))
+        llama_set_n_threads(selected, active_threads, batch_threads);
+}
+
+/** Resolve against the selected CPU variant; never link a generic CPU backend by mistake. */
+void attach_cpu_threadpool(llama_context *target) {
+    if (!target) return;
+    if (!cpu_threadpool) {
+        const auto device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (!device) return;
+        const auto reg = ggml_backend_dev_backend_reg(device);
+        auto create = reinterpret_cast<decltype(ggml_threadpool_new) *>(ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new"));
+        free_threadpool = reinterpret_cast<decltype(ggml_threadpool_free) *>(ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free"));
+        if (!create || !free_threadpool) return; // llama.cpp's automatic pool remains available.
+        auto params = ggml_threadpool_params_default(options.threads);
+        cpu_threadpool = create(&params);
+    }
+    // Inference and benchmark contexts are serialized by the Kotlin engine mutex.
+    if (cpu_threadpool) llama_attach_threadpool(target, cpu_threadpool, cpu_threadpool);
 }
 
 void clear_conversation() {
@@ -168,8 +195,10 @@ void free_context() {
     if (sampler) { common_sampler_free(sampler); sampler = nullptr; }
     templates.reset();
     template_supports_thinking = false;
+    stable_thinking_scaffold = false;
     if (batch_allocated) { llama_batch_free(batch); batch = {}; batch_allocated = false; }
     if (context) { llama_free(context); context = nullptr; }
+    if (cpu_threadpool && free_threadpool) { free_threadpool(cpu_threadpool); cpu_threadpool = nullptr; }
     messages.clear();
     kv_tokens.clear();
     position = system_position = 0;
@@ -234,14 +263,17 @@ llama_context *new_context(int requested = 0) {
     params.n_batch = std::min(options.batch, static_cast<int>(params.n_ctx));
     params.n_ubatch = params.n_batch;
     active_threads = std::max(1, std::min(options.threads, thread_limit.load(std::memory_order_relaxed)));
-    params.n_threads = params.n_threads_batch = active_threads;
+    params.n_threads = active_threads;
+    params.n_threads_batch = std::max(1, std::min(options.threads, batch_thread_limit.load(std::memory_order_relaxed)));
     params.offload_kqv = gpu_layers > 0;
     params.op_offload = gpu_layers > 0;
     params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
     params.abort_callback = abort_decode;
     params.abort_callback_data = nullptr;
     params.no_perf = false;
-    return llama_init_from_model(model, params);
+    auto *created = llama_init_from_model(model, params);
+    attach_cpu_threadpool(created);
+    return created;
 }
 
 int desired_context_size() {
@@ -715,13 +747,15 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_configureNative(JNIEnv *env, jo
     }
     options = {threads, ctx, bs, layers, temp};
     thread_limit.store(threads);
+    batch_thread_limit.store(threads);
     active_threads = threads;
     fallback.clear();
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_arm_aichat_internal_InferenceEngineImpl_setThreadLimitNative(JNIEnv *, jobject, jint threads) {
+Java_com_arm_aichat_internal_InferenceEngineImpl_setThreadLimitNative(JNIEnv *, jobject, jint threads, jint batch_threads) {
     thread_limit.store(std::clamp(static_cast<int>(threads), 1, 32));
+    batch_thread_limit.store(std::clamp(static_cast<int>(batch_threads), 1, 32));
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -811,6 +845,24 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv *, jobject) {
         if (!sampler || !templates) { free_context(); return 1; }
         try { template_supports_thinking = common_chat_templates_support_enable_thinking(templates.get()); }
         catch (...) { template_supports_thinking = false; }
+        if (template_supports_thinking) {
+            char architecture[128]{};
+            llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture));
+            if (std::string(architecture) == "qwen3") {
+                const auto original = common_chat_templates_source(templates.get());
+                const auto adapted = pocketai::stable_qwen3_template(original);
+                if (adapted != original) {
+                    // Retain the stock template if the model's adapted template cannot initialize.
+                    try {
+                        auto stable = common_chat_templates_init(model, adapted);
+                        if (stable && common_chat_templates_support_enable_thinking(stable.get())) {
+                            templates = std::move(stable);
+                            stable_thinking_scaffold = true;
+                        }
+                    } catch (...) { log_event(ANDROID_LOG_WARN, "Stock reasoning template retained"); }
+                }
+            }
+        }
         clear_conversation();
         history_resets = 0;
         budget.start(0);
@@ -1028,7 +1080,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_finishGeneration(JNIEnv *, jobj
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_nativeFastMetrics(JNIEnv *env, jobject) {
     const int phase = live_phase.load(std::memory_order_relaxed);
-    const int threads = live_threads.load(std::memory_order_relaxed);
+    const int threads = (phase == 1 ? live_batch_threads : live_threads).load(std::memory_order_relaxed);
     const int layers = live_gpu_layers.load(std::memory_order_relaxed);
     const int64_t started = live_phase_start_us.load(std::memory_order_relaxed);
     const int64_t elapsed = started > 0 ? std::max<int64_t>(1, ggml_time_us() - started) : 1;
@@ -1060,7 +1112,10 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_nativeDiagnostics(JNIEnv *env, 
     out << "Vulkan GPU: " << (gpu_description.empty() ? "unavailable (device/driver unsupported or backend absent)" : gpu_description) << '\n';
     out << "Requested: " << (options.gpu_layers ? "Vulkan" : "CPU") << "; active: " << (context ? gpu_layers > 0 ? "Vulkan + CPU" : "CPU" : "no model") << '\n';
     out << "GPU layers: " << gpu_layers << "; fallback: " << (fallback.empty() ? "none" : fallback) << '\n';
-    out << "Threads: " << active_threads << " / " << options.threads << "; thermal limit: " << thread_limit.load() << '\n';
+    out << "Threads: " << active_threads << " / " << options.threads << "; runtime limit: " << thread_limit.load()
+        << "; prompt threads: " << (context ? llama_n_threads_batch(context) : 0) << '\n';
+    out << "CPU threadpool: " << (cpu_threadpool ? "persistent" : "automatic") << '\n';
+    out << "Disabled-thinking scaffold: " << (stable_thinking_scaffold ? "stable Qwen3 history" : "stock template") << '\n';
     out << "Context: " << (context ? llama_n_ctx(context) : options.context) << "; batch: " << options.batch << "; temperature: " << options.temperature << '\n';
     out << "Generated: " << budget.produced << " / " << budget.limit
         << "; requested: " << budget.requested
@@ -1125,7 +1180,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_benchModel(JNIEnv *env, jobject
     llama_batch bench_batch{};
     bool allocated = false;
     try {
-        bench_context = new_context();
+        // The benchmark needs only its own short sequences, not a second full chat KV cache.
+        bench_context = new_context(std::max(512, std::max(static_cast<int>(pp), static_cast<int>(tg)) + HEADROOM));
         if (!bench_context) return android_text(env, "Benchmark context allocation failed");
         if (pp > static_cast<int>(llama_n_ctx(bench_context)) - HEADROOM || tg > static_cast<int>(llama_n_ctx(bench_context)) - HEADROOM) {
             llama_free(bench_context);
@@ -1138,29 +1194,31 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_benchModel(JNIEnv *env, jobject
         const auto vocab = llama_model_get_vocab(model);
         auto token = llama_vocab_bos(vocab);
         if (token < 0) token = 0;
-        for (int repeat = 0; repeat < nr; ++repeat) {
+        for (int repeat = -1; repeat < nr; ++repeat) {
+            const int prompt_count = repeat < 0 ? std::min(static_cast<int>(pp), 32) : pp;
+            const int generation_count = repeat < 0 ? std::min(static_cast<int>(tg), 4) : tg;
             llama_memory_clear(llama_get_memory(bench_context), false);
             const auto start = ggml_time_us();
-            for (int offset = 0; offset < pp;) {
+            for (int offset = 0; offset < prompt_count;) {
                 if (cancelled.load()) throw std::runtime_error("cancelled");
                 apply_threads(bench_context);
                 common_batch_clear(bench_batch);
-                const int count = std::min(options.batch, pp - offset);
-                for (int i = 0; i < count; ++i) common_batch_add(bench_batch, token, offset + i, {0}, offset + i + 1 == pp);
+                const int count = std::min(options.batch, prompt_count - offset);
+                for (int i = 0; i < count; ++i) common_batch_add(bench_batch, token, offset + i, {0}, offset + i + 1 == prompt_count);
                 if (llama_decode(bench_context, bench_batch)) throw std::runtime_error("decode");
                 offset += count;
             }
-            prompt_speed += pp * 1e6 / std::max<int64_t>(1, ggml_time_us() - start);
+            if (repeat >= 0) prompt_speed += pp * 1e6 / std::max<int64_t>(1, ggml_time_us() - start);
             llama_memory_clear(llama_get_memory(bench_context), false);
             const auto generation = ggml_time_us();
-            for (int i = 0; i < tg; ++i) {
+            for (int i = 0; i < generation_count; ++i) {
                 if (cancelled.load()) throw std::runtime_error("cancelled");
                 apply_threads(bench_context);
                 common_batch_clear(bench_batch);
                 common_batch_add(bench_batch, token, i, {0}, true);
                 if (llama_decode(bench_context, bench_batch)) throw std::runtime_error("decode");
             }
-            generation_speed += tg * 1e6 / std::max<int64_t>(1, ggml_time_us() - generation);
+            if (repeat >= 0) generation_speed += tg * 1e6 / std::max<int64_t>(1, ggml_time_us() - generation);
         }
         llama_batch_free(bench_batch);
         llama_free(bench_context);

@@ -5,6 +5,25 @@
 #include <vector>
 
 namespace pocketai {
+/** Keep Qwen3's *empty* disabled-thinking scaffold on previous assistant turns.
+ * Changing it between turns otherwise invalidates the whole answer's KV prefix.
+ * Only the known condition is adapted; enabled-thinking behavior is untouched.
+ */
+inline std::string stable_qwen3_template(const std::string &source) {
+    if (source.find("enable_thinking") == std::string::npos ||
+        source.find("reasoning_content.strip") == std::string::npos) return source;
+    for (const auto *variable : {"ns.last_query_index", "ns.last_user_index"}) {
+        const std::string condition = std::string("{%- if loop.index0 > ") + variable + " %}";
+        const auto start = source.find(condition);
+        if (start == std::string::npos || source.find(condition, start + condition.size()) != std::string::npos) continue;
+        auto adapted = source;
+        adapted.replace(start, condition.size(), std::string("{%- if loop.index0 > ") + variable +
+            " or (enable_thinking is defined and enable_thinking is false) %}");
+        return adapted;
+    }
+    return source;
+}
+
 struct GenerationBudget {
     int requested = 0;
     int limit = 0;

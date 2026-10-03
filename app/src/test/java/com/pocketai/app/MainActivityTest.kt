@@ -37,7 +37,7 @@ class MainActivityTest {
         val activity = start()
         val tabs = tabs(activity)
         assertEquals(4, tabs.tabCount)
-        assertEquals(listOf("Chat", "Modèles", "Créer", "Réglages"), (0 until 4).map { tabs.getTabAt(it)?.text.toString() })
+        assertEquals(listOf("Discuter", "Modèles", "Outils", "Réglages"), (0 until 4).map { tabs.getTabAt(it)?.text.toString() })
         assertFalse(ViewModelProvider(activity)[ChatViewModel::class.java].state.value.busy)
         assertNull(ViewModelProvider(activity)[ChatViewModel::class.java].state.value.modelName)
     }
@@ -61,6 +61,24 @@ class MainActivityTest {
         assertNotNull(started)
         assertEquals(Intent.ACTION_OPEN_DOCUMENT, started.intent.action)
         assertEquals("*/*", started.intent.type)
+    }
+
+    @Test fun folderDetectionUsesTheSystemFolderPicker() {
+        val activity = start()
+        tabs(activity).getTabAt(1)!!.select()
+        button(activity, "Choisir un dossier").performClick()
+        val started = shadowOf(activity).nextStartedActivityForResult
+        assertEquals(Intent.ACTION_OPEN_DOCUMENT_TREE, started.intent.action)
+        assertTrue(views(activity).filterIsInstance<TextView>().any { it.text.toString() == "✓ Mes modèles" })
+    }
+
+    @Test fun catalogueAndServersAreSeparated() {
+        val activity = start()
+        tabs(activity).getTabAt(1)!!.select()
+        button(activity, "Catalogue").performClick()
+        assertFalse(views(activity).filterIsInstance<MaterialButton>().any { it.text.toString() == "Tester le serveur" })
+        button(activity, "Serveurs").performClick()
+        assertFalse(views(activity).filterIsInstance<MaterialButton>().any { it.text.toString().startsWith("Télécharger ·") })
     }
 
     @Test fun imageCreationRequiresProviderBeforeAnyGeneration() {

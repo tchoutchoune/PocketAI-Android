@@ -59,7 +59,7 @@ data class HardwareProfile(
         // the thermal listener still reduces concurrency if the device heats up.
         val threads = when {
             eco -> minOf(2, cpuCores)
-            cpuPerformance -> minOf(6, cpuCores)
+            cpuPerformance -> minOf(8, cpuCores)
             vulkanExperimental -> minOf(4, cpuCores)
             warm -> minOf(3, cpuCores)
             powerSave -> minOf(3, cpuCores)

@@ -55,7 +55,7 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
     private external fun finishGeneration()
     private external fun requestCancel()
     private external fun resetCancellation()
-    private external fun setThreadLimitNative(threads: Int)
+    private external fun setThreadLimitNative(threads: Int, batchThreads: Int)
     private external fun unload()
     private external fun shutdown()
 
@@ -71,6 +71,7 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
     @Volatile private var destroyed = false
     @Volatile private var closing = false
     @Volatile private var thermalThreadLimit = 32
+    @Volatile private var thermalBatchThreadLimit = 32
     private var modelLoaded = false
 
     private val initialization = scope.async {
@@ -79,7 +80,7 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
             System.loadLibrary("ai-chat")
             init(nativeLibDir)
             synchronized(nativeControlLock) { nativeLoaded = true }
-            setThreadLimitNative(thermalThreadLimit)
+            setThreadLimitNative(thermalThreadLimit, thermalBatchThreadLimit)
             _state.value = InferenceEngine.State.Initialized
             Log.i(TAG, "Native inference initialized")
         } catch (e: Throwable) {
@@ -100,7 +101,7 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
             check(!closing && !destroyed) { "Inference engine is closing or has been destroyed" }
             check(!modelLoaded) { "Unload the model before changing inference options" }
             configureNative(options.threads, options.contextSize, options.batchSize, options.gpuLayers, options.temperature)
-            setThreadLimitNative(thermalThreadLimit)
+            setThreadLimitNative(thermalThreadLimit, thermalBatchThreadLimit)
             _state.value = InferenceEngine.State.Initialized
         }
     }
@@ -122,10 +123,12 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
         synchronized(nativeControlLock) { if (nativeLoaded) requestCancel() }
     }
 
-    override fun setThreadLimit(threads: Int) {
+    override fun setThreadLimit(threads: Int, batchThreads: Int) {
         require(threads in 1..32) { "Thread limit must be between 1 and 32" }
+        require(batchThreads in 1..32) { "Batch thread limit must be between 1 and 32" }
         thermalThreadLimit = threads
-        synchronized(nativeControlLock) { if (nativeLoaded && !closing) setThreadLimitNative(threads) }
+        thermalBatchThreadLimit = batchThreads
+        synchronized(nativeControlLock) { if (nativeLoaded && !closing) setThreadLimitNative(threads, batchThreads) }
     }
 
     private fun startOperation() {

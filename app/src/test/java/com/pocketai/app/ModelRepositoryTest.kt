@@ -27,17 +27,62 @@ class ModelRepositoryTest {
     @Before fun setUp() {
         context = RuntimeEnvironment.getApplication()
         File(context.filesDir, "models").deleteRecursively()
+        context.getSharedPreferences("model_fingerprints_v1", 0).edit().clear().commit()
         repository = ModelRepository(context)
     }
 
-    @Test fun importingSameNamePreservesBothFiles() = runBlocking {
+    @Test fun importingIdenticalContentReusesTheInstalledFile() = runBlocking {
         val source = File(context.cacheDir, "test-model.gguf").apply { writeBytes(validGguf()) }
         val first = repository.import(Uri.fromFile(source))
         val second = repository.import(Uri.fromFile(source))
-        assertNotEquals(first.name, second.name)
+        assertEquals(first, second)
         assertArrayEquals(source.readBytes(), first.readBytes())
         assertArrayEquals(source.readBytes(), second.readBytes())
+        assertEquals(1, repository.installed().size)
+        assertFalse(File(context.filesDir, "models").listFiles().orEmpty().any { it.extension == "part" })
+    }
+
+    @Test fun differentContentWithSameNamePreservesBothFiles() = runBlocking {
+        val source = File(context.cacheDir, "test-model.gguf").apply { writeBytes(validGguf()) }
+        val first = repository.import(Uri.fromFile(source))
+        source.writeBytes(validGguf().apply { this[40] = 7 })
+        val second = repository.import(Uri.fromFile(source))
+        assertNotEquals(first, second)
+        assertEquals(0, first.readBytes()[40].toInt())
+        assertEquals(7, second.readBytes()[40].toInt())
         assertEquals(2, repository.installed().size)
+    }
+
+    @Test fun renamedInstalledWeightsAreRecognizedAndNeverDownloadedAgain() = runBlocking {
+        val bytes = validGguf()
+        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it.toInt() and 255) }
+        val entry = ModelEntry("known", "Known model", "https://example.invalid/original.gguf", bytes.size.toLong(), "", digest)
+        val renamed = File(context.filesDir, "models/renamed.gguf").apply { writeBytes(bytes) }
+        assertEquals(setOf("known"), repository.inventory(listOf(entry)).single().catalogueIds)
+        assertEquals(renamed, repository.download(entry) { _, _ -> })
+        assertEquals(1, repository.installed().size)
+    }
+
+    @Test fun changedWeightsInvalidateTheStoredFingerprint() = runBlocking {
+        val bytes = validGguf()
+        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it.toInt() and 255) }
+        val entry = ModelEntry("known", "Known", "https://example.invalid/original.gguf", bytes.size.toLong(), "", digest)
+        val file = File(context.filesDir, "models/changed.gguf").apply { writeBytes(bytes) }
+        assertEquals(setOf("known"), repository.inventory(listOf(entry)).single().catalogueIds)
+        val previousTime = file.lastModified()
+        file.writeBytes(bytes.apply { this[40] = 9 })
+        file.setLastModified(previousTime + 2000)
+        assertTrue(repository.inventory(listOf(entry)).single().catalogueIds.isEmpty())
+    }
+
+    @Test fun completedPartialDownloadIsVerifiedAndCommittedWithoutNetwork() = runBlocking {
+        val bytes = validGguf()
+        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it.toInt() and 255) }
+        val entry = ModelEntry("complete", "Complete", "https://example.invalid/completed.gguf", bytes.size.toLong(), "", digest)
+        File(context.filesDir, "models/.download-${digest.take(24)}.part").writeBytes(bytes)
+        val result = repository.download(entry) { _, _ -> }
+        assertArrayEquals(bytes, result.readBytes())
+        assertEquals(1, repository.installed().size)
         assertFalse(File(context.filesDir, "models").listFiles().orEmpty().any { it.extension == "part" })
     }
 

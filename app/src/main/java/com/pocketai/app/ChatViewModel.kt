@@ -43,10 +43,14 @@ internal data class ChatUiState(
     val attachment: PreparedAttachment? = null,
     val hfResults: List<ModelEntry> = emptyList(),
     val remote: Boolean = false,
+    val installedModels: List<InstalledModel> = emptyList(),
+    val folderModels: FolderModels = FolderModels(),
+    val indexingModels: Boolean = false,
 )
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
     val models = ModelRepository(application)
+    val modelFolders = ModelFolderScanner(application)
     val settings = OnlineSettings(application)
     val artifacts = ArtifactStore(application)
     val logs = DiagnosticsLog(application)
@@ -62,6 +66,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     internal val state = mutableState.asStateFlow()
     private var engine: InferenceEngine? = null
     private var activeJob: Job? = null
+    private var inventoryJob: Job? = null
     private var activeFile: File? = null
     private var activeOptions = InferenceOptions()
     private var needsHistoryRestore = true
@@ -75,6 +80,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     @Volatile private var currentThermalStatus = runCatching { power.currentThermalStatus }.getOrDefault(PowerManager.THERMAL_STATUS_NONE)
     @Volatile private var currentThreadLimit = 1
     @Volatile private var preferredThreadLimit = 32
+    @Volatile private var preferredBatchThreadLimit = 32
+    @Volatile private var currentBatchThreadLimit = 1
     private var lastMetricWallMs = android.os.SystemClock.elapsedRealtime()
     private var lastProcessCpuMs = Process.getElapsedCpuTime()
     @Volatile private var latestProcessCpuCores = 0.0
@@ -106,15 +113,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         currentThermalStatus = status
         val configured = activeOptions.threads.coerceAtLeast(1)
         val requested = minOf(configured, preferredThreadLimit).coerceAtLeast(1)
-        val limit = when {
+        val thermalCap = when {
             status >= PowerManager.THERMAL_STATUS_CRITICAL -> 1
-            status >= PowerManager.THERMAL_STATUS_SEVERE -> minOf(2, requested)
-            status >= PowerManager.THERMAL_STATUS_MODERATE -> minOf(if (performanceMode == "cpu-performance") 4 else 3, requested)
-            else -> requested
-        }.coerceAtLeast(1)
+            status >= PowerManager.THERMAL_STATUS_SEVERE -> 2
+            status >= PowerManager.THERMAL_STATUS_MODERATE -> if (performanceMode == "cpu-performance") 4 else 3
+            else -> configured
+        }
+        val limit = minOf(requested, thermalCap).coerceAtLeast(1)
+        val batchLimit = minOf(configured, preferredBatchThreadLimit, thermalCap).coerceAtLeast(1)
         currentThreadLimit = limit
-        engine?.setThreadLimit(limit)
-        logs.event("thermal=$status(" + thermalLabel(status) + ") thread_limit=$limit preferred_threads=$preferredThreadLimit configured_threads=$configured headroom=" + thermalHeadroom())
+        currentBatchThreadLimit = batchLimit
+        engine?.setThreadLimit(limit, batchLimit)
+        logs.event("thermal=$status(" + thermalLabel(status) + ") thread_limit=$limit prompt_threads=$batchLimit preferred_threads=$preferredThreadLimit configured_threads=$configured headroom=" + thermalHeadroom())
     }
 
     var performanceMode: String
@@ -168,6 +178,53 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             logs.failure("thermal_monitor_unavailable", it)
             false
         }
+        refreshModels()
+    }
+
+    fun refreshModels() {
+        if (state.value.busy || inventoryJob?.isActive == true) return
+        inventoryJob = viewModelScope.launch {
+            update { it.copy(indexingModels = true) }
+            try {
+                val quick = withContext(Dispatchers.IO) { models.installed().map { InstalledModel(it) } }
+                // Preserve verified identities until the background refresh completes.
+                update { current -> current.copy(installedModels = quick.map { item ->
+                    current.installedModels.find { it.file == item.file } ?: item
+                }) }
+                val installed = models.inventory(ModelRepository.catalogue + state.value.hfResults)
+                val folder = modelFolders.scan()
+                update { it.copy(installedModels = installed, folderModels = folder) }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) {
+                logs.failure("model_inventory", error)
+                update { it.copy(folderModels = FolderModels(note = "Impossible d’actualiser les modèles. Réessaie.")) }
+            } finally { update { it.copy(indexingModels = false) } }
+        }
+    }
+
+    fun selectModelFolder(uri: android.net.Uri) {
+        if (state.value.busy) return
+        try {
+            modelFolders.remember(uri)
+            inventoryJob?.cancel()
+            inventoryJob = null
+            refreshModels()
+        } catch (error: Exception) {
+            update { it.copy(error = "Android n’a pas autorisé l’accès à ce dossier. Sélectionne un autre dossier.") }
+        }
+    }
+
+    fun forgetModelFolder() {
+        inventoryJob?.cancel()
+        inventoryJob = null
+        modelFolders.forget()
+        update { it.copy(folderModels = FolderModels()) }
+        refreshModels()
+    }
+
+    fun deleteModel(file: File) = task("Suppression du modèle…", refreshInventory = true) {
+        require(file != activeFile) { "Décharge le modèle avant de le supprimer." }
+        require(models.delete(file)) { "Impossible de supprimer ce modèle." }
     }
 
     private suspend fun inference(): InferenceEngine = engine ?: AiChat.getInferenceEngine(getApplication()).also {
@@ -348,9 +405,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         ).joinToString("|").hashCode()
 
     private fun restoredThreadLimit(file: File, options: InferenceOptions): Int {
-        val stored = prefs.getInt(threadTuneKey(file, options), options.threads)
+        val stored = prefs.getInt(threadTuneKey(file, options), minOf(6, options.threads))
         return stored.coerceIn(1, options.threads.coerceAtLeast(1))
     }
+
+    private fun restoredBatchThreadLimit(file: File, options: InferenceOptions): Int =
+        prefs.getInt(threadTuneKey(file, options) + "_prompt", options.threads).coerceIn(1, options.threads.coerceAtLeast(1))
 
     private suspend fun reloadActiveModelOnCpu(file: File): String {
         val reloadStarted = android.os.SystemClock.elapsedRealtime()
@@ -360,7 +420,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val request4096 = profile.totalRamBytes >= 8L * 1024 * 1024 * 1024
         val cpuOptions = baseCpu.copy(
             gpuLayers = 0,
-            threads = minOf(6, profile.cpuCores).coerceAtLeast(1),
+            threads = minOf(8, profile.cpuCores).coerceAtLeast(1),
             contextSize = if (request4096) maxOf(4096, baseCpu.contextSize) else baseCpu.contextSize,
             batchSize = maxOf(256, baseCpu.batchSize),
         )
@@ -369,6 +429,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         inference.cleanUp()
         activeOptions = cpuOptions
         preferredThreadLimit = restoredThreadLimit(file, cpuOptions)
+        preferredBatchThreadLimit = restoredBatchThreadLimit(file, cpuOptions)
+        thermalListener.onThermalStatusChanged(runCatching { power.currentThermalStatus }.getOrDefault(0))
         inference.configure(cpuOptions)
         inference.loadModel(file.absolutePath)
         inference.setSystemPrompt(SYSTEM_PROMPT)
@@ -398,8 +460,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         return info
     }
 
-    private fun task(label: String, block: suspend () -> Unit) {
+    private fun task(label: String, refreshInventory: Boolean = false, block: suspend () -> Unit) {
         if (state.value.busy) return
+        inventoryJob?.cancel()
+        inventoryJob = null
         update { it.copy(busy = true, status = label, error = null) }
         activeJob = viewModelScope.launch {
             logs.event("operation_started=$label")
@@ -422,6 +486,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         update { it.copy(error = "La conversation n’a pas pu être sauvegardée. Vérifie l’espace de stockage.") }
                     }
                 }
+                if (refreshInventory) refreshModels()
             }
         }
     }
@@ -431,7 +496,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         activeJob?.cancel()
     }
 
-    fun importModel(uri: android.net.Uri) = task("Importation du modèle…") {
+    fun importModel(uri: android.net.Uri) = task("Importation du modèle…", refreshInventory = true) {
         val file = models.import(uri)
         update { it.copy(status = "${file.name} importé") }
     }
@@ -457,7 +522,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         logs.event("attachment_cleared")
     }
 
-    fun downloadModel(entry: ModelEntry) = task("Téléchargement de ${entry.title}…") {
+    fun downloadModel(entry: ModelEntry) = task("Téléchargement de ${entry.title}…", refreshInventory = true) {
         var baseBytes = -1L
         var baseTimeMs = android.os.SystemClock.elapsedRealtime()
         var lastDownloadLogMs = 0L
@@ -490,7 +555,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         update { it.copy(status = "${file.name} disponible") }
     }
 
-    fun searchHuggingFace(query: String) = task("Recherche de modèles GGUF sur Hugging Face…") {
+    fun searchHuggingFace(query: String) = task("Recherche de modèles GGUF sur Hugging Face…", refreshInventory = true) {
         val results = huggingFace.search(query)
         logs.event("hf_search query_length=${query.length.coerceAtMost(80)} results=${results.size}")
         update {
@@ -529,7 +594,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     val requestedContext = if (profile.totalRamBytes >= 8L * 1024 * 1024 * 1024) maxOf(4096, it.contextSize) else it.contextSize
                     it.copy(
                         gpuLayers = 0,
-                        threads = minOf(6, profile.cpuCores).coerceAtLeast(1),
+                        threads = minOf(8, profile.cpuCores).coerceAtLeast(1),
                         contextSize = requestedContext,
                         batchSize = maxOf(256, it.batchSize),
                     )
@@ -537,6 +602,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
             activeOptions = options
             preferredThreadLimit = restoredThreadLimit(file, options)
+            preferredBatchThreadLimit = restoredBatchThreadLimit(file, options)
+            thermalListener.onThermalStatusChanged(runCatching { power.currentThermalStatus }.getOrDefault(0))
             val loadWallStarted = android.os.SystemClock.elapsedRealtime()
             inference.configure(options)
             inference.loadModel(file.absolutePath)
@@ -571,10 +638,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun applyPerformanceProfile() {
+        val file = activeFile ?: return
+        loadModel(file)
+    }
+
     fun unloadModel() = task("Libération de la mémoire…") {
         activeFile = null
         activeRemote = null
         preferredThreadLimit = 32
+        preferredBatchThreadLimit = 32
         update { it.copy(modelName = null, remote = false, diagnostics = "", liveMetrics = "") }
         engine?.cleanUp()
         update { it.copy(status = "Modèle déchargé") }
@@ -591,57 +664,59 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
         task("Auto-réglage CPU du modèle…") {
             val inference = inference()
-            // Re-open the full configured range while tuning; an older saved tune
-            // must not prevent the benchmark from testing a faster thread count.
-            preferredThreadLimit = activeOptions.threads.coerceAtLeast(1)
-            val thermalMax = when {
-                currentThermalStatus >= PowerManager.THERMAL_STATUS_CRITICAL -> 1
-                currentThermalStatus >= PowerManager.THERMAL_STATUS_SEVERE -> minOf(2, activeOptions.threads)
-                currentThermalStatus >= PowerManager.THERMAL_STATUS_MODERATE -> minOf(4, activeOptions.threads)
-                else -> activeOptions.threads
-            }.coerceAtLeast(1)
-            val candidates = listOf(2, 3, 4, 5, 6)
-                .filter { it <= thermalMax && it <= activeOptions.threads }
-                .ifEmpty { listOf(1) }
-            data class Sample(val threads: Int, val prompt: Double, val generation: Double)
-            val samples = mutableListOf<Sample>()
-            for (threads in candidates) {
-                inference.setThreadLimit(threads)
-                currentThreadLimit = threads
-                update { it.copy(status = "Benchmark CPU · $threads thread(s)…") }
-                val result = inference.bench(
-                    minOf(128, (activeOptions.contextSize - 64).coerceAtLeast(32)),
-                    minOf(32, (activeOptions.contextSize - 64).coerceAtLeast(16)),
-                    1,
-                    1,
-                )
-                val prompt = Regex("Prompt: ([0-9.]+)").find(result)?.groupValues?.getOrNull(1)?.toDoubleOrNull() ?: 0.0
-                val generation = Regex("Generation: ([0-9.]+)").find(result)?.groupValues?.getOrNull(1)?.toDoubleOrNull() ?: 0.0
-                if (prompt > 0 && generation > 0) samples += Sample(threads, prompt, generation)
-                logs.event("thread_tune_sample model=${file.name} threads=$threads prompt_tps=$prompt generation_tps=$generation thermal=$currentThermalStatus")
+            require(currentThermalStatus < PowerManager.THERMAL_STATUS_MODERATE) {
+                "Laisse refroidir le téléphone avant de comparer les threads."
             }
-            require(samples.isNotEmpty()) { "Le benchmark CPU n’a produit aucune mesure exploitable." }
-            val maxPrompt = samples.maxOf { it.prompt }.coerceAtLeast(0.001)
-            val maxGeneration = samples.maxOf { it.generation }.coerceAtLeast(0.001)
-            val best = samples.maxBy { sample ->
-                0.35 * sample.prompt / maxPrompt + 0.65 * sample.generation / maxGeneration
-            }
-            preferredThreadLimit = best.threads
-            inference.setThreadLimit(best.threads)
-            currentThreadLimit = best.threads
-            prefs.edit().putInt(threadTuneKey(file, activeOptions), best.threads).apply()
-            val summary = samples.joinToString(" · ") {
-                "${it.threads}t: prompt ${"%.1f".format(it.prompt)}, gen ${"%.1f".format(it.generation)} tok/s"
-            }
-            logs.event("thread_tune_selected model=${file.name} threads=${best.threads} samples=$summary")
-            val tunedDiagnostics = diagnosticsWithSessionNote(inference.diagnostics()) +
-                "\nThread auto-tune: $summary\nSelected: ${best.threads}"
-            update {
-                it.copy(
-                    status = "Auto-réglage terminé · ${best.threads} threads",
-                    liveMetrics = "CPU réglé à ${best.threads}/${activeOptions.threads} threads · gen ${"%.1f".format(best.generation)} tok/s",
-                    diagnostics = tunedDiagnostics,
-                )
+            val previousGeneration = preferredThreadLimit
+            val previousPrompt = preferredBatchThreadLimit
+            var selected = false
+            try {
+                val candidates = listOf(2, 3, 4, 5, 6, 8).filter { it <= activeOptions.threads }
+                    .ifEmpty { listOf(1) }
+                val samples = mutableListOf<CpuSample>()
+                for (threads in candidates) {
+                    require(currentThermalStatus < PowerManager.THERMAL_STATUS_MODERATE) {
+                        "Benchmark interrompu par la chauffe. Le réglage précédent est conservé ; réessaie à froid."
+                    }
+                    preferredThreadLimit = threads
+                    preferredBatchThreadLimit = threads
+                    thermalListener.onThermalStatusChanged(currentThermalStatus)
+                    update { it.copy(status = "Benchmark CPU · $threads threads · 2 mesures…") }
+                    val result = inference.bench(
+                        minOf(128, (activeOptions.contextSize - 64).coerceAtLeast(32)),
+                        minOf(32, (activeOptions.contextSize - 64).coerceAtLeast(16)), 1, 2,
+                    )
+                    require(currentThermalStatus < PowerManager.THERMAL_STATUS_MODERATE) {
+                        "Benchmark interrompu par la chauffe. Réessaie après refroidissement."
+                    }
+                    val prompt = Regex("Prompt: ([0-9.]+)").find(result)?.groupValues?.getOrNull(1)?.toDoubleOrNull() ?: 0.0
+                    val generation = Regex("Generation: ([0-9.]+)").find(result)?.groupValues?.getOrNull(1)?.toDoubleOrNull() ?: 0.0
+                    samples += CpuSample(threads, prompt, generation)
+                    logs.event("thread_tune_sample model=${file.name} threads=$threads prompt_tps=$prompt generation_tps=$generation repetitions=2 thermal=$currentThermalStatus")
+                }
+                val best = CpuTuning.select(samples)
+                preferredThreadLimit = best.generation
+                preferredBatchThreadLimit = best.prompt
+                thermalListener.onThermalStatusChanged(currentThermalStatus)
+                prefs.edit().putInt(threadTuneKey(file, activeOptions), best.generation)
+                    .putInt(threadTuneKey(file, activeOptions) + "_prompt", best.prompt).apply()
+                selected = true
+                val summary = samples.joinToString(" · ") {
+                    "${it.threads}t: prompt ${"%.1f".format(it.prompt)}, gen ${"%.1f".format(it.generation)} tok/s"
+                }
+                logs.event("thread_tune_selected model=${file.name} generation_threads=${best.generation} prompt_threads=${best.prompt} samples=$summary")
+                val tunedDiagnostics = diagnosticsWithSessionNote(inference.diagnostics()) +
+                    "\nThread auto-tune: $summary\nSelected: generation ${best.generation}; prompt ${best.prompt}"
+                update {
+                    it.copy(status = "CPU réglé · génération ${best.generation} · prompt ${best.prompt} threads",
+                        liveMetrics = "CPU · ${best.generation} threads génération · ${best.prompt} threads prompt", diagnostics = tunedDiagnostics)
+                }
+            } finally {
+                if (!selected) {
+                    preferredThreadLimit = previousGeneration
+                    preferredBatchThreadLimit = previousPrompt
+                    thermalListener.onThermalStatusChanged(currentThermalStatus)
+                }
             }
         }
     }
@@ -1114,6 +1189,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 .append(" bytes=").append(activeFile?.length() ?: 0L)
                 .append(" options=").append(activeOptions)
                 .append(" threads=").append(currentThreadLimit).append('/').append(activeOptions.threads)
+                .append(" promptThreads=").append(currentBatchThreadLimit)
                 .append(" preferredThreads=").append(preferredThreadLimit).append('\n')
             append("thermal=").append(currentThermalStatus).append('(').append(thermalLabel(currentThermalStatus)).append(')')
                 .append(" headroom=").append(cachedThermalHeadroom)
