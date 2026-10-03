@@ -1,20 +1,20 @@
 # PocketAI Android 4
 
-Assistant Android avec modèles de langage locaux, choix du modèle et réglages automatiques du matériel. Les réponses affichent le Markdown ; les métadonnées techniques et les blocs de raisonnement restent hors du chat.
+Assistant Android avec modèles GGUF locaux et catalogue de 21 modèles pour le chat, le code, la vision, les documents, la voix et les images. Les fonctions spécialisées utilisent des serveurs compatibles configurés explicitement. Les modèles ne sont pas inclus dans l’APK.
 
 ## Installer et commencer
 
 - **Android 13 ou supérieur, téléphone ARM64** (`arm64-v8a`).
-- Dans les [Actions GitHub](https://github.com/tchoutchoune/PocketAI-Android/actions), ouvrir un build réussi de **Build PocketAI 4**, télécharger l’artefact **PocketAI-4.0-arm64-debug**, extraire le ZIP et installer `PocketAI-4.0-arm64-debug.apk`. GitHub peut demander une connexion pour télécharger les artefacts.
+- Dans les [Actions GitHub](https://github.com/tchoutchoune/PocketAI-Android/actions), ouvrir un build réussi de **Build PocketAI 4**, télécharger l’artefact **PocketAI-4.3.0-model-hub-arm64-debug**, extraire le ZIP et installer `PocketAI-4.3.0-model-hub-arm64-debug.apk`. GitHub peut demander une connexion pour télécharger les artefacts.
 - Autoriser l’installation depuis la source choisie si Android le demande. Cet APK est un build de développement signé avec une clé de débogage.
 
-La version 4 utilise le paquet **`com.pocketai.app`** et peut cohabiter avec l’ancienne version 3. Ses modèles et conversations ne sont pas transférés automatiquement : **réimporter les fichiers GGUF** dans l’onglet **Modèles**, puis choisir **Charger**. Conserver la version 3 le temps de récupérer les données souhaitées.
+La preview utilise le paquet **`io.github.tchoutchoune.pocketai.preview`** et la même signature que la preview 4.2.3 : elle met à jour cette application en conservant ses données. Les applications d’un autre paquet restent séparées.
 
 L’onglet **Chat** permet d’envoyer une question, d’arrêter une opération et de commencer une nouvelle conversation. Les conversations et créations sont conservées sur le téléphone. **Décharger** un modèle libère sa mémoire ; **Supprimer** retire son fichier local.
 
 ## Choisir le modèle et les performances
 
-Le catalogue contient les GGUF officiels Qwen en quantification **Q4_K_M** :
+Le catalogue contient 11 nouveaux GGUF de texte : Qwen 3.5 2B/4B, Qwen 3 4B Instruct 2507, Ministral 3 3B, SmolLM3 3B, Gemma 4 E2B/E4B, Qwen 2.5 Coder 1,5B/7B, Phi 4 mini et Qwen 3 4B. Quantification Q4_K_M, sauf Gemma 4 Q4_0. Les métadonnées HF LFS ont été vérifiées le 3 octobre 2026 et sont épinglées dans [ModelHub.kt](app/src/main/java/com/pocketai/app/ModelHub.kt). Leur architecture est vérifiée par llama.cpp au chargement ; la taille du fichier ne représente pas toute la RAM nécessaire. La vision de ces familles reste réservée au mode serveur. Les trois modèles historiques restent disponibles :
 
 | Modèle | Téléchargement | Usage conseillé | Licence |
 | --- | ---: | --- | --- |
@@ -32,7 +32,20 @@ La déclaration Vulkan d’Android permet de tenter l’accélération GPU. Le m
 
 ## Fichiers, images, vidéos et Internet
 
-**Créer** permet de demander au modèle local le contenu d’un fichier : texte, Markdown, code, JSON, CSV ou HTML selon le nom choisi. Chaque réponse du chat peut aussi être exportée en **texte, Markdown, HTML, JSON, CSV ou PDF**. Les exports JSON/CSV contiennent le texte de la réponse ; le PDF conserve ce texte. Enregistrer, partager ou supprimer une création depuis sa fiche. Les fichiers restent accessibles après redémarrage ; l’historique des créations est limité à **100 fichiers et 512 Mo**.
+Dans **Modèles**, filtrer par usage. **Télécharger le GGUF texte** installe le fichier sur le téléphone ; **Charger** le sélectionne pour le chat hors ligne. **Configurer** enregistre, pour chaque modèle, une URL HTTPS (par exemple `https://serveur.example/v1`), son alias exact et une clé facultative chiffrée. Le serveur doit être déployé séparément et héberger réellement ce modèle. PocketAI ne transforme pas une URL Hugging Face en endpoint. **Tester le serveur** vérifie sa liste `/models` ; certains serveurs spécialisés n’exposent pas cette route. **Utiliser** active explicitement le chat distant ; le bandeau affiche alors **Serveur**. Charger un GGUF revient au chat local. Les requêtes chat serveur retournent une réponse complète, sans streaming ; le temps indiqué inclut le réseau.
+
+| Modèles / usage | Route serveur attendue | Interface / données envoyées |
+| --- | --- | --- |
+| Chat du catalogue ou Qwen 3.5 9B, Qwen 3.8 27B, Gemma 4 26B-A4B/31B, Qwen 3 Coder Next | `POST /chat/completions` | Chat : question, historique récent limité, extraits joints |
+| Qwen 3.5, Ministral 3, Gemma 4, SmolVLM2 2,2B | Même route, contenu `image_url` | Photo jointe réduite à 1 280 pixels et JPEG 85 %, plus OCR/extraits ; une photo à la fois. Vidéo non intégrée |
+| Qwen 3 Embedding 0,6B | `POST /embeddings`, vecteurs float | Activer dans Réglages : passages du document et question transmis même avec chat local. 64 passages au maximum répartis dans tout le document, 4 retenus par similarité cosinus. Recherche partielle, sans index persistant |
+| Whisper small | `POST /audio/transcriptions`, multipart | Créer → Transcrire : audio du sélecteur, 25 Mo maximum. Transcription enregistrée en TXT |
+| Kokoro 82M | `POST /audio/speech`, WAV | Créer → Voix : texte (4 000 caractères maximum), voix `ff_siwis` ou `fm_gilles` selon disponibilité du serveur. WAV à ouvrir/enregistrer/partager |
+| Qwen Image 2.1 | `POST /images/generations` et `/images/edits`, réponse `b64_json` | Créer → Image ou Modifier la photo jointe : description, et photo réduite pour l’édition. Nécessite un backend diffusion compatible ; licence Qwen Research |
+
+Un serveur qui n’implémente pas la route ou le modèle sélectionné provoque une erreur explicite ; aucun modèle de remplacement n’est choisi automatiquement. Chaque modèle peut pointer vers un serveur différent. Les noms de dépôts proposés par défaut doivent être remplacés par les alias annoncés par le serveur si nécessaire. Toutes les connexions utilisent HTTPS avec validation TLS ; les redirections authentifiées sont refusées. Les embeddings sont désactivés par défaut. L’inférence spécialisée n’est pas embarquée hors ligne dans l’APK. Le bouton **Lire** du chat conserve la voix Android locale ; Kokoro est une création audio distincte.
+
+**Créer** permet de demander au modèle sélectionné (local ou serveur) le contenu d’un fichier : texte, Markdown, code, JSON, CSV ou HTML selon le nom choisi. Chaque réponse du chat peut aussi être exportée en **texte, Markdown, HTML, JSON, CSV ou PDF**. Les exports JSON/CSV contiennent le texte de la réponse ; le PDF conserve ce texte. Enregistrer, partager ou supprimer une création depuis sa fiche. Les fichiers restent accessibles après redémarrage ; l’historique des créations est limité à **100 fichiers et 512 Mo**.
 
 Les services en ligne sont **facultatifs et inactifs par défaut**, sans clé préinstallée :
 
@@ -59,7 +72,7 @@ Le script de préparation installe dans le répertoire d’outils le **JDK 17**,
 
 `scripts/build.sh` construit l’APK ARM64 avec CPU et Vulkan, lance les tests unitaires de `app` et `lib`, puis contrôle le ZIP, la signature, le paquet et les bibliothèques natives. Résultats :
 
-- `out/PocketAI-4.0-arm64-debug.apk` et `out/SHA256.txt` ;
+- `out/PocketAI-4.3.0-model-hub-arm64-debug.apk` et `out/SHA256.txt` ;
 - preuves de vérification dans `out/` ;
 - rapports dans `app/build/reports/tests/` et `lib/build/reports/tests/`.
 

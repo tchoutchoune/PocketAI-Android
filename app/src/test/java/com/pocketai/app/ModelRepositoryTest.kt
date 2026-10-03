@@ -7,6 +7,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -65,14 +66,25 @@ class ModelRepositoryTest {
     }
 
     @Test fun catalogueUsesPinnedOfficialWeightsAndChecksums() {
-        assertEquals(3, ModelRepository.catalogue.size)
+        assertEquals(14, ModelRepository.catalogue.size)
+        assertEquals(ModelRepository.catalogue.size, ModelRepository.catalogue.map { it.id }.distinct().size)
         ModelRepository.catalogue.forEach { entry ->
-            assertTrue(entry.url.startsWith("https://huggingface.co/Qwen/"))
+            assertTrue(entry.url.startsWith("https://huggingface.co/"))
             assertTrue(Regex("/resolve/[0-9a-f]{40}/").containsMatchIn(entry.url))
             assertTrue(entry.sha256.orEmpty().matches(Regex("[a-f0-9]{64}")))
             assertTrue(entry.sizeBytes > 400_000_000L)
-            assertTrue(entry.licenseUrl.endsWith("/LICENSE"))
+            assertTrue(entry.licenseUrl.startsWith("https://huggingface.co/"))
+            assertFalse(entry.url.contains("mmproj"))
+            assertFalse(entry.url.contains("/main/"))
         }
+    }
+
+    @Test fun specializedModelsCannotBeDownloadedIntoTheTextEngine() {
+        assertEquals(21, ModelHub.models.size)
+        ModelHub.models.filter { !it.supportsChat }.forEach { assertNull(it.local) }
+        assertTrue(ModelHub.find("smolvlm2").vision)
+        assertNull(ModelHub.find("smolvlm2").local)
+        assertEquals(ModelUse.CODE, ModelHub.find("qwen25-coder-15b").use)
     }
 
     private fun validGguf() = ByteArray(128).apply {

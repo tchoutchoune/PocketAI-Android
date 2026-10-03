@@ -281,7 +281,7 @@ class ModelRepository(private val context: Context) {
         private val ioMutex = Mutex()
 
         /** Sizes, SHA-256 (LFS OID), revisions and licenses checked against the official HF API. */
-        val catalogue: List<ModelEntry> = listOf(
+        val catalogue: List<ModelEntry> = ModelHub.localCatalogue + listOf(
             ModelEntry(
                 id = "qwen2.5-0.5b-q4_k_m",
                 title = "Qwen 2.5 · 0,5B · rapide",

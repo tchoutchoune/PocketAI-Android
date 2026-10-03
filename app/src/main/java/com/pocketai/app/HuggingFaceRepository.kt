@@ -38,6 +38,10 @@ class HuggingFaceRepository {
             val pinnedRevision = details.optString("sha")
                 .takeIf { it.matches(Regex("[a-fA-F0-9]{40,64}")) }
                 ?: revision
+            if (pinnedRevision == "main") continue
+            val pipeline = details.optString("pipeline_tag")
+            if (pipeline in setOf("feature-extraction", "automatic-speech-recognition", "text-to-speech",
+                    "text-to-image", "image-to-image")) continue
             val siblings = details.optJSONArray("siblings") ?: continue
             val license = details.optJSONObject("cardData")?.optString("license").orEmpty()
             val downloads = details.optLong("downloads", model.optLong("downloads", 0L))
@@ -48,14 +52,15 @@ class HuggingFaceRepository {
                 val filename = sibling.optString("rfilename")
                 val lowerName = filename.lowercase()
                 if (!filename.endsWith(".gguf", ignoreCase = true)) continue
-                if ("mmproj" in lowerName || "projector" in lowerName) continue
+                if ("mmproj" in lowerName || "projector" in lowerName || "mtp" in lowerName ||
+                    "embedding" in lowerName || "whisper" in lowerName || "kokoro" in lowerName) continue
                 if (Regex("(?i)-\\d{5}-of-\\d{5}\\.gguf$").containsMatchIn(filename)) continue
                 val lfs = sibling.optJSONObject("lfs") ?: continue
                 val sha = lfs.optString("sha256").lowercase()
                 val size = lfs.optLong("size", -1L)
                 if (!sha.matches(Regex("[a-f0-9]{64}")) || size < 8L * 1024 * 1024) continue
 
-                val pinned = if (pinnedRevision == "main") "main" else pinnedRevision
+                val pinned = pinnedRevision
                 val url = "https://huggingface.co/${encodePath(repoId)}/resolve/$pinned/${encodePath(filename)}?download=true"
                 val quant = filename.substringBeforeLast(".gguf").substringAfterLast('-').uppercase()
                 val description = buildString {

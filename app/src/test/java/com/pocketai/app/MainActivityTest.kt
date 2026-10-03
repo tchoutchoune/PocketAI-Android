@@ -79,4 +79,13 @@ class MainActivityTest {
         assertEquals("Bonjour", input.text.toString())
         assertTrue(ViewModelProvider(activity)[ChatViewModel::class.java].state.value.messages.isEmpty())
     }
+
+    @Test fun specializedModelActionRequiresConfigurationBeforeAnyUpload() {
+        val activity = start()
+        tabs(activity).getTabAt(2)!!.select()
+        button(activity, "Transcrire un audio · Whisper").performClick()
+        assertNull(shadowOf(activity).nextStartedActivityForResult)
+        assertFalse(ViewModelProvider(activity)[ChatViewModel::class.java].state.value.busy)
+        assertTrue(ViewModelProvider(activity)[ChatViewModel::class.java].settings.inferenceUrl("whisper-small").isBlank())
+    }
 }

@@ -125,7 +125,7 @@ internal object AttachmentContextBuilder {
         )
     }
 
-    private fun chunk(document: String, chunkChars: Int, overlapChars: Int): List<String> {
+    internal fun chunk(document: String, chunkChars: Int, overlapChars: Int): List<String> {
         val normalized = document.replace("\r\n", "\n").replace('\r', '\n').trim()
         if (normalized.isBlank()) return emptyList()
         val chunks = mutableListOf<String>()

@@ -69,6 +69,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var stopButton: MaterialButton
     private lateinit var newButton: MaterialButton
     private var selectedTab = 0
+    private var hubFilter: ModelUse? = null
     private var followStreaming = true
     private var tts: TextToSpeech? = null
     private var ttsReady = false
@@ -80,6 +81,9 @@ class MainActivity : AppCompatActivity() {
     }
     private val attachmentPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let(model::prepareAttachment)
+    }
+    private val audioPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let(model::transcribeAudio)
     }
     private val cameraPicker = registerForActivityResult(ActivityResultContracts.TakePicture()) { success ->
         val file = pendingCameraFile
@@ -192,7 +196,7 @@ class MainActivity : AppCompatActivity() {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 model.state.collect { state ->
                     status.text = state.status
-                    modelBadge.text = state.modelName?.let { "Local · $it" } ?: "Choisis un modèle dans l’onglet Modèles"
+                    modelBadge.text = state.modelName?.let { "${if (state.remote) "Serveur" else "Local"} · $it" } ?: "Choisis un modèle dans l’onglet Modèles"
                     liveMetricsView.text = state.liveMetrics
                     liveMetricsView.visibility = if (state.liveMetrics.isBlank()) View.GONE else View.VISIBLE
                     progress.visibility = if (state.busy) View.VISIBLE else View.GONE
@@ -372,8 +376,10 @@ class MainActivity : AppCompatActivity() {
             contents.addView(controls); modelsPanel.addView(card(contents))
         }
         if (model.state.value.modelName != null) modelsPanel.addView(button("Décharger et libérer la mémoire") { model.unloadModel() }.apply { isEnabled = !model.state.value.busy })
-        modelsPanel.addView(text("Catalogue vérifié", 18f, true))
-        ModelRepository.catalogue.forEach { entry ->
+        renderHubCatalogue()
+        if (hubFilter == null || hubFilter == ModelUse.CHAT) {
+        modelsPanel.addView(text("Modèles historiques", 18f, true))
+        ModelRepository.catalogue.filter { entry -> ModelHub.models.none { it.local?.id == entry.id } }.forEach { entry ->
             val contents = column()
             contents.addView(text(entry.title, 17f, true))
             contents.addView(text(entry.description, 14f))
@@ -386,6 +392,7 @@ class MainActivity : AppCompatActivity() {
             }.apply { isEnabled = !model.state.value.busy })
             controls.addView(button("Licence") { openLink(entry.licenseUrl) })
             contents.addView(controls); modelsPanel.addView(card(contents))
+        }
         }
 
         val hf = model.state.value.hfResults
@@ -411,6 +418,104 @@ class MainActivity : AppCompatActivity() {
             }
             modelsPanel.addView(button("Effacer les résultats") { model.clearHuggingFaceResults(); renderModels() })
         }
+    }
+
+    private fun renderHubCatalogue() {
+        modelsPanel.addView(text("Catalogue des modèles", 18f, true))
+        modelsPanel.addView(button("Usage : ${hubFilter?.label ?: "Tous"}") {
+            val labels = arrayOf("Tous") + ModelUse.entries.map { it.label }.toTypedArray()
+            MaterialAlertDialogBuilder(this).setTitle("Choisir un usage").setItems(labels) { _, index ->
+                hubFilter = if (index == 0) null else ModelUse.entries[index - 1]; renderModels()
+            }.show()
+        })
+        ModelHub.models.filter { hubFilter == null || it.use == hubFilter ||
+            (hubFilter == ModelUse.VISION && it.vision) }.forEach { entry ->
+            val contents = column()
+            contents.addView(text(entry.title, 17f, true))
+            contents.addView(text(entry.description, 14f))
+            entry.local?.let { local ->
+                contents.addView(text("${"%.2f".format(local.sizeBytes / (1024.0 * 1024 * 1024))} Go · GGUF texte local · SHA-256 vérifié", 12f))
+                contents.addView(button("Télécharger le GGUF texte") {
+                    MaterialAlertDialogBuilder(this).setTitle("Télécharger ${entry.title} ?")
+                        .setMessage("${local.description}\n\n${"%.2f".format(local.sizeBytes / (1024.0 * 1024 * 1024))} Go de stockage, plus la mémoire du contexte. Ce téléchargement contient le texte seul. Consulte la licence du modèle.")
+                        .setNegativeButton("Annuler", null).setPositiveButton("Télécharger") { _, _ -> model.downloadModel(local) }.show()
+                }.apply { isEnabled = !model.state.value.busy })
+            }
+            contents.addView(text(if (entry.supportsChat) "Serveur : ${if (entry.vision) "texte + photo" else "texte"}"
+                else "Serveur nécessaire · ${entry.use.label}", 12f))
+            val controls = row()
+            controls.addView(button("Configurer") { hubServerDialog(entry) }.apply { isEnabled = !model.state.value.busy })
+            controls.addView(button("Fiche / licence") { openLink(entry.pageUrl) })
+            contents.addView(controls)
+            val actions = row()
+            actions.addView(button("Tester le serveur") {
+                hubAction(entry.id) { model.checkRemoteModel(entry) }
+            }.apply { isEnabled = !model.state.value.busy })
+            actions.addView(button(if (entry.supportsChat) "Utiliser" else "Ouvrir l’usage") {
+                if (entry.supportsChat) hubAction(entry.id) {
+                    MaterialAlertDialogBuilder(this).setTitle("Utiliser ${entry.title} sur serveur ?")
+                        .setMessage("Les questions, l’historique récent et les extraits joints seront envoyés au serveur configuré. ${if (entry.vision) "Les photos jointes seront aussi transmises, réduites à 1 280 pixels." else "Les photos fournissent seulement leur OCR local."} Reviens à un GGUF installé pour utiliser le chat local.")
+                        .setNegativeButton("Annuler", null).setPositiveButton("Utiliser") { _, _ ->
+                            model.selectRemoteModel(entry); tabs.getTabAt(0)?.select()
+                        }.show()
+                } else tabs.getTabAt(if (entry.use == ModelUse.EMBEDDING) 3 else 2)?.select()
+            }.apply { isEnabled = !model.state.value.busy })
+            contents.addView(actions)
+            modelsPanel.addView(card(contents))
+        }
+    }
+
+    private fun chooseHubConfiguration() {
+        MaterialAlertDialogBuilder(this).setTitle("Quel modèle configurer ?")
+            .setItems(ModelHub.models.map { it.title }.toTypedArray()) { _, index ->
+                hubServerDialog(ModelHub.models[index])
+            }.show()
+    }
+
+    private fun hubAction(id: String, action: () -> Unit) {
+        if (model.state.value.busy) return
+        if (model.settings.inferenceUrl(id).isBlank()) hubServerDialog(ModelHub.find(id), action)
+        else action()
+    }
+
+    private fun hubServerDialog(entry: HubModel, afterSave: () -> Unit = {}) {
+        if (model.state.value.busy) return
+        val wrapper = column().apply { setPadding(dp(20), dp(4), dp(20), dp(4)) }
+        val url = EditText(this).apply {
+            hint = "URL HTTPS du serveur, terminant souvent par /v1"
+            setText(model.settings.inferenceUrl(entry.id)); isSingleLine = true
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+        }
+        val alias = EditText(this).apply {
+            hint = "Alias du modèle exposé par le serveur"; setText(model.settings.inferenceModel(entry.id)); isSingleLine = true
+        }
+        val key = EditText(this).apply {
+            hint = "Clé facultative · vide = conserver"; isSingleLine = true
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        val clearKey = android.widget.CheckBox(this).apply { text = "Supprimer la clé enregistrée"; setTextColor(Color.parseColor("#D6E2EA")) }
+        listOf(url, alias, key, clearKey).forEach(wrapper::addView)
+        val endpoint = when (entry.use) {
+            ModelUse.EMBEDDING -> "/embeddings"
+            ModelUse.TRANSCRIPTION -> "/audio/transcriptions"
+            ModelUse.SPEECH -> "/audio/speech (WAV)"
+            ModelUse.IMAGE -> "/images/generations et /images/edits (b64_json)"
+            else -> "/chat/completions${if (entry.vision) " avec image_url" else ""}"
+        }
+        val dialog = MaterialAlertDialogBuilder(this).setTitle(entry.title)
+            .setMessage("Le serveur doit héberger ce modèle et fournir $endpoint au format compatible OpenAI. Les données saisies dans cet usage lui seront envoyées. La configuration ne déploie pas le modèle. Le test utilise /models lorsqu’il est disponible.")
+            .setView(wrapper).setNegativeButton("Annuler", null).setPositiveButton("Enregistrer", null).create()
+        dialog.setOnShowListener {
+            dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                if (model.state.value.busy) return@setOnClickListener
+                try {
+                    model.settings.configureInference(entry.id, url.text.toString(), alias.text.toString(),
+                        if (clearKey.isChecked) "" else key.text.toString().trim().takeIf { it.isNotEmpty() })
+                    dialog.dismiss(); renderModels(); renderSettings(); afterSave()
+                } catch (error: Exception) { url.error = error.message ?: "Configuration invalide." }
+            }
+        }
+        dialog.show()
     }
 
     private fun huggingFaceSearchDialog() {
@@ -440,8 +545,20 @@ class MainActivity : AppCompatActivity() {
     private fun renderCreation() {
         creationPanel.removeAllViews(); pad(creationPanel)
         creationPanel.addView(text("Créer et télécharger", 22f, true))
-        creationPanel.addView(text("Documents et code : modèle local. Images et vidéos : services en ligne facultatifs, avec tes clés et leurs tarifs.", 14f))
-        creationPanel.addView(button("Créer un fichier avec le modèle local") { createFileDialog() }.apply { isEnabled = !model.state.value.busy })
+        creationPanel.addView(text("Documents et code : modèle de chat sélectionné, local ou serveur. Vision, Whisper, Kokoro et Qwen Image : serveur à configurer, avec ses conditions et tarifs.", 14f))
+        creationPanel.addView(button("Créer un fichier avec le modèle sélectionné") { createFileDialog() }.apply { isEnabled = !model.state.value.busy })
+        creationPanel.addView(button("Transcrire un audio · Whisper") {
+            hubAction("whisper-small") { audioPicker.launch(arrayOf("audio/*")) }
+        }.apply { isEnabled = !model.state.value.busy })
+        creationPanel.addView(button("Créer une voix · Kokoro") {
+            hubAction("kokoro") { promptDialog("Voix Kokoro", "Le texte est envoyé au serveur Kokoro (4 000 caractères maximum).", true, model::synthesizeSpeech) }
+        }.apply { isEnabled = !model.state.value.busy })
+        creationPanel.addView(button("Créer une image · Qwen Image") {
+            hubAction("qwen-image") { promptDialog("Qwen Image", "La description est envoyée au serveur diffusion configuré.", true) { model.generateHubImage(it) } }
+        }.apply { isEnabled = !model.state.value.busy })
+        creationPanel.addView(button("Modifier la photo jointe · Qwen Image") {
+            hubAction("qwen-image") { promptDialog("Modifier la photo", "Joins d’abord une photo dans le chat. La photo réduite et les instructions sont envoyées au serveur ; celui-ci doit prendre en charge /images/edits.", true) { model.generateHubImage(it, edit = true) } }
+        }.apply { isEnabled = !model.state.value.busy })
         creationPanel.addView(button("Générer une image") { promptDialog("Image en ligne", "Décris l’image à générer. La demande est envoyée au fournisseur configuré.", model.settings.hasImageKey, model::generateImage) }.apply { isEnabled = !model.state.value.busy })
         creationPanel.addView(button("Générer une vidéo") { promptDialog("Vidéo en ligne", "Décris une courte vidéo. La demande est envoyée à fal.ai ; les délais et le coût dépendent du fournisseur.", model.settings.hasFalKey, model::generateVideo) }.apply { isEnabled = !model.state.value.busy })
         creationPanel.addView(text("Fichiers prêts", 18f, true))
@@ -476,6 +593,33 @@ class MainActivity : AppCompatActivity() {
     private fun renderSettings() {
         settingsPanel.removeAllViews(); pad(settingsPanel)
         settingsPanel.addView(text("Ton PocketAI", 22f, true))
+        settingsPanel.addView(text("Serveurs des modèles", 18f, true))
+        settingsPanel.addView(button("Configurer un modèle du catalogue") { chooseHubConfiguration() }.apply { isEnabled = !model.state.value.busy })
+        settingsPanel.addView(text("Chaque modèle a son URL HTTPS et son alias serveur. Il doit être déployé côté serveur ; une fiche Hugging Face n’est pas un endpoint d’inférence. Les clés restent chiffrées sur le téléphone.", 13f))
+        settingsPanel.addView(SwitchMaterial(this).apply {
+            text = "Recherche sémantique · serveur Qwen Embedding"
+            setTextColor(Color.parseColor("#D6E2EA"))
+            isChecked = model.settings.embeddingEnabled
+            isEnabled = !model.state.value.busy
+            setOnCheckedChangeListener { _, checked ->
+                if (checked) {
+                    isChecked = false
+                    hubAction("qwen3-embedding") {
+                        MaterialAlertDialogBuilder(this@MainActivity).setTitle("Activer les embeddings ?")
+                            .setMessage("Les passages de chaque document joint et tes questions seront envoyés au serveur d’embeddings, y compris avec un chat local. La recherche est limitée à 64 passages répartis dans le document.")
+                            .setNegativeButton("Annuler", null).setPositiveButton("Activer") { _, _ ->
+                                model.settings.embeddingEnabled = true; renderSettings()
+                            }.show()
+                    }
+                } else model.settings.embeddingEnabled = false
+            }
+        })
+        settingsPanel.addView(button("Voix Kokoro : ${model.settings.speechVoice}") {
+            MaterialAlertDialogBuilder(this).setTitle("Voix française du serveur")
+                .setItems(arrayOf("ff_siwis · féminin", "fm_gilles · masculin")) { _, index ->
+                    model.settings.speechVoice = if (index == 0) "ff_siwis" else "fm_gilles"; renderSettings()
+                }.show()
+        }.apply { isEnabled = !model.state.value.busy })
         settingsPanel.addView(text("Performances", 18f, true))
         val modeLabels = arrayOf("Auto · adaptatif", "CPU · performance", "CPU · équilibré", "Autonomie", "Vulkan · expérimental")
         val modes = arrayOf("auto", "cpu-performance", "balanced", "eco", "performance")
@@ -646,7 +790,7 @@ class MainActivity : AppCompatActivity() {
         val filename = EditText(this).apply { hint = "Nom du fichier"; setText("document.md"); isSingleLine = true }
         val prompt = EditText(this).apply { hint = "Que doit contenir ce fichier ?"; minLines = 3; gravity = Gravity.TOP }
         contents.addView(filename); contents.addView(prompt)
-        val dialog = MaterialAlertDialogBuilder(this).setTitle("Créer un fichier local")
+        val dialog = MaterialAlertDialogBuilder(this).setTitle("Créer un fichier · ${if (model.state.value.remote) "serveur" else "local"}")
             .setView(contents).setNegativeButton("Annuler", null).setPositiveButton("Créer", null).create()
         dialog.setOnShowListener {
             dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener {

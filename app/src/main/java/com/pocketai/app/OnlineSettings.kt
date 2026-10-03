@@ -46,6 +46,28 @@ class OnlineSettings(context: Context) {
     val hasImageKey: Boolean get() = preferences.contains("image_key")
     val hasFalKey: Boolean get() = preferences.contains("fal_key")
 
+    fun inferenceUrl(id: String): String = preferences.getString("hub_${id}_url", "").orEmpty()
+    fun inferenceModel(id: String): String = preferences.getString("hub_${id}_model", null)
+        ?: ModelHub.find(id).repository
+    fun inferenceKey(id: String): String = readSecret("hub_${id}_key")
+    fun configureInference(id: String, url: String, model: String, key: String?) {
+        ModelHub.find(id)
+        InferenceProtocol.baseUrl(url)
+        require(model.isNotBlank() && model.length <= 200 && !model.any { it.isISOControl() }) {
+            "Identifiant du modèle invalide."
+        }
+        if (key != null) writeSecret("hub_${id}_key", key)
+        check(preferences.edit().putString("hub_${id}_url", url.trim().trimEnd('/'))
+            .putString("hub_${id}_model", model.trim()).commit())
+    }
+
+    var embeddingEnabled: Boolean
+        get() = preferences.getBoolean("hub_embedding_enabled", false)
+        set(value) { preferences.edit().putBoolean("hub_embedding_enabled", value).apply() }
+    var speechVoice: String
+        get() = preferences.getString("hub_speech_voice", "ff_siwis").orEmpty()
+        set(value) { preferences.edit().putString("hub_speech_voice", value.trim()).apply() }
+
     private fun readSecret(name: String): String {
         val stored = preferences.getString(name, null) ?: return ""
         try {

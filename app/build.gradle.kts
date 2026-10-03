@@ -10,8 +10,8 @@ android {
         applicationId = "io.github.tchoutchoune.pocketai.preview"
         minSdk = 33
         targetSdk = 36
-        versionCode = 423
-        versionName = "4.2.3-assistant-tuned"
+        versionCode = 430
+        versionName = "4.3.0-model-hub"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk { abiFilters += "arm64-v8a" }
     }
