@@ -93,7 +93,7 @@ jobs:
       - name: Upload APK and verification evidence
         uses: actions/upload-artifact@v6
         with:
-          name: PocketAI-4.5.1-vulkan-probes-arm64-debug
+          name: PocketAI-4.5.2-vulkan-isolated-arm64-debug
           path: out/*
           retention-days: 14
           if-no-files-found: error
@@ -106,14 +106,14 @@ jobs:
           cat SHA256.txt
           mkdir transfers
           split --bytes=24M --numeric-suffixes=0 --suffix-length=2 \
-            PocketAI-4.5.1-vulkan-probes-arm64-debug.apk transfers/PocketAI.apk.part-
+            PocketAI-4.5.2-vulkan-isolated-arm64-debug.apk transfers/PocketAI.apk.part-
           test -s transfers/PocketAI.apk.part-00
           test ! -e transfers/PocketAI.apk.part-10
       - name: Upload APK transfer file 00
         if: ${{ hashFiles('out/transfers/PocketAI.apk.part-00') != '' }}
         uses: actions/upload-artifact@v6
         with:
-          name: PocketAI-4.5.1-vulkan-probes-transfer-00
+          name: PocketAI-4.5.2-vulkan-isolated-transfer-00
           path: out/transfers/PocketAI.apk.part-00
           retention-days: 14
           if-no-files-found: error
@@ -121,7 +121,7 @@ jobs:
         if: ${{ hashFiles('out/transfers/PocketAI.apk.part-01') != '' }}
         uses: actions/upload-artifact@v6
         with:
-          name: PocketAI-4.5.1-vulkan-probes-transfer-01
+          name: PocketAI-4.5.2-vulkan-isolated-transfer-01
           path: out/transfers/PocketAI.apk.part-01
           retention-days: 14
           if-no-files-found: error
@@ -129,7 +129,7 @@ jobs:
         if: ${{ hashFiles('out/transfers/PocketAI.apk.part-02') != '' }}
         uses: actions/upload-artifact@v6
         with:
-          name: PocketAI-4.5.1-vulkan-probes-transfer-02
+          name: PocketAI-4.5.2-vulkan-isolated-transfer-02
           path: out/transfers/PocketAI.apk.part-02
           retention-days: 14
           if-no-files-found: error
@@ -137,7 +137,7 @@ jobs:
         if: ${{ hashFiles('out/transfers/PocketAI.apk.part-03') != '' }}
         uses: actions/upload-artifact@v6
         with:
-          name: PocketAI-4.5.1-vulkan-probes-transfer-03
+          name: PocketAI-4.5.2-vulkan-isolated-transfer-03
           path: out/transfers/PocketAI.apk.part-03
           retention-days: 14
           if-no-files-found: error
@@ -145,7 +145,7 @@ jobs:
         if: ${{ hashFiles('out/transfers/PocketAI.apk.part-04') != '' }}
         uses: actions/upload-artifact@v6
         with:
-          name: PocketAI-4.5.1-vulkan-probes-transfer-04
+          name: PocketAI-4.5.2-vulkan-isolated-transfer-04
           path: out/transfers/PocketAI.apk.part-04
           retention-days: 14
           if-no-files-found: error
@@ -153,7 +153,7 @@ jobs:
         if: ${{ hashFiles('out/transfers/PocketAI.apk.part-05') != '' }}
         uses: actions/upload-artifact@v6
         with:
-          name: PocketAI-4.5.1-vulkan-probes-transfer-05
+          name: PocketAI-4.5.2-vulkan-isolated-transfer-05
           path: out/transfers/PocketAI.apk.part-05
           retention-days: 14
           if-no-files-found: error
@@ -161,7 +161,7 @@ jobs:
         if: ${{ hashFiles('out/transfers/PocketAI.apk.part-06') != '' }}
         uses: actions/upload-artifact@v6
         with:
-          name: PocketAI-4.5.1-vulkan-probes-transfer-06
+          name: PocketAI-4.5.2-vulkan-isolated-transfer-06
           path: out/transfers/PocketAI.apk.part-06
           retention-days: 14
           if-no-files-found: error
@@ -169,7 +169,7 @@ jobs:
         if: ${{ hashFiles('out/transfers/PocketAI.apk.part-07') != '' }}
         uses: actions/upload-artifact@v6
         with:
-          name: PocketAI-4.5.1-vulkan-probes-transfer-07
+          name: PocketAI-4.5.2-vulkan-isolated-transfer-07
           path: out/transfers/PocketAI.apk.part-07
           retention-days: 14
           if-no-files-found: error
@@ -177,7 +177,7 @@ jobs:
         if: ${{ hashFiles('out/transfers/PocketAI.apk.part-08') != '' }}
         uses: actions/upload-artifact@v6
         with:
-          name: PocketAI-4.5.1-vulkan-probes-transfer-08
+          name: PocketAI-4.5.2-vulkan-isolated-transfer-08
           path: out/transfers/PocketAI.apk.part-08
           retention-days: 14
           if-no-files-found: error
@@ -185,7 +185,7 @@ jobs:
         if: ${{ hashFiles('out/transfers/PocketAI.apk.part-09') != '' }}
         uses: actions/upload-artifact@v6
         with:
-          name: PocketAI-4.5.1-vulkan-probes-transfer-09
+          name: PocketAI-4.5.2-vulkan-isolated-transfer-09
           path: out/transfers/PocketAI.apk.part-09
           retention-days: 14
           if-no-files-found: error

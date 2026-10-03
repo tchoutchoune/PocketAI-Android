@@ -6,6 +6,27 @@
 #include <vector>
 
 namespace pocketai {
+struct ActivationStats {
+    size_t nan = 0;
+    size_t infinity = 0;
+    size_t positive_infinity = 0;
+    double max_abs = 0;
+    size_t nonfinite() const { return nan + infinity; }
+};
+
+inline ActivationStats activation_stats(const float *values, size_t count) {
+    ActivationStats result;
+    for (size_t i = 0; i < count; ++i) {
+        if (std::isnan(values[i])) ++result.nan;
+        else if (!std::isfinite(values[i])) {
+            ++result.infinity;
+            if (values[i] > 0) ++result.positive_infinity;
+        }
+        else result.max_abs = std::max(result.max_abs, std::abs(double(values[i])));
+    }
+    return result;
+}
+
 enum LogitFailure {
     INVALID_LOGITS = 1, NONFINITE_METRICS = 2, JS_DIVERGENCE = 4,
     RELATIVE_RMSE = 8, TOP_TOKEN_MARGIN = 16,

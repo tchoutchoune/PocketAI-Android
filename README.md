@@ -5,7 +5,7 @@ Assistant Android avec modèles GGUF locaux et catalogue de 21 modèles pour le 
 ## Installer et commencer
 
 - **Android 13 ou supérieur, téléphone ARM64** (`arm64-v8a`).
-- Dans les [Actions GitHub](https://github.com/tchoutchoune/PocketAI-Android/actions), ouvrir un build réussi de **Build PocketAI 4** sur la branche preview `codex/dynamic-context-budget`, télécharger l’artefact **PocketAI-4.5.1-vulkan-probes-arm64-debug**, extraire le ZIP et installer `PocketAI-4.5.1-vulkan-probes-arm64-debug.apk`. GitHub peut demander une connexion pour télécharger les artefacts.
+- Dans les [Actions GitHub](https://github.com/tchoutchoune/PocketAI-Android/actions), ouvrir un build réussi de **Build PocketAI 4** sur la branche preview `codex/dynamic-context-budget`, télécharger l’artefact **PocketAI-4.5.2-vulkan-isolated-arm64-debug**, extraire le ZIP et installer `PocketAI-4.5.2-vulkan-isolated-arm64-debug.apk`. GitHub peut demander une connexion pour télécharger les artefacts.
 - Autoriser l’installation depuis la source choisie si Android le demande. Cet APK est un build de développement signé avec une clé de débogage.
 
 La preview utilise le paquet **`io.github.tchoutchoune.pocketai.preview`** et la même signature que la preview 4.2.3 : elle met à jour cette application en conservant ses données. Les applications d’un autre paquet restent séparées.
@@ -30,16 +30,17 @@ Dans **Réglages**, choisir **Auto · adaptatif**, **CPU · performance**, **CPU
 
 La déclaration Vulkan d’Android permet de tenter l’accélération GPU. Le moteur vérifie ensuite le backend et peut revenir au CPU si le GPU ou ses allocations échouent. **Voir le matériel et le moteur** indique le backend réellement actif, les couches GPU, les threads et les mesures de génération. La présence de Vulkan ne garantit pas un gain de vitesse sur chaque téléphone.
 
-## Vulkan : contrôles détaillés 4.5.1
+## Vulkan : profil isolé 4.5.2
 
 Le diagnostic du OnePlus CPH2747 identifie un Adreno 840. Un ancien essai Vulkan à 16 couches produisait une sortie corrompue ; la présence des bibliothèques et de Vulkan 1.4 ne prouve donc pas la fiabilité de l’inférence. Cette version propose une correction de compatibilité à vérifier sur l’appareil, sans annoncer de gain non mesuré.
 
-- Détection native du GPU et empreinte du pilote avant l’initialisation ggml. Sur Adreno 840 : calcul F32, matrices coopératives/dot2 et exécution asynchrone désactivées, soumissions sérialisées et Flash Attention désactivée. Le CPU conserve son chemin habituel.
+- Détection native du GPU et empreinte du pilote avant l’initialisation ggml. Sur Adreno 840 : calcul F32, matrices coopératives/dot2/MMVQ et calculs entiers désactivés, aucune fusion, réorganisation du graphe ou réutilisation des descripteurs. Les soumissions synchrones traitent un nœud à la fois. Le cache KV passe en F32 sur le CPU, l’attention reste sur le CPU et les opérations GPU opportunistes sont désactivées ; les couches de poids restent partiellement sur le GPU. Flash Attention est désactivée. Ce profil isole les chemins encore actifs après les valeurs non finies constatées en 4.5.1 ; il peut être plus lent et ne prouve pas une correction du pilote. Le CPU conserve son chemin habituel.
 - Une copie de compilation isolée du llama.cpp épinglé remplace `unpack8` par des décalages 32 bits et des conversions signées explicites, pour éviter les bitcasts d’octets signalés sur certains pilotes Qualcomm. Le test de shader vérifie le SPIR-V généré ; la correction sur Adreno 840 reste à confirmer avec les mesures du téléphone.
 - **Réglages → Comparer et optimiser CPU / Vulkan** : trois textes publics fixes produisent douze distributions de scores CPU. Chaque configuration GPU doit les reproduire dans les tolérances avant et après un benchmark indépendant. Un contrôle CPU contre sa propre référence doit réussir avant les essais GPU. Six essais combinent 16 ou toutes les couches avec des lots physiques de 32 ou 64, puis 16 ou 4 couches avec un lot physique d’un seul token ; le batch logique reste séparé. Les deux derniers essais explorent un autre chemin de calcul, sans garantie de correction ni de vitesse. Le contexte GPU initial est limité à 2 048 tokens.
 - Les refus conservent leur cause : allocation, code de décodage, scores non finis ou divergence numérique. Les écarts JS/RMS, les critères échoués et la première sonde fautive sont journalisés avant le retour au CPU. Le dernier essai reste visible dans le diagnostic du même modèle ; seules des erreurs numériques justifient une exclusion persistante du GPU. Aucun texte de conversation n’est utilisé.
+- Après le premier refus pour scores non finis d’une comparaison, une sonde publique est rejouée dans un contexte indépendant avec observation des sorties GPU F32. La trace conserve le nom technique, l’opération et la forme du premier tenseur NaN/+Inf observé, sans enregistrer son contenu ; les -Inf de masque ne sont pas pris pour une erreur. Limites : 20 secondes, 64 Mio lus, 8 Mio par tenseur. L’observation insère des synchronisations : son résultat ne valide jamais un profil et n’entre jamais dans les mesures de vitesse. Aucun callback de trace n’est installé pour le chat ou le benchmark.
 - Vulkan est retenu si la génération atteint au moins le CPU, la préparation reste à au moins 90 % du CPU, et le score pondéré atteint 105 %. Ces courts tests ne couvrent pas toutes les conversations ni une utilisation prolongée. Les scores non finis et les répétitions dégénérées déclenchent encore un retour au CPU pendant l’utilisation.
-- Seul un profil GPU validé et effectivement retenu pour son gain est mémorisé. Le résultat est lié au modèle (taille/date), à la version du correctif, à Android et au pilote. Une mise à jour invalide le réglage. Un modèle revenu silencieusement au CPU est exclu des résultats GPU. La chauffe ou l’économie d’énergie interrompent la comparaison ; la conversation est conservée.
+- Seul un profil GPU validé et effectivement retenu pour son gain est mémorisé. Le résultat est lié au modèle (taille/date), à la version du correctif, à Android et au pilote. Une mise à jour d’Android, du pilote ou du correctif de compatibilité invalide le réglage. Le profil isolé v2 invalide les anciennes recettes et exclusions v1. Un modèle revenu silencieusement au CPU est exclu des résultats GPU. La chauffe ou l’économie d’énergie interrompent la comparaison ; la conversation est conservée.
 
 Installer la mise à jour, désactiver l’économie d’énergie, laisser refroidir l’appareil, charger le GGUF puis lancer la comparaison dans Réglages. Elle peut prendre plusieurs minutes et charger le modèle plusieurs fois. Exporter ensuite le diagnostic pour vérifier les couches réellement actives, les validations et les tokens/s.
 
@@ -95,7 +96,7 @@ Le script de préparation installe dans le répertoire d’outils le **JDK 17**,
 
 `scripts/build.sh` construit l’APK ARM64 avec CPU et Vulkan, lance les tests unitaires de `app` et `lib`, puis contrôle le ZIP, la signature, le paquet et les bibliothèques natives. Résultats :
 
-- `out/PocketAI-4.5.1-vulkan-probes-arm64-debug.apk` et `out/SHA256.txt` ;
+- `out/PocketAI-4.5.2-vulkan-isolated-arm64-debug.apk` et `out/SHA256.txt` ;
 - preuves de vérification dans `out/` ;
 - rapports dans `app/build/reports/tests/` et `lib/build/reports/tests/`.
 

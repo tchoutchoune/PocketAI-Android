@@ -11,6 +11,13 @@ int main(int argc, char **argv) {
         return 0;
     }
     pocketai::GenerationBudget budget;
+    const float health[] = {-12.5f, 3.0f, std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity()};
+    const auto stats = pocketai::activation_stats(health, 5);
+    assert(stats.nan == 1 && stats.infinity == 2 && stats.nonfinite() == 3);
+    assert(stats.positive_infinity == 1);
+    assert(stats.max_abs == 12.5);
+    assert(pocketai::activation_stats(nullptr, 0).nonfinite() == 0);
     const std::vector<float> reference{-4.0f, 0.0f, 3.0f, 2.0f};
     const std::vector<float> shifted{6.0f, 10.0f, 13.0f, 12.0f};
     const std::vector<float> close{-3.999f, 0.001f, 3.002f, 1.999f};

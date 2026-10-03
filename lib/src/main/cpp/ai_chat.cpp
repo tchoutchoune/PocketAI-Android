@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include <cstdlib>
+#include <cstring>
 #include <sys/stat.h>
 #include "chat.h"
 #include "common.h"
@@ -52,6 +53,8 @@ pocketai::VulkanProbe vulkan_probe;
 std::string validation_summary = "not compared with CPU";
 std::string last_validation_record;
 std::string last_validation_path;
+std::string validation_trace_record;
+bool validation_trace_attempted = false;
 struct ValidationProbe {
     std::vector<llama_token> input;
     std::vector<llama_token> continuation;
@@ -272,7 +275,73 @@ bool load_selected_model(bool use_gpu) {
     return model != nullptr;
 }
 
-llama_context *new_context(int requested = 0) {
+struct OperatorTrace {
+    static constexpr size_t MAX_BYTES = 64 * 1024 * 1024;
+    static constexpr size_t MAX_TENSOR_BYTES = 8 * 1024 * 1024;
+    const int64_t started = ggml_time_us();
+    size_t bytes = 0;
+    int tensors = 0, skipped = 0;
+    bool limited = false, failed_read = false, found = false;
+    std::string tensor, operation, previous_tensor, previous_operation;
+    int64_t shape[4]{};
+    pocketai::ActivationStats stats;
+    bool expired() const { return ggml_time_us() - started > 20 * 1000 * 1000; }
+};
+
+std::string diagnostic_name(const char *name) {
+    std::string result;
+    for (size_t i = 0; name && name[i] && i < 64; ++i) {
+        const char c = name[i];
+        result += ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                   (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.') ? c : '_';
+    }
+    return result;
+}
+
+bool trace_activation(ggml_tensor *tensor, bool ask, void *opaque) {
+    auto &trace = *static_cast<OperatorTrace *>(opaque);
+    if (trace.expired()) trace.limited = true;
+    if (trace.limited || trace.found || cancelled.load()) return ask;
+    // Only GPU compute outputs from a fixed public probe are inspected. Mask
+    // inputs may legitimately contain -Inf, so views/copies/input nodes are excluded.
+    const char *buffer = tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : nullptr;
+    const bool compute = tensor->op == GGML_OP_MUL_MAT || tensor->op == GGML_OP_RMS_NORM ||
+        tensor->op == GGML_OP_NORM || tensor->op == GGML_OP_ROPE || tensor->op == GGML_OP_SOFT_MAX ||
+        tensor->op == GGML_OP_ADD || tensor->op == GGML_OP_MUL || tensor->op == GGML_OP_UNARY ||
+        tensor->op == GGML_OP_GLU || tensor->op == GGML_OP_SCALE;
+    if (!compute || !buffer || !std::strstr(buffer, "Vulkan") ||
+        tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor)) return !ask;
+    const size_t bytes = ggml_nbytes(tensor);
+    if (!bytes || bytes > OperatorTrace::MAX_TENSOR_BYTES) { if (ask) ++trace.skipped; return !ask; }
+    if (bytes > OperatorTrace::MAX_BYTES - trace.bytes) { trace.limited = true; return ask; }
+    if (ask) return true;
+    try {
+        std::vector<float> values(bytes / sizeof(float));
+        ggml_backend_tensor_get(tensor, values.data(), 0, bytes);
+        trace.bytes += bytes;
+        ++trace.tensors;
+        const auto stats = pocketai::activation_stats(values.data(), values.size());
+        // Negative infinity can be a valid attention mask; NaN/+Inf cannot.
+        if (stats.nan || stats.positive_infinity) {
+            trace.found = true;
+            trace.tensor = diagnostic_name(tensor->name);
+            trace.operation = diagnostic_name(ggml_op_name(tensor->op));
+            std::copy(tensor->ne, tensor->ne + 4, trace.shape);
+            trace.stats = stats;
+            return false;
+        }
+        trace.previous_tensor = diagnostic_name(tensor->name);
+        trace.previous_operation = diagnostic_name(ggml_op_name(tensor->op));
+    } catch (...) { trace.failed_read = true; return false; }
+    return true;
+}
+
+bool abort_operator_trace(void *opaque) {
+    auto &trace = *static_cast<OperatorTrace *>(opaque);
+    return cancelled.load() || trace.limited || trace.found || trace.failed_read || trace.expired();
+}
+
+llama_context *new_context(int requested = 0, OperatorTrace *trace = nullptr) {
     auto params = llama_context_default_params();
     const int trained = llama_model_n_ctx_train(model);
     params.n_ctx = std::min(requested ? requested : options.context, trained > 0 ? trained : options.context);
@@ -283,14 +352,82 @@ llama_context *new_context(int requested = 0) {
     params.n_threads_batch = std::max(1, std::min(options.threads, batch_thread_limit.load(std::memory_order_relaxed)));
     params.offload_kqv = gpu_layers > 0;
     params.op_offload = gpu_layers > 0;
+    if (gpu_layers > 0 && vulkan_probe.adreno840) {
+        // F32 matmul alone does not isolate FP16 KV transfers or attention kernels.
+        params.type_k = params.type_v = GGML_TYPE_F32;
+        params.offload_kqv = false;
+        params.op_offload = false;
+    }
     params.flash_attn_type = gpu_layers > 0 && vulkan_probe.adreno840
         ? LLAMA_FLASH_ATTN_TYPE_DISABLED : LLAMA_FLASH_ATTN_TYPE_AUTO;
     params.abort_callback = abort_decode;
     params.abort_callback_data = nullptr;
+    if (trace) {
+        params.cb_eval = trace_activation;
+        params.cb_eval_user_data = trace;
+        params.abort_callback = abort_operator_trace;
+        params.abort_callback_data = trace;
+    }
     params.no_perf = false;
     auto *created = llama_init_from_model(model, params);
     attach_cpu_threadpool(created);
     return created;
+}
+
+std::string trace_fixed_probe(const ValidationProbe &probe, int last_step) {
+    OperatorTrace trace;
+    struct Resources {
+        llama_context *ctx = nullptr;
+        llama_batch batch{};
+        bool allocated = false;
+        ~Resources() { if (allocated) llama_batch_free(batch); if (ctx) llama_free(ctx); }
+    } resources;
+    int status = 0;
+    size_t final_nonfinite = 0;
+    const char *reason = "trace_context_unavailable";
+    try {
+        resources.ctx = new_context(512, &trace);
+        if (!resources.ctx) throw std::runtime_error("trace context");
+        resources.batch = llama_batch_init(options.batch, 0, 1);
+        resources.allocated = true;
+        if (!resources.batch.token || !resources.batch.pos || !resources.batch.n_seq_id ||
+            !resources.batch.seq_id || !resources.batch.logits) throw std::runtime_error("trace batch");
+        apply_threads(resources.ctx);
+        for (size_t offset = 0; offset < probe.input.size();) {
+            common_batch_clear(resources.batch);
+            const size_t count = std::min(size_t(options.batch), probe.input.size() - offset);
+            for (size_t i = 0; i < count; ++i) common_batch_add(resources.batch, probe.input[offset + i], offset + i, {0}, offset + i + 1 == probe.input.size());
+            status = llama_decode(resources.ctx, resources.batch);
+            if (status) break;
+            offset += count;
+        }
+        const size_t continuation = std::min(size_t(std::max(0, last_step)), probe.continuation.size());
+        for (size_t step = 0; !status && step < continuation; ++step) {
+            common_batch_clear(resources.batch);
+            common_batch_add(resources.batch, probe.continuation[step], probe.input.size() + step, {0}, true);
+            status = llama_decode(resources.ctx, resources.batch);
+        }
+        reason = trace.found ? "nonfinite_gpu_tensor" : trace.failed_read ? "trace_read_failed" :
+            trace.limited || trace.expired() ? "trace_budget_reached" : cancelled.load() ? "cancelled" :
+            status ? "trace_decode_failed" : "instrumented_probe_completed";
+        if (!status) {
+            const float *logits = llama_get_logits_ith(resources.ctx, -1);
+            if (logits) {
+                final_nonfinite = pocketai::activation_stats(logits, llama_vocab_n_tokens(llama_model_get_vocab(model))).nonfinite();
+                if (final_nonfinite) reason = "instrumented_probe_nonfinite_logits";
+            } else reason = "trace_logits_unavailable";
+        }
+    } catch (...) { reason = "trace_allocation_failed"; }
+    std::ostringstream out;
+    out << "{\"reason\":\"" << reason << "\",\"gpuLayers\":" << gpu_layers << ",\"microBatch\":" << options.micro_batch
+        << ",\"observedTensors\":" << trace.tensors << ",\"bytesRead\":" << trace.bytes << ",\"skippedTensors\":" << trace.skipped
+        << ",\"decodeStatus\":" << status << ",\"durationMs\":" << (ggml_time_us() - trace.started) / 1000
+        << ",\"finalNonfiniteCount\":" << final_nonfinite
+        << ",\"firstBadTensor\":\"" << trace.tensor << "\",\"operation\":\"" << trace.operation
+        << "\",\"shape\":[" << trace.shape[0] << ',' << trace.shape[1] << ',' << trace.shape[2] << ',' << trace.shape[3]
+        << "],\"nanCount\":" << trace.stats.nan << ",\"infinityCount\":" << trace.stats.infinity
+        << ",\"previousHealthyTensor\":\"" << trace.previous_tensor << "\",\"previousHealthyOperation\":\"" << trace.previous_operation << "\"}";
+    return out.str();
 }
 
 int desired_context_size() {
@@ -727,9 +864,12 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_init(JNIEnv *env, jobject, jstr
         vulkan_probe = pocketai::probe_vulkan();
         if (vulkan_probe.adreno840) {
             for (const auto *flag : {"GGML_VK_DISABLE_F16", "GGML_VK_DISABLE_COOPMAT", "GGML_VK_DISABLE_COOPMAT2",
-                                     "GGML_VK_DISABLE_DOT2", "GGML_VK_DISABLE_ASYNC", "GGML_VK_SERIALIZE_SUBMISSIONS"}) {
+                                     "GGML_VK_DISABLE_DOT2", "GGML_VK_DISABLE_ASYNC", "GGML_VK_SERIALIZE_SUBMISSIONS",
+                                     "GGML_VK_DISABLE_FUSION", "GGML_VK_DISABLE_GRAPH_OPTIMIZE", "GGML_VK_DISABLE_DESCRIPTOR_REUSE",
+                                     "GGML_VK_DISABLE_INTEGER_DOT_PRODUCT", "GGML_VK_DISABLE_MMVQ"}) {
                 setenv(flag, "1", 1);
             }
+            setenv("GGML_VK_MAX_NODES_PER_SUBMIT", "1", 1);
         }
         common_log_set_verbosity_thold(-1);
         llama_log_set(private_backend_log, nullptr);
@@ -1145,13 +1285,15 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_nativeDiagnostics(JNIEnv *env, 
     out.precision(3);
     out << "Vulkan GPU: " << (gpu_description.empty() ? "unavailable (device/driver unsupported or backend absent)" : gpu_description) << '\n';
     out << "Vulkan driver: " << (vulkan_probe.fingerprint.empty() ? "unavailable" : vulkan_probe.fingerprint) << '\n';
-    out << "Vulkan compatibility: " << (vulkan_probe.adreno840 ? "Adreno 840 FP32, scalar matmul, synchronous queues, flash attention off" : "standard") << '\n';
+    out << "Vulkan compatibility: " << (vulkan_probe.adreno840 ? "Adreno 840 isolated v2: FP32 KV, CPU attention, scalar matmul, no fusion/graph reorder/descriptor reuse/integer dot/MMVQ, synchronous one-node submissions, flash attention off" : "standard") << '\n';
+    out << "Vulkan operator trace (fixed public probe only): " << (validation_trace_record.empty() || last_validation_path != model_path ? "not run" : validation_trace_record) << '\n';
     out << "Current context validation: " << validation_summary << '\n';
     out << "Last probe attempt for this model: "
         << (last_validation_path == model_path && !last_validation_record.empty() ? last_validation_record : "none") << '\n';
     out << "Requested: " << (options.gpu_layers ? "Vulkan" : "CPU") << "; active: " << (context ? gpu_layers > 0 ? "Vulkan + CPU" : "CPU" : "no model") << '\n';
     out << "GPU layers: " << gpu_layers << "; fallback: " << (fallback.empty() ? "none" : fallback) << '\n';
     out << "Micro-batch: " << (context ? llama_n_ubatch(context) : options.micro_batch) << '\n';
+    out << "Attention policy: " << (gpu_layers > 0 && vulkan_probe.adreno840 ? "F32 host KV; CPU attention; opportunistic op offload disabled" : "standard") << '\n';
     out << "Threads: " << active_threads << " / " << options.threads << "; runtime limit: " << thread_limit.load()
         << "; prompt threads: " << (context ? llama_n_threads_batch(context) : 0) << '\n';
     out << "CPU threadpool: " << (cpu_threadpool ? "persistent" : "automatic") << '\n';
@@ -1292,7 +1434,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_validateBackendNative(JNIEnv *e
     } resources;
     int checked = 0, top_matches = 0, failure_mask = 0, failed_comparisons = 0;
     int probe_index = -1, step_index = -1, first_bad_probe = -1, first_bad_step = -1;
-    int decode_status = 0, nonfinite_count = 0;
+    int decode_status = 0, nonfinite_count = 0, nan_count = 0, infinity_count = 0;
     double max_js = 0, max_rmse = 0;
     const char *stage = "model_check";
     const char *reason = "model_unavailable";
@@ -1314,7 +1456,9 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_validateBackendNative(JNIEnv *e
             << ",\"topMatches\":" << top_matches << ",\"failureMask\":" << failure_mask
             << ",\"failedComparisons\":" << failed_comparisons << ",\"firstFailureProbe\":" << first_bad_probe
             << ",\"firstFailureStep\":" << first_bad_step << ",\"probe\":" << probe_index << ",\"step\":" << step_index
-            << ",\"decodeStatus\":" << decode_status << ",\"nonfiniteCount\":" << nonfinite_count << "}";
+            << ",\"decodeStatus\":" << decode_status << ",\"nonfiniteCount\":" << nonfinite_count
+            << ",\"nanCount\":" << nan_count << ",\"infinityCount\":" << infinity_count
+            << ",\"gpuOperatorTrace\":" << (validation_trace_record.empty() ? "null" : validation_trace_record) << "}";
         last_validation_record = out.str();
         last_validation_path = model_path;
         return android_text(env, last_validation_record);
@@ -1328,6 +1472,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_validateBackendNative(JNIEnv *e
         const auto key = model_path + "|" + std::to_string(metadata.st_size) + "|" +
             std::to_string(metadata.st_mtim.tv_sec) + "|" + std::to_string(metadata.st_mtim.tv_nsec) + "|" + std::to_string(vocab_size);
         if (capture) {
+            validation_trace_record.clear();
+            validation_trace_attempted = false;
             stage = "reference_input"; reason = "reference_input_failed";
             validation_reference.clear();
             validation_model_key.clear();
@@ -1379,7 +1525,12 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_validateBackendNative(JNIEnv *e
                 if (!logits) throw std::runtime_error("missing probe logits");
                 if (!pocketai::finite_logits(logits, vocab_size)) {
                     reason = "nonfinite_logits";
-                    for (int i = 0; i < vocab_size; ++i) if (!std::isfinite(logits[i])) ++nonfinite_count;
+                    const auto stats = pocketai::activation_stats(logits, vocab_size);
+                    nan_count = stats.nan;
+                    infinity_count = stats.infinity;
+                    nonfinite_count = stats.nonfinite();
+                    failure_mask |= pocketai::INVALID_LOGITS;
+                    first_bad_probe = probe_index; first_bad_step = step;
                     throw std::runtime_error("nonfinite probe");
                 }
                 if (capture) {
@@ -1420,6 +1571,15 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_validateBackendNative(JNIEnv *e
         if (capture) { validation_reference.clear(); validation_model_key.clear(); }
         validation_summary = cancelled.load() ? "comparison cancelled" : "comparison unavailable or failed";
         if (cancelled.load()) reason = "cancelled";
+        // Observation inserts synchronization and changes execution. Never use
+        // its result to validate a GPU recipe or include it in benchmark timing.
+        if (!capture && gpu_layers > 0 && !cancelled.load() && !validation_trace_attempted &&
+            std::string(reason) == "nonfinite_logits" && probe_index >= 0 && size_t(probe_index) < validation_reference.size()) {
+            validation_trace_attempted = true;
+            if (resources.ctx) { llama_free(resources.ctx); resources.ctx = nullptr; }
+            try { validation_trace_record = trace_fixed_probe(validation_reference[probe_index], step_index); }
+            catch (...) { validation_trace_record = "{\"reason\":\"trace_unavailable\"}"; }
+        }
         return record(false);
     }
 }
@@ -1428,6 +1588,8 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_shutdown(JNIEnv *, jobject) {
     last_validation_record.clear();
     last_validation_path.clear();
+    validation_trace_record.clear();
+    validation_trace_attempted = false;
     validation_reference.clear();
     validation_model_key.clear();
     llama_backend_free();
