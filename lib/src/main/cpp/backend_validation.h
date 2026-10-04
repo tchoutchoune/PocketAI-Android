@@ -35,6 +35,9 @@ struct LogitComparison {
     bool passed = false;
     double js = 0;
     double relative_rmse = 0;
+    // Diagnostic only: none of these fields changes the acceptance thresholds.
+    double mean_offset = 0, reference_std = 0, actual_std = 0;
+    double max_centered_delta = 0, probability_log_rmse = 0, tail_error_share = 0;
     bool top_match = false;
     int failures = INVALID_LOGITS;
 };
@@ -60,11 +63,13 @@ inline LogitComparison compare_logits(const std::vector<float> &reference, const
     }
     mean_delta /= count;
     mean_ref /= count;
+    result.mean_offset = mean_delta;
     for (size_t i = 0; i < count; ++i) {
         sum_a += std::exp(double(reference[i]) - reference[top_a]);
         sum_b += std::exp(double(actual[i]) - actual[top_b]);
     }
-    double error = 0, variance = 0;
+    const double log_sum_a = std::log(sum_a), log_sum_b = std::log(sum_b);
+    double error = 0, variance = 0, actual_variance = 0, probability_error = 0, tail_error = 0;
     for (size_t i = 0; i < count; ++i) {
         const double a = std::exp(double(reference[i]) - reference[top_a]) / sum_a;
         const double b = std::exp(double(actual[i]) - actual[top_b]) / sum_b;
@@ -73,10 +78,22 @@ inline LogitComparison compare_logits(const std::vector<float> &reference, const
         if (b > 0) result.js += 0.5 * b * std::log(b / mixture);
         const double delta = double(actual[i]) - reference[i] - mean_delta;
         error += delta * delta;
+        result.max_centered_delta = std::max(result.max_centered_delta, std::abs(delta));
+        if (std::max(a, b) < 1e-8) tail_error += delta * delta;
+        // Log probabilities are also invariant to a constant logit offset.
+        const double probability_delta = (double(actual[i]) - actual[top_b] - log_sum_b) -
+            (double(reference[i]) - reference[top_a] - log_sum_a);
+        probability_error += mixture * probability_delta * probability_delta;
         const double centered = reference[i] - mean_ref;
         variance += centered * centered;
+        const double actual_centered = double(actual[i]) - mean_ref - mean_delta;
+        actual_variance += actual_centered * actual_centered;
     }
     result.relative_rmse = std::sqrt(error / std::max(variance, double(count) * 1e-6));
+    result.reference_std = std::sqrt(variance / count);
+    result.actual_std = std::sqrt(actual_variance / count);
+    result.probability_log_rmse = std::sqrt(probability_error);
+    result.tail_error_share = error > 0 ? tail_error / error : 0;
     result.top_match = top_a == top_b;
     const bool close_top = reference[top_a] - reference[top_b] <= 0.35 && actual[top_b] - actual[top_a] <= 0.35;
     result.failures = 0;

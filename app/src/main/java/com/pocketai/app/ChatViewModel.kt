@@ -672,12 +672,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             append(" · scores=").append(data.optInt("samples"))
             if (data.has("maxJs")) append(" · JS=").append(data.opt("maxJs"))
             if (data.has("maxRelativeRmse")) append(" · RMS relatif=").append(data.opt("maxRelativeRmse"))
+            if (data.has("maxProbabilityLogRmse")) append(" · RMS log-probabilité=").append(data.opt("maxProbabilityLogRmse"))
+            if (data.has("probePolicy")) append(" · profil numérique=").append(data.optString("probePolicy"))
             if (data.has("failureMask")) append(" · critères=").append(data.optInt("failureMask"))
             if (data.has("decodeStatus")) append(" · décodage=").append(data.optInt("decodeStatus"))
             if (data.has("nonfiniteCount")) append(" · scores non finis=").append(data.optInt("nonfiniteCount"))
         }
-        suspend fun validate(capture: Boolean, phase: String): JSONObject {
-            val data = JSONObject(inference.validateBackend(capture))
+        suspend fun validate(capture: Boolean, phase: String, comparableContext: Boolean = true): JSONObject {
+            val data = JSONObject(inference.validateBackend(capture, comparableContext))
             currentCoroutineContext().ensureActive()
             // Only fixed public probes are evaluated: no conversation or credentials.
             logs.event("backend_validation phase=$phase options=$activeOptions result=$data")
@@ -694,6 +696,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             require(passed(reference)) { "Référence CPU indisponible : ${validationDetails(reference)}" }
             val cpuControl = validate(false, "Contrôle CPU contre CPU")
             require(passed(cpuControl)) { "La référence CPU ne se reproduit pas ; GPU non évalué : ${validationDetails(cpuControl)}" }
+            if (reference.optString("probePolicy") == "adreno840-f32-cpu-attention") {
+                // Diagnostic only: this tests KV/attention precision on CPU, not
+                // GPU correctness. GPU validation still requires matched settings.
+                validate(false, "CPU standard contre CPU au profil GPU", comparableContext = false)
+            }
             suspend fun measure(options: InferenceOptions): BackendMeasurement {
                 requireCool()
                 val output = inference.bench(128, 16, 1, 2)

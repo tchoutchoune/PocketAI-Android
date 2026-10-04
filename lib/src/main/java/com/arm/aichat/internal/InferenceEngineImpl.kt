@@ -44,7 +44,7 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
 
     private external fun init(nativeLibDir: String)
     private external fun configureNative(threads: Int, contextSize: Int, batchSize: Int, gpuLayers: Int, temperature: Float, microBatchSize: Int)
-    private external fun validateBackendNative(captureCpuReference: Boolean): String
+    private external fun validateBackendNative(captureCpuReference: Boolean, comparableContext: Boolean): String
     private external fun load(modelPath: String): Int
     private external fun prepare(): Int
     private external fun nativeDiagnostics(): String
@@ -241,13 +241,13 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
         }
     }
 
-    override suspend fun validateBackend(captureCpuReference: Boolean): String = withContext(dispatcher) {
+    override suspend fun validateBackend(captureCpuReference: Boolean, comparableContext: Boolean): String = withContext(dispatcher) {
         awaitInitialization()
         mutex.withLock {
             check(!closing && !destroyed && modelLoaded && _state.value is InferenceEngine.State.ModelReady)
             startOperation()
             _state.value = InferenceEngine.State.Benchmarking
-            try { validateBackendNative(captureCpuReference) }
+            try { validateBackendNative(captureCpuReference, comparableContext) }
             finally { _state.value = InferenceEngine.State.ModelReady }
         }
     }

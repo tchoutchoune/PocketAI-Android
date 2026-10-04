@@ -177,10 +177,35 @@ class VulkanBackendIntegrationTest {
         assertFalse(app.getSharedPreferences("pocketai", 0).all.keys.any { it.startsWith("vulkan_recipe_") })
     }
 
+    @Test fun adrenoProbesAlignPoliciesAndMeasureStandardCpuDriftSeparately() = runBlocking {
+        val engine = FakeEngine(alignedPolicy = true, standardCpuMismatch = true)
+        inject(engine)
+        model.compareVulkanBackends(file)
+        assertEquals(listOf(true, true, false), engine.cpuProbePolicies)
+        assertTrue(engine.gpuProbePolicies.all { it })
+        assertEquals(13, engine.gpuProbePolicies.size)
+        assertEquals(2, engine.cpuValidations)
+        assertEquals("performance", model.performanceMode)
+        assertEquals(0, model.gpuBlacklistCount)
+        assertTrue(model.state.value.backendComparison.contains("CPU standard contre CPU au profil GPU : refusé"))
+    }
+
+    @Test fun alignedGpuMismatchStillPreventsBenchmarkAndCaching() = runBlocking {
+        val engine = FakeEngine(alignedPolicy = true, gpuFailureReason = "numeric_mismatch")
+        inject(engine)
+        model.compareVulkanBackends(file)
+        assertEquals(listOf(true, true, false), engine.cpuProbePolicies)
+        assertEquals(1, engine.benchmarks)
+        assertEquals("cpu-performance", model.performanceMode)
+        assertEquals(1, model.gpuBlacklistCount)
+        assertFalse(app.getSharedPreferences("pocketai", 0).all.keys.any { it.startsWith("vulkan_recipe_") })
+    }
+
     private class FakeEngine(val fallback: Boolean = false, val cancelValidation: Boolean = false,
         val gpuFailureReason: String? = null, val cpuSelfFailure: Boolean = false,
         val rescueOnly: Boolean = false, val slowerGpu: Boolean = false,
-        val finalFailureReason: String? = null) : InferenceEngine {
+        val finalFailureReason: String? = null, val alignedPolicy: Boolean = false,
+        val standardCpuMismatch: Boolean = false) : InferenceEngine {
         override val state = MutableStateFlow<InferenceEngine.State>(InferenceEngine.State.ModelReady)
         private var options = InferenceOptions()
         var benchmarks = 0
@@ -188,6 +213,8 @@ class VulkanBackendIntegrationTest {
         var cpuValidations = 0
         var gpuLoads = 0
         var cleanups = 0
+        val cpuProbePolicies = mutableListOf<Boolean>()
+        val gpuProbePolicies = mutableListOf<Boolean>()
         override suspend fun configure(options: InferenceOptions) { this.options = options }
         private fun layers() = if (fallback) 0 else options.gpuLayers.coerceAtMost(36)
         override suspend fun diagnostics() = "Vulkan driver: Adreno test driver\nGPU layers: ${layers()}\nContext: ${options.contextSize}\nMicro-batch: ${options.microBatchSize}"
@@ -202,7 +229,8 @@ class VulkanBackendIntegrationTest {
             if (layers() > 0 && slowerGpu) return "Prompt: 20 tokens/s\nGeneration: 10 tokens/s"
             return if (layers() > 0) "Prompt: 80 tokens/s\nGeneration: ${if (layers() == 36) 24 else 20} tokens/s" else "Prompt: 50 tokens/s\nGeneration: 12 tokens/s"
         }
-        override suspend fun validateBackend(captureCpuReference: Boolean): String {
+        override suspend fun validateBackend(captureCpuReference: Boolean, comparableContext: Boolean): String {
+            if (layers() > 0) gpuProbePolicies += comparableContext else cpuProbePolicies += comparableContext
             if (!captureCpuReference) {
                 if (layers() > 0) {
                     gpuValidations++
@@ -218,10 +246,12 @@ class VulkanBackendIntegrationTest {
                     }
                 } else {
                     cpuValidations++
+                    if (standardCpuMismatch && !comparableContext) return "{\"passed\":false,\"samples\":12,\"reason\":\"numeric_mismatch\"}"
                     if (cpuSelfFailure) return "{\"passed\":false,\"samples\":12,\"reason\":\"numeric_mismatch\"}"
                 }
             }
-            return "{\"passed\":true,\"samples\":12}"
+            return JSONObject().put("passed", true).put("samples", 12)
+                .put("probePolicy", if (alignedPolicy) "adreno840-f32-cpu-attention" else "standard").toString()
         }
         override suspend fun cleanUp() { cleanups++ }
         override suspend fun destroy() { }

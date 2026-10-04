@@ -10,7 +10,7 @@ internal data class BackendMeasurement(
 )
 
 internal object VulkanTuning {
-    const val REVISION = "adreno-isolated-v2"
+    const val REVISION = "adreno-isolated-v2-comparable-v1"
 
     fun candidates(base: InferenceOptions): List<InferenceOptions> =
         listOf(16, 256).flatMap { layers -> listOf(32, 64).map { micro ->

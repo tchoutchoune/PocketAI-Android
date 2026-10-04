@@ -51,8 +51,8 @@ interface InferenceEngine {
      */
     suspend fun bench(pp: Int, tg: Int, pl: Int, nr: Int = 1): String
 
-    /** Fixed public probes in an independent context; never reads or changes chat history. */
-    suspend fun validateBackend(captureCpuReference: Boolean): String
+    /** Fixed public probes; comparableContext aligns CPU KV/attention with the Adreno GPU profile. */
+    suspend fun validateBackend(captureCpuReference: Boolean, comparableContext: Boolean = true): String
 
     /**
      * Unloads the currently loaded model.

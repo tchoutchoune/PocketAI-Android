@@ -10,8 +10,8 @@ android {
         applicationId = "io.github.tchoutchoune.pocketai.preview"
         minSdk = 33
         targetSdk = 36
-        versionCode = 452
-        versionName = "4.5.2-vulkan-isolated"
+        versionCode = 453
+        versionName = "4.5.3-vulkan-comparable"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk { abiFilters += "arm64-v8a" }
     }

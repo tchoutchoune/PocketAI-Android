@@ -62,6 +62,7 @@ struct ValidationProbe {
 };
 std::vector<ValidationProbe> validation_reference;
 std::string validation_model_key;
+std::string validation_reference_policy;
 ggml_backend_dev_t gpu = nullptr;
 int gpu_layers = 0;
 int active_threads = 4;
@@ -341,7 +342,7 @@ bool abort_operator_trace(void *opaque) {
     return cancelled.load() || trace.limited || trace.found || trace.failed_read || trace.expired();
 }
 
-llama_context *new_context(int requested = 0, OperatorTrace *trace = nullptr) {
+llama_context *new_context(int requested = 0, OperatorTrace *trace = nullptr, bool comparable_probe = false) {
     auto params = llama_context_default_params();
     const int trained = llama_model_n_ctx_train(model);
     params.n_ctx = std::min(requested ? requested : options.context, trained > 0 ? trained : options.context);
@@ -352,13 +353,14 @@ llama_context *new_context(int requested = 0, OperatorTrace *trace = nullptr) {
     params.n_threads_batch = std::max(1, std::min(options.threads, batch_thread_limit.load(std::memory_order_relaxed)));
     params.offload_kqv = gpu_layers > 0;
     params.op_offload = gpu_layers > 0;
-    if (gpu_layers > 0 && vulkan_probe.adreno840) {
+    const bool isolated_attention = vulkan_probe.adreno840 && (gpu_layers > 0 || comparable_probe);
+    if (isolated_attention) {
         // F32 matmul alone does not isolate FP16 KV transfers or attention kernels.
         params.type_k = params.type_v = GGML_TYPE_F32;
         params.offload_kqv = false;
         params.op_offload = false;
     }
-    params.flash_attn_type = gpu_layers > 0 && vulkan_probe.adreno840
+    params.flash_attn_type = isolated_attention
         ? LLAMA_FLASH_ATTN_TYPE_DISABLED : LLAMA_FLASH_ATTN_TYPE_AUTO;
     params.abort_callback = abort_decode;
     params.abort_callback_data = nullptr;
@@ -1422,7 +1424,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_unload(JNIEnv *, jobject) {
 }
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_arm_aichat_internal_InferenceEngineImpl_validateBackendNative(JNIEnv *env, jobject, jboolean capture) {
+Java_com_arm_aichat_internal_InferenceEngineImpl_validateBackendNative(JNIEnv *env, jobject, jboolean capture, jboolean comparable) {
     struct Resources {
         llama_context *ctx = nullptr;
         llama_batch batch{};
@@ -1436,6 +1438,11 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_validateBackendNative(JNIEnv *e
     int probe_index = -1, step_index = -1, first_bad_probe = -1, first_bad_step = -1;
     int decode_status = 0, nonfinite_count = 0, nan_count = 0, infinity_count = 0;
     double max_js = 0, max_rmse = 0;
+    double max_probability_log_rmse = 0;
+    std::ostringstream comparison_details;
+    bool has_comparison_details = false;
+    const char *probe_policy = vulkan_probe.adreno840 && (gpu_layers > 0 || comparable)
+        ? "adreno840-f32-cpu-attention" : "standard";
     const char *stage = "model_check";
     const char *reason = "model_unavailable";
     auto json_number = [](double value) {
@@ -1452,12 +1459,16 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_validateBackendNative(JNIEnv *e
             << ",\"reason\":\"" << reason << "\",\"stage\":\"" << stage
             << "\",\"backend\":\"" << (gpu_layers > 0 ? "Vulkan" : "CPU") << "\",\"gpuLayers\":" << gpu_layers
             << ",\"microBatch\":" << options.micro_batch << ",\"maxJs\":" << json_number(max_js)
+            << ",\"probePolicy\":\"" << probe_policy << "\""
+            << ",\"referencePolicy\":\"" << validation_reference_policy << "\""
             << ",\"maxRelativeRmse\":" << json_number(max_rmse)
+            << ",\"maxProbabilityLogRmse\":" << json_number(max_probability_log_rmse)
             << ",\"topMatches\":" << top_matches << ",\"failureMask\":" << failure_mask
             << ",\"failedComparisons\":" << failed_comparisons << ",\"firstFailureProbe\":" << first_bad_probe
             << ",\"firstFailureStep\":" << first_bad_step << ",\"probe\":" << probe_index << ",\"step\":" << step_index
             << ",\"decodeStatus\":" << decode_status << ",\"nonfiniteCount\":" << nonfinite_count
             << ",\"nanCount\":" << nan_count << ",\"infinityCount\":" << infinity_count
+            << ",\"comparisonDetails\":[" << comparison_details.str() << "]"
             << ",\"gpuOperatorTrace\":" << (validation_trace_record.empty() ? "null" : validation_trace_record) << "}";
         last_validation_record = out.str();
         last_validation_path = model_path;
@@ -1477,6 +1488,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_validateBackendNative(JNIEnv *e
             stage = "reference_input"; reason = "reference_input_failed";
             validation_reference.clear();
             validation_model_key.clear();
+            validation_reference_policy = probe_policy;
             for (const auto *text : {
                     "Bonjour. La capitale de la France est Paris. Une semaine compte sept jours. Explique simplement les saisons. ",
                     "Calcule : 2 + 3 = 5. 7 fois 8 = 56. Les nombres pairs sont divisibles par deux. ",
@@ -1493,8 +1505,15 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_validateBackendNative(JNIEnv *e
             reason = "reference_unavailable";
             throw std::runtime_error("matching CPU reference missing");
         }
+        if (!capture && gpu_layers > 0 && validation_reference_policy != probe_policy) {
+            reason = "reference_policy_mismatch";
+            throw std::runtime_error("GPU requires a matching numerical policy");
+        }
         stage = "context_allocation"; reason = "context_allocation_failed";
-        resources.ctx = new_context(512);
+        // GPU isolation uses F32 host KV and ordinary CPU attention. Compare it
+        // with the SAME numeric policy on CPU; chat and benchmarks keep their
+        // normal settings. A separate standard-CPU probe quantifies policy drift.
+        resources.ctx = new_context(512, nullptr, comparable);
         if (!resources.ctx || llama_n_ctx(resources.ctx) < 192) throw std::runtime_error("probe context");
         stage = "batch_allocation"; reason = "batch_allocation_failed";
         resources.batch = llama_batch_init(options.batch, 0, 1);
@@ -1549,6 +1568,19 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_validateBackendNative(JNIEnv *e
                     passed = passed && comparison.passed;
                     max_js = std::max(max_js, comparison.js);
                     max_rmse = std::max(max_rmse, comparison.relative_rmse);
+                    max_probability_log_rmse = std::max(max_probability_log_rmse, comparison.probability_log_rmse);
+                    if (has_comparison_details) comparison_details << ',';
+                    has_comparison_details = true;
+                    comparison_details << "{\"probe\":" << probe_index << ",\"step\":" << step
+                        << ",\"js\":" << json_number(comparison.js)
+                        << ",\"relativeRmse\":" << json_number(comparison.relative_rmse)
+                        << ",\"meanOffset\":" << json_number(comparison.mean_offset)
+                        << ",\"referenceStd\":" << json_number(comparison.reference_std)
+                        << ",\"actualStd\":" << json_number(comparison.actual_std)
+                        << ",\"maxCenteredDelta\":" << json_number(comparison.max_centered_delta)
+                        << ",\"probabilityLogRmse\":" << json_number(comparison.probability_log_rmse)
+                        << ",\"tailErrorShare\":" << json_number(comparison.tail_error_share)
+                        << ",\"failureMask\":" << comparison.failures << "}";
                     if (comparison.top_match) ++top_matches;
                 }
                 ++checked;
@@ -1568,7 +1600,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_validateBackendNative(JNIEnv *e
         validation_summary = capture ? "CPU reference captured (12 distributions)" : passed ? "CPU comparison passed (12 distributions)" : "CPU comparison FAILED";
         return record(passed);
     } catch (...) {
-        if (capture) { validation_reference.clear(); validation_model_key.clear(); }
+        if (capture) { validation_reference.clear(); validation_model_key.clear(); validation_reference_policy.clear(); }
         validation_summary = cancelled.load() ? "comparison cancelled" : "comparison unavailable or failed";
         if (cancelled.load()) reason = "cancelled";
         // Observation inserts synchronization and changes execution. Never use
@@ -1592,5 +1624,6 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_shutdown(JNIEnv *, jobject) {
     validation_trace_attempted = false;
     validation_reference.clear();
     validation_model_key.clear();
+    validation_reference_policy.clear();
     llama_backend_free();
 }

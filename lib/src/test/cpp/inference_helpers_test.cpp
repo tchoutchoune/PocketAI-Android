@@ -25,6 +25,9 @@ int main(int argc, char **argv) {
     const std::vector<float> nonfinite{0.0f, std::numeric_limits<float>::infinity(), 3.0f, 2.0f};
     assert(pocketai::compare_logits(reference, shifted.data(), shifted.size()).passed);
     assert(pocketai::compare_logits(reference, shifted.data(), shifted.size()).failures == 0);
+    const auto offset_check = pocketai::compare_logits(reference, shifted.data(), shifted.size());
+    assert(offset_check.mean_offset == 10 && offset_check.probability_log_rmse < 1e-12);
+    assert(offset_check.max_centered_delta == 0 && offset_check.tail_error_share == 0);
     assert(pocketai::compare_logits(reference, close.data(), close.size()).passed);
     assert(!pocketai::compare_logits(reference, corrupt.data(), corrupt.size()).passed);
     const auto corruption = pocketai::compare_logits(reference, corrupt.data(), corrupt.size());
@@ -41,6 +44,15 @@ int main(int argc, char **argv) {
     spike[7] = 12.0f;
     assert(!pocketai::compare_logits(flat, spike.data(), spike.size()).passed);
     assert(pocketai::compare_logits(flat, flat.data(), flat.size()).passed);
+    // Similar probabilities/top token do not waive gross low-probability logit
+    // drift. Tail diagnostics explain the rejection without changing its gate.
+    const std::vector<float> tail_reference{0, -1, -25, -35};
+    const std::vector<float> tail_actual{0, -1, -55, -65};
+    const auto tail = pocketai::compare_logits(tail_reference, tail_actual.data(), tail_actual.size());
+    assert(tail.top_match && tail.js < 0.01 && !tail.passed);
+    assert(tail.failures & pocketai::RELATIVE_RMSE);
+    assert(!(tail.failures & pocketai::JS_DIVERGENCE));
+    assert(tail.probability_log_rmse < 0.001 && tail.tail_error_share > 0.4);
     budget.start(3);
     for (int i = 0; i < 3; ++i) {
         assert(!budget.exhausted());
