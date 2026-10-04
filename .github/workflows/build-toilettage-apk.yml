@@ -1,0 +1,102 @@
+name: Build Toilettage APK
+
+on:
+  push:
+    branches:
+      - build-toilettage-apk-20261004
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 36
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Reconstruct application sources
+        run: |
+          mkdir -p "$RUNNER_TEMP/toilettage"
+          cat toilettage-build/payload.part00 toilettage-build/payload.part01 toilettage-build/payload.part02 toilettage-build/payload.part03 toilettage-build/payload.part04 | base64 -d > "$RUNNER_TEMP/toilettage.zip"
+          echo "f78e3f4ca09633dda8a463990818d588daf7d641a486f873d54b3984bedf2e01  $RUNNER_TEMP/toilettage.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/toilettage.zip" -d "$RUNNER_TEMP/toilettage"
+
+      - name: Generate reminder sounds
+        working-directory: ${{ runner.temp }}/toilettage
+        run: |
+          mkdir -p www/sounds
+          python3 - <<'PY'
+          import wave, math, struct, os
+          os.makedirs("www/sounds", exist_ok=True)
+          def tone(path, notes, rate=22050):
+              frames=[]
+              for freq,secs,amp in notes:
+                  n=int(rate*secs)
+                  for i in range(n):
+                      env=min(1.0, i/(rate*.02), max(0.0,(n-i)/(rate*.08)))
+                      value=int(32767*amp*env*math.sin(2*math.pi*freq*i/rate))
+                      frames.append(struct.pack("<h",value))
+              with wave.open(path,"wb") as w:
+                  w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
+                  w.writeframes(b"".join(frames))
+          tone("www/sounds/bell.wav",[(880,.25,.35),(1175,.35,.28)])
+          tone("www/sounds/zen.wav",[(523,.28,.25),(659,.28,.22),(784,.42,.20)])
+          tone("www/sounds/pop.wav",[(740,.12,.32),(988,.18,.26)])
+          tone("www/sounds/classic.wav",[(659,.22,.28),(784,.22,.26),(988,.35,.24)])
+          PY
+
+      - name: Install application dependencies
+        working-directory: ${{ runner.temp }}/toilettage
+        run: npm install --no-audit --no-fund
+
+      - name: Create Android project
+        working-directory: ${{ runner.temp }}/toilettage
+        run: npx cap add android
+
+      - name: Prepare Android reminders and sounds
+        working-directory: ${{ runner.temp }}/toilettage
+        run: bash scripts/prepare-android.sh
+
+      - name: Build debug APK
+        working-directory: ${{ runner.temp }}/toilettage/android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleDebug
+
+      - name: Validate APK
+        run: |
+          APK="$RUNNER_TEMP/toilettage/android/app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK"
+          unzip -t "$APK" >/dev/null
+          cp "$APK" PattesCompagniePro-v2.apk
+          sha256sum PattesCompagniePro-v2.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PattesCompagniePro-APK
+          path: PattesCompagniePro-v2.apk
+          if-no-files-found: error
+          retention-days: 7
