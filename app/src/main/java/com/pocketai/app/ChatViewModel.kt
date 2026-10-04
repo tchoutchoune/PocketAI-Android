@@ -701,7 +701,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 // GPU correctness. GPU validation still requires matched settings.
                 validate(false, "CPU standard contre CPU au profil GPU", comparableContext = false)
             }
-            suspend fun measure(options: InferenceOptions): BackendMeasurement {
+            suspend fun measure(options: InferenceOptions, validated: Boolean = true): BackendMeasurement {
                 requireCool()
                 val output = inference.bench(128, 16, 1, 2)
                 currentCoroutineContext().ensureActive()
@@ -709,7 +709,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 fun speed(label: String): Double = Regex("$label: ([0-9.eE+\\-]+)")
                     .find(output)?.groupValues?.get(1)?.toDoubleOrNull()?.takeIf { it.isFinite() && it > 0 }
                     ?: error("Le benchmark n’a pas retourné de vitesse exploitable.")
-                return BackendMeasurement(options, speed("Prompt"), speed("Generation"), true)
+                return BackendMeasurement(options, speed("Prompt"), speed("Generation"), validated)
             }
             val cpu = measure(cpuOptions)
             fun description(sample: BackendMeasurement): String = "préparation %.1f · génération %.1f tok/s".format(sample.promptTps, sample.generationTps)
@@ -725,6 +725,26 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     require(actual.gpuLayers > 0) { "Le backend est revenu au CPU ; essai GPU exclu." }
                     val label = "GPU ${actual.gpuLayers} couches · lot ${actual.microBatchSize}"
                     val validation = validate(false, "$label avant mesure")
+                    if (!passed(validation) && VulkanTuning.diagnosticCandidate(candidate) &&
+                        VulkanTuning.canMeasureRejectedGpu(
+                            reason = validation.optString("reason"), stage = validation.optString("stage"),
+                            samples = validation.optInt("samples", -1), failureMask = validation.optInt("failureMask", -1),
+                            topMatches = validation.optInt("topMatches", -1), decodeStatus = validation.optInt("decodeStatus", -1),
+                            nonfiniteCount = validation.optInt("nonfiniteCount", -1),
+                            maxJs = validation.optDouble("maxJs", Double.NaN),
+                            maxRelativeRmse = validation.optDouble("maxRelativeRmse", Double.NaN),
+                            policiesMatch = validation.optString("probePolicy").isNotBlank() &&
+                                validation.optString("probePolicy") == validation.optString("referencePolicy"))) {
+                        val diagnostic = measure(actual, validated = false)
+                        val after = validate(false, "$label après mesure diagnostique")
+                        report += "$label : ${description(diagnostic)} · mesure diagnostique · profil non validé pour le chat"
+                        logs.event("vulkan_diagnostic_measurement options=$actual validated=false activation_allowed=false" +
+                            " prompt_tps=${diagnostic.promptTps} generation_tps=${diagnostic.generationTps}" +
+                            " cpu_prompt_tps=${cpu.promptTps} cpu_generation_tps=${cpu.generationTps}" +
+                            " validation=$validation after=$after")
+                        // Never add this sample to selection. The original refusal
+                        // applies even if the post-benchmark probe happens to pass.
+                    }
                     require(passed(validation)) { "Contrôle GPU refusé : ${validationDetails(validation)}" }
                     val sample = measure(actual)
                     // Check again after the timed workload to catch delayed corruption.

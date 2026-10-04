@@ -201,11 +201,41 @@ class VulkanBackendIntegrationTest {
         assertFalse(app.getSharedPreferences("pocketai", 0).all.keys.any { it.startsWith("vulkan_recipe_") })
     }
 
+    @Test fun rmsOnlyGpuTimingNeverActivatesOrCachesRejectedProfiles() = runBlocking {
+        val engine = FakeEngine(alignedPolicy = true, rmsOnlyGpuFailure = true)
+        inject(engine)
+        val history = model.state.value.messages
+        model.compareVulkanBackends(file)
+        assertEquals(3, engine.benchmarks)
+        assertEquals(8, engine.gpuValidations)
+        assertEquals(listOf(16 to 32, 4 to 1), engine.benchmarkedOptions
+            .filter { it.gpuLayers > 0 }.map { it.gpuLayers to it.microBatchSize })
+        assertTrue(engine.benchmarkWorkloads.all { it == listOf(128, 16, 1, 2) })
+        assertEquals("cpu-performance", model.performanceMode)
+        assertEquals(1, model.gpuBlacklistCount)
+        assertEquals(history, model.state.value.messages)
+        assertEquals(2, model.state.value.backendComparison.lines()
+            .count { it.contains("mesure diagnostique · profil non validé pour le chat") })
+        assertFalse(app.getSharedPreferences("pocketai", 0).all.keys.any { it.startsWith("vulkan_recipe_") })
+    }
+
+    @Test fun passingPostDiagnosticProbeCannotValidateOriginalRefusal() = runBlocking {
+        val engine = FakeEngine(alignedPolicy = true, rmsOnlyGpuFailure = true, passingDiagnosticAfter = true)
+        inject(engine)
+        model.compareVulkanBackends(file)
+        assertEquals(3, engine.benchmarks)
+        assertTrue(model.state.value.backendComparison.contains("après mesure diagnostique : validé"))
+        assertEquals("cpu-performance", model.performanceMode)
+        assertEquals(1, model.gpuBlacklistCount)
+        assertFalse(app.getSharedPreferences("pocketai", 0).all.keys.any { it.startsWith("vulkan_recipe_") })
+    }
+
     private class FakeEngine(val fallback: Boolean = false, val cancelValidation: Boolean = false,
         val gpuFailureReason: String? = null, val cpuSelfFailure: Boolean = false,
         val rescueOnly: Boolean = false, val slowerGpu: Boolean = false,
         val finalFailureReason: String? = null, val alignedPolicy: Boolean = false,
-        val standardCpuMismatch: Boolean = false) : InferenceEngine {
+        val standardCpuMismatch: Boolean = false, val rmsOnlyGpuFailure: Boolean = false,
+        val passingDiagnosticAfter: Boolean = false) : InferenceEngine {
         override val state = MutableStateFlow<InferenceEngine.State>(InferenceEngine.State.ModelReady)
         private var options = InferenceOptions()
         var benchmarks = 0
@@ -215,7 +245,13 @@ class VulkanBackendIntegrationTest {
         var cleanups = 0
         val cpuProbePolicies = mutableListOf<Boolean>()
         val gpuProbePolicies = mutableListOf<Boolean>()
-        override suspend fun configure(options: InferenceOptions) { this.options = options }
+        val benchmarkedOptions = mutableListOf<InferenceOptions>()
+        val benchmarkWorkloads = mutableListOf<List<Int>>()
+        private var benchmarkSinceValidation = false
+        override suspend fun configure(options: InferenceOptions) {
+            this.options = options
+            benchmarkSinceValidation = false
+        }
         private fun layers() = if (fallback) 0 else options.gpuLayers.coerceAtMost(36)
         override suspend fun diagnostics() = "Vulkan driver: Adreno test driver\nGPU layers: ${layers()}\nContext: ${options.contextSize}\nMicro-batch: ${options.microBatchSize}"
         override fun fastMetrics() = ""
@@ -226,10 +262,15 @@ class VulkanBackendIntegrationTest {
         override fun sendUserPrompt(message: String, predictLength: Int) = emptyFlow<String>()
         override suspend fun bench(pp: Int, tg: Int, pl: Int, nr: Int): String {
             benchmarks++
+            benchmarkedOptions += options
+            benchmarkWorkloads += listOf(pp, tg, pl, nr)
+            benchmarkSinceValidation = true
             if (layers() > 0 && slowerGpu) return "Prompt: 20 tokens/s\nGeneration: 10 tokens/s"
             return if (layers() > 0) "Prompt: 80 tokens/s\nGeneration: ${if (layers() == 36) 24 else 20} tokens/s" else "Prompt: 50 tokens/s\nGeneration: 12 tokens/s"
         }
         override suspend fun validateBackend(captureCpuReference: Boolean, comparableContext: Boolean): String {
+            val afterBenchmark = benchmarkSinceValidation
+            benchmarkSinceValidation = false
             if (layers() > 0) gpuProbePolicies += comparableContext else cpuProbePolicies += comparableContext
             if (!captureCpuReference) {
                 if (layers() > 0) {
@@ -238,6 +279,15 @@ class VulkanBackendIntegrationTest {
                     if (finalFailureReason != null && gpuLoads == 7) {
                         return JSONObject().put("passed", false).put("samples", 0)
                             .put("reason", finalFailureReason).put("stage", "context_allocation").toString()
+                    }
+                    if (rmsOnlyGpuFailure && !(passingDiagnosticAfter && afterBenchmark)) {
+                        return JSONObject().put("passed", false).put("samples", 12)
+                            .put("reason", "numeric_mismatch").put("stage", "completed")
+                            .put("maxJs", 0.0055).put("maxRelativeRmse", 0.31)
+                            .put("failureMask", 8).put("topMatches", 12)
+                            .put("decodeStatus", 0).put("nonfiniteCount", 0)
+                            .put("probePolicy", "adreno840-f32-cpu-attention")
+                            .put("referencePolicy", "adreno840-f32-cpu-attention").toString()
                     }
                     if (gpuFailureReason != null && (!rescueOnly || options.microBatchSize != 1)) {
                         return JSONObject().put("passed", false).put("samples", if (gpuFailureReason == "numeric_mismatch") 12 else 0)

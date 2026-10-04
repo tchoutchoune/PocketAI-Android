@@ -38,4 +38,40 @@ class VulkanTuningTest {
         assertEquals(setOf(16 to 32, 16 to 64, 256 to 32, 256 to 64, 16 to 1, 4 to 1), candidates.map { it.gpuLayers to it.microBatchSize }.toSet())
         assertTrue(candidates.all { it.batchSize == 128 })
     }
+
+    @Test fun diagnosticTimingIsBoundedToTwoPartialGpuProfiles() {
+        assertEquals(listOf(16 to 32, 4 to 1), VulkanTuning.candidates(InferenceOptions())
+            .filter(VulkanTuning::diagnosticCandidate).map { it.gpuLayers to it.microBatchSize })
+    }
+
+    private fun measurable(reason: String = "numeric_mismatch", stage: String = "completed",
+        samples: Int = 12, failureMask: Int = 8, topMatches: Int = 12,
+        decodeStatus: Int = 0, nonfiniteCount: Int = 0, maxJs: Double = 0.0055,
+        maxRelativeRmse: Double = 0.31, policiesMatch: Boolean = true) =
+        VulkanTuning.canMeasureRejectedGpu(reason, stage, samples, failureMask, topMatches,
+            decodeStatus, nonfiniteCount, maxJs, maxRelativeRmse, policiesMatch)
+
+    @Test fun onlyCompleteFiniteRmsOnlyRefusalsCanBeTimed() {
+        assertTrue(measurable())
+        assertFalse(measurable(reason = "nonfinite_logits"))
+        assertFalse(measurable(stage = "logit_comparison"))
+        assertFalse(measurable(samples = 11))
+        assertFalse(measurable(failureMask = 12))
+        assertFalse(measurable(topMatches = 11))
+        assertFalse(measurable(decodeStatus = -1))
+        assertFalse(measurable(nonfiniteCount = 1))
+        assertFalse(measurable(nonfiniteCount = -1))
+        assertFalse(measurable(policiesMatch = false))
+    }
+
+    @Test fun invalidOrOutOfRangeDiagnosticMetricsAreRejected() {
+        assertFalse(measurable(maxJs = Double.NaN))
+        assertFalse(measurable(maxJs = Double.POSITIVE_INFINITY))
+        assertFalse(measurable(maxJs = -0.001))
+        assertFalse(measurable(maxJs = 0.010001))
+        assertFalse(measurable(maxRelativeRmse = Double.NaN))
+        assertFalse(measurable(maxRelativeRmse = Double.POSITIVE_INFINITY))
+        assertFalse(measurable(maxRelativeRmse = 0.03))
+        assertTrue(measurable(maxJs = 0.01))
+    }
 }

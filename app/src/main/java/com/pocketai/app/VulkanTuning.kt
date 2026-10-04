@@ -17,6 +17,20 @@ internal object VulkanTuning {
             base.copy(gpuLayers = layers, microBatchSize = micro)
         } } + listOf(16, 4).map { base.copy(gpuLayers = it, microBatchSize = 1) }
 
+    // Bound extra timing work to two partial-offload configurations. Rejected
+    // measurements remain ineligible for selection, even if they are faster.
+    fun diagnosticCandidate(requested: InferenceOptions): Boolean =
+        (requested.gpuLayers == 16 && requested.microBatchSize == 32) ||
+            (requested.gpuLayers == 4 && requested.microBatchSize == 1)
+
+    fun canMeasureRejectedGpu(reason: String, stage: String, samples: Int,
+        failureMask: Int, topMatches: Int, decodeStatus: Int, nonfiniteCount: Int,
+        maxJs: Double, maxRelativeRmse: Double, policiesMatch: Boolean): Boolean =
+        reason == "numeric_mismatch" && stage == "completed" && samples == 12 &&
+            failureMask == 8 && topMatches == 12 && decodeStatus == 0 && nonfiniteCount == 0 &&
+            maxJs.isFinite() && maxJs in 0.0..0.01 &&
+            maxRelativeRmse.isFinite() && maxRelativeRmse > 0.03 && policiesMatch
+
     private fun usable(sample: BackendMeasurement) = sample.validated &&
         sample.promptTps.isFinite() && sample.promptTps > 0 &&
         sample.generationTps.isFinite() && sample.generationTps > 0

@@ -5,7 +5,7 @@ Assistant Android avec modèles GGUF locaux et catalogue de 21 modèles pour le 
 ## Installer et commencer
 
 - **Android 13 ou supérieur, téléphone ARM64** (`arm64-v8a`).
-- Dans les [Actions GitHub](https://github.com/tchoutchoune/PocketAI-Android/actions), ouvrir un build réussi de **Build PocketAI 4** sur la branche preview `codex/dynamic-context-budget`, télécharger l’artefact **PocketAI-4.5.3-vulkan-comparable-arm64-debug**, extraire le ZIP et installer `PocketAI-4.5.3-vulkan-comparable-arm64-debug.apk`. GitHub peut demander une connexion pour télécharger les artefacts.
+- Dans les [Actions GitHub](https://github.com/tchoutchoune/PocketAI-Android/actions), ouvrir un build réussi de **Build PocketAI 4** sur la branche preview `codex/dynamic-context-budget`, télécharger l’artefact **PocketAI-4.5.4-vulkan-measured-arm64-debug**, extraire le ZIP et installer `PocketAI-4.5.4-vulkan-measured-arm64-debug.apk`. GitHub peut demander une connexion pour télécharger les artefacts.
 - Autoriser l’installation depuis la source choisie si Android le demande. Cet APK est un build de développement signé avec une clé de débogage.
 
 La preview utilise le paquet **`io.github.tchoutchoune.pocketai.preview`** et la même signature que la preview 4.2.3 : elle met à jour cette application en conservant ses données. Les applications d’un autre paquet restent séparées.
@@ -30,7 +30,7 @@ Dans **Réglages**, choisir **Auto · adaptatif**, **CPU · performance**, **CPU
 
 La déclaration Vulkan d’Android permet de tenter l’accélération GPU. Le moteur vérifie ensuite le backend et peut revenir au CPU si le GPU ou ses allocations échouent. **Voir le matériel et le moteur** indique le backend réellement actif, les couches GPU, les threads et les mesures de génération. La présence de Vulkan ne garantit pas un gain de vitesse sur chaque téléphone.
 
-## Vulkan : comparaison avec paramètres identiques 4.5.3
+## Vulkan : comparaison et mesures diagnostiques 4.5.4
 
 Le diagnostic du OnePlus CPH2747 identifie un Adreno 840. Un ancien essai Vulkan à 16 couches produisait une sortie corrompue ; la présence des bibliothèques et de Vulkan 1.4 ne prouve donc pas la fiabilité de l’inférence. Cette version propose une correction de compatibilité à vérifier sur l’appareil, sans annoncer de gain non mesuré.
 
@@ -39,6 +39,7 @@ Le diagnostic du OnePlus CPH2747 identifie un Adreno 840. Un ancien essai Vulkan
 - **Réglages → Comparer et optimiser CPU / Vulkan** : trois textes publics fixes produisent douze distributions de scores CPU. Chaque configuration GPU doit les reproduire dans les tolérances avant et après un benchmark indépendant. Un contrôle CPU contre sa propre référence doit réussir avant les essais GPU. Six essais combinent 16 ou toutes les couches avec des lots physiques de 32 ou 64, puis 16 ou 4 couches avec un lot physique d’un seul token ; le batch logique reste séparé. Les deux derniers essais explorent un autre chemin de calcul, sans garantie de correction ni de vitesse. Le contexte GPU initial est limité à 2 048 tokens.
 - En 4.5.3, les sondes CPU de référence et GPU utilisent sur Adreno 840 le même cache KV FP32 sur CPU, sans Flash Attention ni opérations GPU opportunistes. La 4.5.2 comparait son profil GPU à une référence CPU avec KV FP16 et attention automatique : le nouveau contrôle retire cette différence sans prétendre qu’elle explique les écarts constatés. Un contrôle CPU standard contre la référence FP32 quantifie séparément ce changement de politique ; son résultat est diagnostique et ne valide aucun GPU. Le chat et les mesures CPU conservent leurs paramètres habituels. Une référence d’une autre politique ne peut pas valider un essai GPU.
 - Les seuils restent JS ≤ 0,01, RMS relatif centré ≤ 0,03 et marge des meilleurs tokens ≤ 0,35. Chaque distribution ajoute le décalage moyen, les écarts types, l’écart centré maximal, le RMS des log-probabilités pondéré par leurs probabilités et la part de l’erreur sur les tokens de probabilité inférieure à 1e-8 dans les deux distributions. Ces statistiques sont diagnostiques ; aucun score brut ni texte de conversation n’est enregistré. La version du protocole invalide les anciennes recettes et exclusions.
+- En 4.5.4, deux profils refusés (16 couches / lot 32 et 4 couches / lot 1) peuvent être chronométrés à titre diagnostique. Il faut douze comparaisons terminées, aucun score non fini ni erreur de décodage, douze meilleurs tokens identiques, JS ≤ 0,01, des politiques numériques identiques et le seul critère RMS échoué. Le benchmark pp128/tg16 ×2 est identique au CPU ; un nouveau contrôle suit la mesure. Ces résultats portent la mention « profil non validé pour le chat » : ils ne participent jamais à la sélection et ne sont jamais mémorisés comme recette Vulkan, même si le contrôle suivant réussit. Les seuils de validation restent inchangés.
 - Les refus conservent leur cause : allocation, code de décodage, scores non finis ou divergence numérique. Les écarts JS/RMS, les critères échoués et la première sonde fautive sont journalisés avant le retour au CPU. Le dernier essai reste visible dans le diagnostic du même modèle ; seules des erreurs numériques justifient une exclusion persistante du GPU. Aucun texte de conversation n’est utilisé.
 - Après le premier refus pour scores non finis d’une comparaison, une sonde publique est rejouée dans un contexte indépendant avec observation des sorties GPU F32. La trace conserve le nom technique, l’opération et la forme du premier tenseur NaN/+Inf observé, sans enregistrer son contenu ; les -Inf de masque ne sont pas pris pour une erreur. Limites : 20 secondes, 64 Mio lus, 8 Mio par tenseur. L’observation insère des synchronisations : son résultat ne valide jamais un profil et n’entre jamais dans les mesures de vitesse. Aucun callback de trace n’est installé pour le chat ou le benchmark.
 - Vulkan est retenu si la génération atteint au moins le CPU, la préparation reste à au moins 90 % du CPU, et le score pondéré atteint 105 %. Ces courts tests ne couvrent pas toutes les conversations ni une utilisation prolongée. Les scores non finis et les répétitions dégénérées déclenchent encore un retour au CPU pendant l’utilisation.
@@ -98,7 +99,7 @@ Le script de préparation installe dans le répertoire d’outils le **JDK 17**,
 
 `scripts/build.sh` construit l’APK ARM64 avec CPU et Vulkan, lance les tests unitaires de `app` et `lib`, puis contrôle le ZIP, la signature, le paquet et les bibliothèques natives. Résultats :
 
-- `out/PocketAI-4.5.3-vulkan-comparable-arm64-debug.apk` et `out/SHA256.txt` ;
+- `out/PocketAI-4.5.4-vulkan-measured-arm64-debug.apk` et `out/SHA256.txt` ;
 - preuves de vérification dans `out/` ;
 - rapports dans `app/build/reports/tests/` et `lib/build/reports/tests/`.
 
