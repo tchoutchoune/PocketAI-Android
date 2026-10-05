@@ -32,6 +32,12 @@ bool batch_allocated = false;
 common_chat_templates_ptr templates;
 common_sampler *sampler = nullptr;
 std::vector<common_chat_msg> messages;
+struct TurnSpan {
+    llama_pos start = 0;
+    llama_pos end = 0;
+};
+std::vector<TurnSpan> turns;
+llama_pos current_turn_start = -1;
 std::string system_prompt;
 std::string model_path;
 std::string cached_bytes;
@@ -53,6 +59,7 @@ bool generation_eog = false;
 bool needs_end_of_turn = false;
 bool context_dirty = false;
 int shifts = 0;
+int turn_evictions = 0;
 int64_t generation_start = 0;
 int64_t generation_end = 0;
 int64_t prompt_us = 0;
@@ -115,7 +122,11 @@ void clear_conversation() {
     if (context) llama_memory_clear(llama_get_memory(context), false);
     if (sampler) common_sampler_reset(sampler);
     messages.clear();
+    turns.clear();
+    current_turn_start = -1;
     position = system_position = 0;
+    shifts = 0;
+    turn_evictions = 0;
     cached_bytes.clear();
     assistant_text.clear();
     generating = false;
@@ -133,6 +144,8 @@ void free_context() {
     if (batch_allocated) { llama_batch_free(batch); batch = {}; batch_allocated = false; }
     if (context) { llama_free(context); context = nullptr; }
     messages.clear();
+    turns.clear();
+    current_turn_start = -1;
     position = system_position = 0;
     cached_bytes.clear();
     assistant_text.clear();
@@ -177,15 +190,43 @@ llama_context *new_context(int requested = 0) {
     return llama_init_from_model(model, params);
 }
 
+void drop_oldest_message_turn() {
+    if (messages.empty()) return;
+    const size_t first = messages.front().role == "system" ? 1 : 0;
+    const size_t available = messages.size() > first ? messages.size() - first : 0;
+    const size_t count = std::min<size_t>(2, available);
+    if (count) messages.erase(messages.begin() + first, messages.begin() + first + count);
+}
+
+bool evict_oldest_turn() {
+    if (turns.empty() || !llama_memory_can_shift(llama_get_memory(context))) return false;
+    const auto oldest = turns.front();
+    const llama_pos start = std::max(system_position, oldest.start);
+    const llama_pos end = oldest.end;
+    if (end <= start || end > position) return false;
+    const llama_pos discard = end - start;
+    if (!llama_memory_seq_rm(llama_get_memory(context), 0, start, end)) return false;
+    llama_memory_seq_add(llama_get_memory(context), 0, end, position, -discard);
+    position -= discard;
+    turns.erase(turns.begin());
+    for (auto &turn : turns) {
+        turn.start -= discard;
+        turn.end -= discard;
+    }
+    if (current_turn_start >= end) current_turn_start -= discard;
+    else if (current_turn_start > start) current_turn_start = start;
+    drop_oldest_message_turn();
+    ++shifts;
+    ++turn_evictions;
+    return true;
+}
+
 bool make_room(int required) {
     const int capacity = static_cast<int>(llama_n_ctx(context)) - HEADROOM;
-    const int discard = pocketai::discard_count(position, system_position, required, capacity);
-    if (!discard) return true;
-    if (discard < 0 || !llama_memory_can_shift(llama_get_memory(context))) return false;
-    if (!llama_memory_seq_rm(llama_get_memory(context), 0, system_position, system_position + discard)) return false;
-    llama_memory_seq_add(llama_get_memory(context), 0, system_position + discard, position, -discard);
-    position -= discard;
-    ++shifts;
+    if (required < 0 || system_position + required > capacity) return false;
+    while (position + required > capacity) {
+        if (!evict_oldest_turn()) return false;
+    }
     return true;
 }
 
@@ -218,11 +259,8 @@ void add_message(const std::string &role, const std::string &content) {
     message.role = role;
     message.content = content;
     messages.push_back(std::move(message));
-    // Templates need recent role ordering; keep the native history bounded as the KV cache slides.
-    if (messages.size() > 64) {
-        const size_t first = messages.front().role == "system" ? 1 : 0;
-        messages.erase(messages.begin() + first, messages.begin() + first + 2);
-    }
+    // Message history is pruned only when the corresponding KV-cache turn is evicted.
+    // Keeping both structures in lockstep prevents chat-template history from drifting.
 }
 
 llama_tokens tokenize_input(const std::string &text, bool parse_special) {
@@ -251,10 +289,16 @@ int install_system_prompt() {
 void finish_generation() {
     if (!generating) return;
     generation_end = ggml_time_us();
-    if (!context_dirty && common_chat_templates_was_explicit(templates.get())) {
-        add_message("assistant", assistant_text);
-        needs_end_of_turn = !generation_eog;
+    if (!context_dirty) {
+        if (common_chat_templates_was_explicit(templates.get())) {
+            add_message("assistant", assistant_text);
+            needs_end_of_turn = !generation_eog;
+        }
+        if (current_turn_start >= system_position && position > current_turn_start) {
+            turns.push_back({current_turn_start, position});
+        }
     }
+    current_turn_start = -1;
     generating = false;
     cached_bytes.clear();
     log_event(ANDROID_LOG_INFO, cancelled.load() ? "Generation cancelled" : "Generation complete");
@@ -382,6 +426,27 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(JNIEnv *env
 }
 
 extern "C" JNIEXPORT jint JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_countPromptTokensNative(JNIEnv *env, jobject, jstring text) {
+    if (!context || !model || !templates) return -1;
+    try {
+        const auto user = java_text(env, text);
+        const bool chat_template = common_chat_templates_was_explicit(templates.get());
+        const auto formatted = chat_template ? format_message("user", user, true) : user;
+        const auto tokens = tokenize_input(formatted, chat_template);
+        return static_cast<jint>(tokens.size() + (needs_end_of_turn && !turns.empty() ? 1 : 0));
+    } catch (...) {
+        throw_io(env, "Prompt tokenization failed");
+        return -1;
+    }
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_promptCapacityNative(JNIEnv *, jobject) {
+    if (!context) return -1;
+    return std::max(0, static_cast<int>(llama_n_ctx(context)) - static_cast<int>(system_position) - HEADROOM - 1);
+}
+
+extern "C" JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(JNIEnv *env, jobject, jstring text, jint maximum) {
     if (!context || maximum < 1 || maximum > 32768) return 2;
     finish_generation();
@@ -392,8 +457,14 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(JNIEnv *env, 
             auto eot = llama_vocab_eot(vocab);
             if (eot < 0) eot = llama_vocab_eos(vocab);
             if (eot < 0) { context_dirty = true; return 2; }
-            const int result = decode_prompt({eot}, false);
-            if (result) return result;
+            // Reserve room first. If this evicts the previous turn entirely, its EOT
+            // must not be decoded as an orphan token at the beginning of the new turn.
+            if (!make_room(1)) { context_dirty = true; return 1; }
+            if (!turns.empty()) {
+                const int result = decode_prompt({eot}, false);
+                if (result) return result;
+                turns.back().end = position;
+            }
             needs_end_of_turn = false;
         }
         const auto user = java_text(env, text);
@@ -406,10 +477,14 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(JNIEnv *env, 
         common_sampler_reset(sampler);
         const auto start = ggml_time_us();
         if (!make_room(static_cast<int>(tokens.size()))) { context_dirty = true; return 1; }
+        current_turn_start = position;
         const int result = decode_prompt(tokens, true);
         prompt_us = ggml_time_us() - start;
         prompt_tokens = tokens.size();
-        if (result) return result;
+        if (result) {
+            current_turn_start = -1;
+            return result;
+        }
         if (chat_template) add_message("user", user);
         budget.start(maximum);
         generation_start = ggml_time_us();
@@ -417,7 +492,11 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(JNIEnv *env, 
         generation_eog = false;
         generating = true;
         return 0;
-    } catch (...) { context_dirty = true; return 2; }
+    } catch (...) {
+        current_turn_start = -1;
+        context_dirty = true;
+        return 2;
+    }
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -474,7 +553,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_nativeDiagnostics(JNIEnv *env, 
     out << "GPU layers: " << gpu_layers << "; fallback: " << (fallback.empty() ? "none" : fallback) << '\n';
     out << "Threads: " << active_threads << " / " << options.threads << "; thermal limit: " << thread_limit.load() << '\n';
     out << "Context: " << (context ? llama_n_ctx(context) : options.context) << "; batch: " << options.batch << "; temperature: " << options.temperature << '\n';
-    out << "Generated: " << budget.produced << " / " << budget.limit << "; context shifts: " << shifts << '\n';
+    out << "Generated: " << budget.produced << " / " << budget.limit << "; context shifts: " << shifts
+        << "; turn evictions: " << turn_evictions << "; resident turns: " << turns.size() << '\n';
     const int64_t duration = generation_start ? (generation_end ? generation_end : ggml_time_us()) - generation_start : 0;
     out << "Generation: " << (duration > 0 ? budget.produced * 1e6 / duration : 0.0) << " tokens/s; prompt: " << (prompt_us > 0 ? prompt_tokens * 1e6 / prompt_us : 0.0) << " tokens/s\n";
     out << "Backend warnings: " << backend_warnings.load() << "; errors: " << backend_errors.load() << '\n';

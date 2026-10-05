@@ -110,12 +110,17 @@ class ChatAdapter(
         if (message.isUser) {
             holder.body.setTextIsSelectable(true)
             holder.body.text = visible
+        } else if (message.isStreaming) {
+            // Streaming must stay cheap: parsing the whole Markdown tree for every token batch
+            // causes RecyclerView layout churn and makes scrolling janky on long answers.
+            holder.body.setTextIsSelectable(false)
+            holder.body.movementMethod = null
+            holder.body.text = visible.ifBlank { "Préparation de la réponse…" }
         } else {
-            // Selectable TextViews install ArrowKeyMovementMethod; Markwon does not replace it.
-            // The explicit movement method makes source citations open in the browser.
+            // Render Markdown once, when the response is complete.
             holder.body.setTextIsSelectable(false)
             holder.body.movementMethod = LinkMovementMethod.getInstance()
-            markdown.setMarkdown(holder.body, visible.ifBlank { if (message.isStreaming) "Préparation de la réponse…" else "Aucune réponse reçue." })
+            markdown.setMarkdown(holder.body, visible.ifBlank { "Aucune réponse reçue." })
         }
         holder.progress.visibility = if (message.isStreaming) View.VISIBLE else View.GONE
         holder.actions.visibility = if (message.isStreaming || visible.isBlank()) View.GONE else View.VISIBLE
