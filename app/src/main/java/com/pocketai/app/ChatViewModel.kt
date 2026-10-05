@@ -74,6 +74,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private fun learnedGpuLimit(file: File): Int? =
         prefs.getInt(backendLearningKey(file), -1).takeIf { it >= 0 }
 
+    private fun quarantineGpuForSemanticFailure(file: File, reason: String) {
+        val key = backendLearningKey(file)
+        val previous = prefs.getInt(key, -1)
+        prefs.edit().putInt(key, 0).apply()
+        logs.event(
+            "backend_semantic_quarantine reason=$reason previous_limit=$previous active_gpu_layers=${activeOptions.gpuLayers}"
+        )
+    }
+
     private fun learnBackendCompatibility(file: File, diagnostics: String): BackendHealth? {
         val health = BackendHealthPolicy.parse(diagnostics) ?: return null
         val learned = health.learnedGpuLimit ?: return health
@@ -421,6 +430,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             val response = ChatMessage(content = "", isUser = false, isStreaming = true)
             update { it.copy(messages = it.messages + user + response) }
             val buffer = StringBuilder()
+            val outputGuard = OutputHealthGuard()
             var lastPaint = 0L
             val started = android.os.SystemClock.elapsedRealtime()
             var chunks = 0
@@ -428,6 +438,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             thermalListener.onThermalStatusChanged(runCatching { power.currentThermalStatus }.getOrDefault(0))
             try {
                 inference().sendUserPrompt(prepared.text, generationBudget).collect { token ->
+                    outputGuard.observe(token)?.let { throw DegenerateOutputException(it) }
                     buffer.append(token)
                     chunks++
                     val now = android.os.SystemClock.elapsedRealtime()
@@ -436,6 +447,23 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         update { s -> s.copy(messages = s.messages.map { if (it.id == response.id) it.copy(content = buffer.toString()) else it }) }
                     }
                 }
+            } catch (error: DegenerateOutputException) {
+                if (activeOptions.gpuLayers > 0) {
+                    activeFile?.let { quarantineGpuForSemanticFailure(it, error.reasonCode) }
+                }
+                needsHistoryRestore = true
+                update { s -> s.copy(messages = s.messages.map {
+                    if (it.id == response.id) it.copy(content = buffer.toString(), isStreaming = false) else it
+                }) }
+                throw IllegalStateException(
+                    if (activeOptions.gpuLayers > 0) {
+                        "PocketAI a stoppé une sortie GPU anormale. Ce modèle passera en CPU au prochain chargement automatique. " +
+                            "Recharge le modèle, ou utilise le mode Performances pour retester volontairement le GPU."
+                    } else {
+                        "PocketAI a stoppé une sortie locale anormale. Recharge le modèle et vérifie son intégrité."
+                    },
+                    error,
+                )
             } catch (error: Exception) {
                 needsHistoryRestore = true
                 update { s -> s.copy(messages = s.messages.map {
