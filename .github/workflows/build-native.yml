@@ -15,6 +15,12 @@ on:
 permissions:
   contents: read
 
+# Keep only the newest build for a branch. PocketAI native builds are expensive and
+# stale queued runs delay the APK the device tester actually needs.
+concurrency:
+  group: pocketai-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   android:
     runs-on: ubuntu-24.04
@@ -61,7 +67,7 @@ jobs:
           POCKETAI_VULKAN_DIR: /usr
           CMAKE_BUILD_PARALLEL_LEVEL: '4'
         run: bash scripts/build.sh
-      - name: Upload APK and verification evidence
+      - name: Upload APKs and verification evidence
         uses: actions/upload-artifact@v6
         with:
           name: PocketAI-4.2.2-arm64-vulkan-test
