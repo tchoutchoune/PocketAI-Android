@@ -35,6 +35,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     val settings = OnlineSettings(application)
     val artifacts = ArtifactStore(application)
     val logs = DiagnosticsLog(application)
+    private val performance = PerformanceMonitor(application)
     private val tools = OnlineTools(settings, artifacts)
     private val conversations = ConversationStore(application)
     private val prefs = application.getSharedPreferences("pocketai", 0)
@@ -116,6 +117,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         engine?.cancelGeneration()
         activeJob?.cancel()
     }
+
+    fun performanceReport(): String = performance.report(state.value.diagnostics)
 
     fun importModel(uri: android.net.Uri) = task("Importation du modèle…") {
         val file = models.import(uri)
