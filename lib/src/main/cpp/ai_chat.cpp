@@ -544,22 +544,21 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_tuneThreadsNative(JNIEnv *, job
         if (token < 0) token = 0;
         double best_speed = -1.0;
         int best_threads = std::min(static_cast<int>(maximum), options.threads);
+        std::vector<int> tested;
 
-        for (const int threads : candidates) {
+        const auto benchmark = [&](int threads) {
             if (cancelled.load()) throw std::runtime_error("cancelled");
             llama_memory_clear(llama_get_memory(bench_context), false);
             llama_set_n_threads(bench_context, threads, threads);
 
-            // Tiny warm-up removes most first-dispatch noise without making model load feel slow.
-            for (int i = 0; i < 2; ++i) {
-                common_batch_clear(bench_batch);
-                common_batch_add(bench_batch, token, i, {0}, true);
-                if (llama_decode(bench_context, bench_batch)) throw std::runtime_error("thread tune warmup");
-            }
+            // One warm-up token is enough to wake CPU/GPU clocks without making tuning intrusive.
+            common_batch_clear(bench_batch);
+            common_batch_add(bench_batch, token, 0, {0}, true);
+            if (llama_decode(bench_context, bench_batch)) throw std::runtime_error("thread tune warmup");
 
             llama_memory_clear(llama_get_memory(bench_context), false);
             const auto started = ggml_time_us();
-            constexpr int TOKENS = 12;
+            constexpr int TOKENS = 6;
             for (int i = 0; i < TOKENS; ++i) {
                 if (cancelled.load()) throw std::runtime_error("cancelled");
                 common_batch_clear(bench_batch);
@@ -567,12 +566,24 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_tuneThreadsNative(JNIEnv *, job
                 if (llama_decode(bench_context, bench_batch)) throw std::runtime_error("thread tune decode");
             }
             const auto elapsed = std::max<int64_t>(1, ggml_time_us() - started);
-            const double speed = TOKENS * 1e6 / elapsed;
+            return TOKENS * 1e6 / elapsed;
+        };
+
+        const auto consider = [&](int threads) {
+            if (threads < 1 || threads > maximum ||
+                std::find(tested.begin(), tested.end(), threads) != tested.end()) return;
+            const double speed = benchmark(threads);
+            tested.push_back(threads);
             if (speed > best_speed) {
                 best_speed = speed;
                 best_threads = threads;
             }
-        }
+        };
+
+        for (const int threads : candidates) consider(threads);
+        const int coarse_best = best_threads;
+        consider(coarse_best - 1);
+        consider(coarse_best + 1);
 
         llama_batch_free(bench_batch);
         llama_free(bench_context);
