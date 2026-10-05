@@ -26,7 +26,7 @@ int main() {
     assert((pocketai::gpu_layer_candidates(1) == std::vector<int>{1, 0}));
     assert((pocketai::context_backoff_candidates(32768) == std::vector<int>{16384, 8192, 4096, 2048, 1024, 512}));
     assert((pocketai::context_backoff_candidates(4096) == std::vector<int>{2048, 1024, 512}));
-    assert((pocketai::thread_candidates(8) == std::vector<int>{1, 2, 3, 4, 6, 8}));
+    assert((pocketai::thread_candidates(8) == std::vector<int>{1, 2, 3, 4, 5, 6, 7, 8}));
     assert((pocketai::thread_candidates(5) == std::vector<int>{1, 2, 3, 4, 5}));
 
     const std::string emoji = "\xF0\x9F\x98\x80";
