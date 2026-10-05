@@ -86,28 +86,6 @@ void note_fallback(const std::string &message) {
     fallback += message;
 }
 
-std::vector<int> gpu_candidates(int requested) {
-    std::vector<int> result;
-    const auto add = [&](int value) {
-        value = std::max(0, value);
-        if (std::find(result.begin(), result.end(), value) == result.end()) result.push_back(value);
-    };
-    add(requested);
-    if (requested > 1) add(std::max(1, requested * 3 / 4));
-    if (requested > 1) add(std::max(1, requested / 2));
-    if (requested > 1) add(std::max(1, requested / 4));
-    add(0);
-    return result;
-}
-
-std::vector<int> context_candidates(int requested) {
-    std::vector<int> result;
-    for (int value : {32768, 16384, 8192, 4096, 2048, 1024, 512}) {
-        if (value < requested) result.push_back(value);
-    }
-    return result;
-}
-
 void throw_io(JNIEnv *env, const char *message) {
     const auto type = env->FindClass("java/io/IOException");
     if (type) env->ThrowNew(type, message);
@@ -439,7 +417,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstr
     llama_model_free(model); model = nullptr;
 
     const int requested = std::min(options.gpu_layers, model_layers);
-    for (const int layers : gpu_candidates(requested)) {
+    for (const int layers : pocketai::gpu_layer_candidates(requested)) {
         if (cancelled.load()) return 3;
         if (layers == requested || layers == 0) continue;
         if (reload_model_layers(layers)) {
@@ -468,7 +446,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv *, jobject) {
     // Preserve the requested context first: progressively reduce Vulkan offload before
     // sacrificing context length. This avoids the old all-or-nothing GPU -> CPU jump.
     if (!context && initial_gpu_layers > 0 && !cancelled.load()) {
-        for (const int layers : gpu_candidates(initial_gpu_layers)) {
+        for (const int layers : pocketai::gpu_layer_candidates(initial_gpu_layers)) {
             if (layers >= initial_gpu_layers) continue;
             if (cancelled.load()) break;
             if (!reload_model_layers(layers)) continue;
@@ -484,7 +462,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv *, jobject) {
     // If the requested context still does not fit, retain the current backend and back
     // down through standard context sizes. promptCapacity() always exposes the real size.
     if (!context && model && !cancelled.load()) {
-        for (const int candidate : context_candidates(requested_context)) {
+        for (const int candidate : pocketai::context_backoff_candidates(requested_context)) {
             free_context();
             try { context = new_context(candidate); } catch (...) { context = nullptr; }
             if (context) {
@@ -559,11 +537,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_tuneThreadsNative(JNIEnv *, job
         if (!bench_batch.token || !bench_batch.pos || !bench_batch.seq_id || !bench_batch.logits)
             throw std::runtime_error("thread tune batch allocation");
 
-        std::vector<int> candidates;
-        for (const int value : {1, 2, 3, 4, 6, 8, static_cast<int>(maximum)}) {
-            if (value <= maximum && std::find(candidates.begin(), candidates.end(), value) == candidates.end())
-                candidates.push_back(value);
-        }
+        const auto candidates = pocketai::thread_candidates(static_cast<int>(maximum));
 
         const auto vocab = llama_model_get_vocab(model);
         auto token = llama_vocab_bos(vocab);
