@@ -367,7 +367,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     buffer.append(token)
                     chunks++
                     val now = android.os.SystemClock.elapsedRealtime()
-                    if (now - lastPaint >= 160) {
+                    if (now - lastPaint >= 100) {
                         lastPaint = now
                         update { s -> s.copy(messages = s.messages.map { if (it.id == response.id) it.copy(content = buffer.toString()) else it }) }
                     }
