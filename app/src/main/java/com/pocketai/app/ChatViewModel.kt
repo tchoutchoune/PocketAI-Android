@@ -62,8 +62,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         set(value) { prefs.edit().putString("mode", value).apply() }
 
     var maxTokens: Int
-        get() = prefs.getInt("maxTokens", 512).coerceIn(64, 2048)
-        set(value) { prefs.edit().putInt("maxTokens", value.coerceIn(64, 2048)).apply() }
+        get() = prefs.getInt("maxTokens", 512).coerceIn(64, 8192)
+        set(value) { prefs.edit().putInt("maxTokens", value.coerceIn(64, 8192)).apply() }
 
     init {
         logs.event("application_started")
@@ -140,18 +140,58 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             require(file.length() <= profile.availableRamBytes * 75 / 100) {
                 "La mémoire disponible est trop faible pour ce modèle. Ferme les autres applications ou choisis un modèle plus petit."
             }
-            val options = profile.recommend(file.length(), performanceMode)
-            activeOptions = options
-            inference.configure(options)
+            val requestedOptions = profile.recommend(file.length(), performanceMode)
+            activeOptions = requestedOptions
+            inference.configure(requestedOptions)
             inference.loadModel(file.absolutePath)
+
+            val allocationInfo = inference.diagnostics()
+            val activeGpuLayers = Regex("GPU layers: (\\d+)").find(allocationInfo)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            val actualContext = Regex("Context: (\\d+)").find(allocationInfo)?.groupValues?.get(1)?.toIntOrNull()
+                ?: requestedOptions.contextSize
+
+            var selectedThreads = requestedOptions.threads
+            val canTune = requestedOptions.threads > 1 &&
+                !profile.powerSave &&
+                profile.thermalStatus < PowerManager.THERMAL_STATUS_MODERATE &&
+                performanceMode != "eco"
+            if (canTune) {
+                val key = threadTuneKey(file, profile, activeGpuLayers, actualContext)
+                val cached = prefs.getInt(key, 0).takeIf { it in 1..requestedOptions.threads }
+                selectedThreads = if (cached != null) {
+                    inference.setThreadLimit(cached)
+                    logs.event("thread_tune_cache threads=$cached gpu_layers=$activeGpuLayers context=$actualContext")
+                    cached
+                } else {
+                    update { it.copy(status = "Optimisation CPU · benchmark des threads…") }
+                    runCatching { inference.tuneThreads(requestedOptions.threads) }.getOrElse { error ->
+                        logs.failure("thread_auto_tune", error)
+                        requestedOptions.threads
+                    }.also { tuned ->
+                        prefs.edit().putInt(key, tuned).apply()
+                        logs.event("thread_tuned threads=$tuned max=${requestedOptions.threads} gpu_layers=$activeGpuLayers context=$actualContext")
+                    }
+                }
+            }
+            activeOptions = requestedOptions.copy(threads = selectedThreads)
+
             inference.setSystemPrompt(SYSTEM_PROMPT)
             thermalListener.onThermalStatusChanged(runCatching { power.currentThermalStatus }.getOrDefault(0))
             val info = inference.diagnostics()
+            val finalContext = Regex("Context: (\\d+)").find(info)?.groupValues?.get(1)?.toIntOrNull() ?: actualContext
+            val finalGpuLayers = Regex("GPU layers: (\\d+)").find(info)?.groupValues?.get(1)?.toIntOrNull() ?: activeGpuLayers
+            val backend = if (finalGpuLayers > 0) "$finalGpuLayers couches GPU" else "CPU"
             activeFile = file
             needsHistoryRestore = true
-            logs.event("model_ready options=$options diagnostics=$info")
+            logs.event("model_ready requested=$requestedOptions active=$activeOptions diagnostics=$info")
             prefs.edit().putString("lastModel", file.name).apply()
-            update { it.copy(modelName = file.nameWithoutExtension, status = "Prêt · ${options.threads} threads · ${options.contextSize} tokens", diagnostics = info) }
+            update {
+                it.copy(
+                    modelName = file.nameWithoutExtension,
+                    status = "Prêt · $selectedThreads threads · ${"%.1f".format(finalContext / 1024.0)}K contexte · $backend",
+                    diagnostics = info,
+                )
+            }
         } catch (error: Exception) {
             activeFile = null
             update { it.copy(modelName = null, diagnostics = "") }
@@ -168,6 +208,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         engine?.cleanUp()
         update { it.copy(status = "Modèle déchargé") }
     }
+
+    private fun threadTuneKey(
+        file: File,
+        profile: HardwareProfile,
+        gpuLayers: Int,
+        contextSize: Int,
+    ): String = "thread_tune_v1_${file.name.hashCode()}_${file.length()}_${profile.cpuCores}_${gpuLayers}_$contextSize"
 
     private data class PreparedPrompt(val text: String, val tokens: Int, val capacity: Int)
 
