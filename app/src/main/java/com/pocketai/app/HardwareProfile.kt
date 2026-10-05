@@ -19,9 +19,18 @@ data class HardwareProfile(
     val thermalStatus: Int,
 ) {
     val summary: String
-        get() = "${String.format(Locale.FRANCE, "%.1f", totalRamBytes / GIB.toDouble())} Go RAM · " +
-            "$cpuCores cœurs · ${if (vulkanVersion != null) "Vulkan $vulkanVersion disponible à vérifier" else "CPU"}" +
-            if (powerSave) " · économie d’énergie" else ""
+        get() {
+            val thermal = when {
+                thermalStatus >= PowerManager.THERMAL_STATUS_SEVERE -> "chaud"
+                thermalStatus >= PowerManager.THERMAL_STATUS_MODERATE -> "tiède"
+                else -> "normal"
+            }
+            return "${String.format(Locale.FRANCE, "%.1f", totalRamBytes / GIB.toDouble())} Go RAM total · " +
+                "${String.format(Locale.FRANCE, "%.1f", availableRamBytes / GIB.toDouble())} Go disponible\n" +
+                "$cpuCores cœurs CPU · $bigCores cœurs rapides estimés · thermique $thermal\n" +
+                (if (vulkanVersion != null) "Vulkan $vulkanVersion déclaré par Android" else "Backend CPU uniquement déclaré") +
+                if (powerSave) " · économie d’énergie active" else ""
+        }
 
     /** Keep memory for Android, weights, KV cache, and (when used) GPU allocations. */
     fun recommend(modelBytes: Long = 0, mode: String = "balanced"): InferenceOptions {
