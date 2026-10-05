@@ -62,6 +62,7 @@ int shifts = 0;
 int turn_evictions = 0;
 int gpu_load_attempts = 0;
 int context_backoffs = 0;
+int tuned_thread_choice = 0;
 int64_t generation_start = 0;
 int64_t generation_end = 0;
 int64_t prompt_us = 0;
@@ -393,6 +394,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_configureNative(JNIEnv *env, jo
     fallback.clear();
     gpu_load_attempts = 0;
     context_backoffs = 0;
+    tuned_thread_choice = 0;
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -544,6 +546,76 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_promptCapacityNative(JNIEnv *, 
 }
 
 extern "C" JNIEXPORT jint JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_tuneThreadsNative(JNIEnv *, jobject, jint maximum) {
+    if (!model || !context || maximum < 1 || maximum > 32) return -1;
+    llama_context *bench_context = nullptr;
+    llama_batch bench_batch{};
+    bool allocated = false;
+    try {
+        bench_context = new_context(512);
+        if (!bench_context) return -1;
+        bench_batch = llama_batch_init(1, 0, 1);
+        allocated = true;
+        if (!bench_batch.token || !bench_batch.pos || !bench_batch.seq_id || !bench_batch.logits)
+            throw std::runtime_error("thread tune batch allocation");
+
+        std::vector<int> candidates;
+        for (const int value : {1, 2, 3, 4, 6, 8, static_cast<int>(maximum)}) {
+            if (value <= maximum && std::find(candidates.begin(), candidates.end(), value) == candidates.end())
+                candidates.push_back(value);
+        }
+
+        const auto vocab = llama_model_get_vocab(model);
+        auto token = llama_vocab_bos(vocab);
+        if (token < 0) token = 0;
+        double best_speed = -1.0;
+        int best_threads = std::min(static_cast<int>(maximum), options.threads);
+
+        for (const int threads : candidates) {
+            if (cancelled.load()) throw std::runtime_error("cancelled");
+            llama_memory_clear(llama_get_memory(bench_context), false);
+            llama_set_n_threads(bench_context, threads, threads);
+
+            // Tiny warm-up removes most first-dispatch noise without making model load feel slow.
+            for (int i = 0; i < 2; ++i) {
+                common_batch_clear(bench_batch);
+                common_batch_add(bench_batch, token, i, {0}, true);
+                if (llama_decode(bench_context, bench_batch)) throw std::runtime_error("thread tune warmup");
+            }
+
+            llama_memory_clear(llama_get_memory(bench_context), false);
+            const auto started = ggml_time_us();
+            constexpr int TOKENS = 12;
+            for (int i = 0; i < TOKENS; ++i) {
+                if (cancelled.load()) throw std::runtime_error("cancelled");
+                common_batch_clear(bench_batch);
+                common_batch_add(bench_batch, token, i, {0}, true);
+                if (llama_decode(bench_context, bench_batch)) throw std::runtime_error("thread tune decode");
+            }
+            const auto elapsed = std::max<int64_t>(1, ggml_time_us() - started);
+            const double speed = TOKENS * 1e6 / elapsed;
+            if (speed > best_speed) {
+                best_speed = speed;
+                best_threads = threads;
+            }
+        }
+
+        llama_batch_free(bench_batch);
+        llama_free(bench_context);
+        tuned_thread_choice = best_threads;
+        thread_limit.store(best_threads);
+        active_threads = std::max(1, std::min(options.threads, best_threads));
+        llama_set_n_threads(context, active_threads, active_threads);
+        log_event(ANDROID_LOG_INFO, "CPU thread auto-tune completed");
+        return best_threads;
+    } catch (...) {
+        if (allocated) llama_batch_free(bench_batch);
+        if (bench_context) llama_free(bench_context);
+        return cancelled.load() ? -2 : -1;
+    }
+}
+
+extern "C" JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(JNIEnv *env, jobject, jstring text, jint maximum) {
     if (!context || maximum < 1 || maximum > 32768) return 2;
     finish_generation();
@@ -649,7 +721,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_nativeDiagnostics(JNIEnv *env, 
     out << "Requested: " << (options.gpu_layers ? "Vulkan" : "CPU") << "; active: " << (context ? gpu_layers > 0 ? "Vulkan + CPU" : "CPU" : "no model") << '\n';
     out << "GPU layers: " << gpu_layers << "; load attempts: " << gpu_load_attempts
         << "; fallback: " << (fallback.empty() ? "none" : fallback) << '\n';
-    out << "Threads: " << active_threads << " / " << options.threads << "; thermal limit: " << thread_limit.load() << '\n';
+    out << "Threads: " << active_threads << " / " << options.threads << "; thermal/preferred limit: " << thread_limit.load()
+        << "; auto-tuned: " << (tuned_thread_choice ? std::to_string(tuned_thread_choice) : "not run") << '\n';
     out << "Context: " << (context ? llama_n_ctx(context) : options.context) << " / requested " << options.context
         << "; backoffs: " << context_backoffs << "; batch: " << options.batch << "; temperature: " << options.temperature << '\n';
     out << "Generated: " << budget.produced << " / " << budget.limit << "; context shifts: " << shifts
