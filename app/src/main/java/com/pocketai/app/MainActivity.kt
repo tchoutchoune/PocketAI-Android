@@ -339,9 +339,16 @@ class MainActivity : AppCompatActivity() {
         settingsPanel.addView(text("Diagnostics", 18f, true))
         settingsPanel.addView(button("Performances en direct") { showPerformanceDialog() })
         settingsPanel.addView(button("Voir le matériel et le moteur") {
-            MaterialAlertDialogBuilder(this).setTitle("Diagnostic matériel")
-                .setMessage(HardwareProfile.detect(this).summary + "\n\n" + model.state.value.diagnostics.ifBlank { "Charge un modèle pour confirmer le moteur utilisé." })
-                .setPositiveButton("Fermer", null).show()
+            lifecycleScope.launch {
+                try {
+                    val diagnostics = model.refreshEngineDiagnostics()
+                    MaterialAlertDialogBuilder(this@MainActivity).setTitle("Diagnostic matériel")
+                        .setMessage(HardwareProfile.detect(this@MainActivity).summary + "\n\n" + diagnostics)
+                        .setPositiveButton("Fermer", null).show()
+                } catch (error: Exception) {
+                    showError(error.message ?: "Diagnostic moteur impossible")
+                }
+            }
         })
         if (model.state.value.modelName != null) {
             settingsPanel.addView(button("Recalibrer les threads CPU") { model.retunePerformance() }
