@@ -99,8 +99,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 throw e
             } catch (e: Exception) {
                 logs.failure(label, e)
+                captureNativeFailure()
+                if (engine?.state?.value is InferenceEngine.State.Error) {
+                    activeFile = null
+                    needsHistoryRestore = true
+                    update { it.copy(modelName = null) }
+                }
                 update { it.copy(status = "Action interrompue", error = e.message ?: "Une erreur est survenue") }
             } finally {
+                if (engine?.state?.value is InferenceEngine.State.Error) {
+                    activeFile = null
+                    needsHistoryRestore = true
+                    update { it.copy(modelName = null) }
+                }
                 update { s -> s.copy(busy = false, messages = s.messages.map { it.copy(isStreaming = false) }) }
                 withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
                     try { conversations.save(state.value.messages) }
@@ -111,6 +122,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
+    }
+
+    private suspend fun captureNativeFailure() {
+        val current = engine ?: return
+        try {
+            val info = current.diagnostics()
+            // These native fields never contain prompts, model paths or credentials.
+            info.lineSequence().forEach { logs.event("native_failure $it") }
+            update { it.copy(diagnostics = info) }
+        } catch (_: Exception) { /* Keep the original failure. */ }
     }
 
     fun stop() {
@@ -180,13 +201,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
             }
-            activeOptions = requestedOptions.copy(threads = selectedThreads)
+            activeOptions = requestedOptions.copy(threads = selectedThreads, gpuLayers = activeGpuLayers, contextSize = actualContext)
 
             inference.setSystemPrompt(SYSTEM_PROMPT)
             thermalListener.onThermalStatusChanged(runCatching { power.currentThermalStatus }.getOrDefault(0))
             val info = inference.diagnostics()
             val finalContext = Regex("Context: (\\d+)").find(info)?.groupValues?.get(1)?.toIntOrNull() ?: actualContext
             val finalGpuLayers = Regex("GPU layers: (\\d+)").find(info)?.groupValues?.get(1)?.toIntOrNull() ?: activeGpuLayers
+            activeOptions = activeOptions.copy(gpuLayers = finalGpuLayers, contextSize = finalContext)
             val backend = if (finalGpuLayers > 0) "$finalGpuLayers couches GPU" else "CPU"
             activeFile = file
             needsHistoryRestore = true
@@ -200,8 +222,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
         } catch (error: Exception) {
+            captureNativeFailure()
             activeFile = null
-            update { it.copy(modelName = null, diagnostics = "") }
+            update { it.copy(modelName = null) }
             withContext(kotlinx.coroutines.NonCancellable) {
                 try { inference.cleanUp() } catch (cleanupError: Exception) { logs.failure("model_cleanup", cleanupError) }
             }
@@ -248,7 +271,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         gpuLayers: Int,
         contextSize: Int,
         maxThreads: Int,
-    ): String = "thread_tune_v1_${file.name.hashCode()}_${file.length()}_${profile.cpuCores}_${gpuLayers}_${contextSize}_t$maxThreads"
+    ): String = "thread_tune_v2_sync_${file.name.hashCode()}_${file.length()}_${profile.cpuCores}_${gpuLayers}_${contextSize}_t$maxThreads"
 
     private data class PreparedPrompt(val text: String, val tokens: Int, val capacity: Int)
 
@@ -259,6 +282,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         previousMessages: List<ChatMessage>,
     ): PreparedPrompt {
         val inference = inference()
+        // Restore UI history into a fresh native conversation, including after a
+        // cancelled partial response; never append it to an already resident KV history.
+        if (needsHistoryRestore) inference.setSystemPrompt(SYSTEM_PROMPT)
         val capacity = inference.promptCapacity()
         var history = if (needsHistoryRestore) previousMessages.takeLast(8) else emptyList()
         val originalHistorySize = history.size
@@ -336,14 +362,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             var chunks = 0
             logs.event("prompt_ready tokens=${prepared.tokens} capacity=${prepared.capacity} generation_budget=$generationBudget")
             thermalListener.onThermalStatusChanged(runCatching { power.currentThermalStatus }.getOrDefault(0))
-            inference().sendUserPrompt(prepared.text, generationBudget).collect { token ->
-                buffer.append(token)
-                chunks++
-                val now = android.os.SystemClock.elapsedRealtime()
-                if (now - lastPaint >= 160) {
-                    lastPaint = now
-                    update { s -> s.copy(messages = s.messages.map { if (it.id == response.id) it.copy(content = buffer.toString()) else it }) }
+            try {
+                inference().sendUserPrompt(prepared.text, generationBudget).collect { token ->
+                    buffer.append(token)
+                    chunks++
+                    val now = android.os.SystemClock.elapsedRealtime()
+                    if (now - lastPaint >= 160) {
+                        lastPaint = now
+                        update { s -> s.copy(messages = s.messages.map { if (it.id == response.id) it.copy(content = buffer.toString()) else it }) }
+                    }
                 }
+            } catch (error: Exception) {
+                needsHistoryRestore = true
+                update { s -> s.copy(messages = s.messages.map {
+                    if (it.id == response.id) it.copy(content = buffer.toString(), isStreaming = false) else it
+                }) }
+                throw error
             }
             needsHistoryRestore = false
             val info = inference().diagnostics()

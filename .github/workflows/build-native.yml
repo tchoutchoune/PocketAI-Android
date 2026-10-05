@@ -10,16 +10,23 @@ on:
       - '*.gradle.kts'
       - 'gradle.properties'
       - 'scripts/**'
+      - 'docs/ADRENO-840-VALIDATION.md'
       - '.github/workflows/build-native.yml'
 
 permissions:
   contents: read
 
+# Keep only the newest build for a branch. PocketAI native builds are expensive and
+# stale queued runs delay the APK the device tester actually needs.
+concurrency:
+  group: pocketai-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   android:
     runs-on: ubuntu-24.04
     container: debian:trixie
-    timeout-minutes: 90
+    timeout-minutes: 35
     env:
       DEBIAN_FRONTEND: noninteractive
     steps:
@@ -61,10 +68,10 @@ jobs:
           POCKETAI_VULKAN_DIR: /usr
           CMAKE_BUILD_PARALLEL_LEVEL: '4'
         run: bash scripts/build.sh
-      - name: Upload APK and verification evidence
+      - name: Upload APKs and verification evidence
         uses: actions/upload-artifact@v6
         with:
-          name: PocketAI-4.0-arm64-debug
+          name: PocketAI-4.2.2-arm64-vulkan-test
           path: out/*
           retention-days: 14
           if-no-files-found: error
