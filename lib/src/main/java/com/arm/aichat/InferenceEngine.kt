@@ -19,6 +19,12 @@ interface InferenceEngine {
     /** Hardware, backend selection, fallback reason, and last generation throughput. */
     suspend fun diagnostics(): String
 
+    /** Exact token count for a new user message using the loaded model tokenizer and chat template. */
+    suspend fun promptTokenCount(message: String): Int
+
+    /** Maximum token count a single new user turn can occupy while preserving the system prompt. */
+    suspend fun promptCapacity(): Int
+
     /** Cancel a native decode or model load without waiting for the inference dispatcher. */
     fun cancelGeneration()
 
