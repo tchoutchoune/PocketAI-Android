@@ -36,6 +36,7 @@ import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.textfield.TextInputLayout
 import com.google.android.material.switchmaterial.SwitchMaterial
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -336,6 +337,7 @@ class MainActivity : AppCompatActivity() {
         settingsPanel.addView(button("Images · ${if (model.settings.hasImageKey) "configurées" else "à configurer"}") { onlineDialog("image") })
         settingsPanel.addView(button("Vidéos · ${if (model.settings.hasFalKey) "configurées" else "à configurer"}") { onlineDialog("video") })
         settingsPanel.addView(text("Diagnostics", 18f, true))
+        settingsPanel.addView(button("Performances en direct") { showPerformanceDialog() })
         settingsPanel.addView(button("Voir le matériel et le moteur") {
             MaterialAlertDialogBuilder(this).setTitle("Diagnostic matériel")
                 .setMessage(HardwareProfile.detect(this).summary + "\n\n" + model.state.value.diagnostics.ifBlank { "Charge un modèle pour confirmer le moteur utilisé." })
@@ -355,6 +357,34 @@ class MainActivity : AppCompatActivity() {
             } else toast("Termine l’enregistrement en cours.")
         })
         settingsPanel.addView(text("Les logs contiennent le matériel, les réglages et les erreurs techniques. Le texte de tes conversations et les clés API ne sont pas journalisés.", 13f))
+    }
+
+    private fun showPerformanceDialog() {
+        val body = TextView(this).apply {
+            textSize = 13f
+            setTextColor(Color.parseColor("#D6E2EA"))
+            typeface = android.graphics.Typeface.MONOSPACE
+            setTextIsSelectable(true)
+            setPadding(dp(16), dp(8), dp(16), dp(16))
+        }
+        val scroll = ScrollView(this).apply {
+            isFillViewport = true
+            addView(body, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        val dialog = MaterialAlertDialogBuilder(this)
+            .setTitle("Performances PocketAI")
+            .setView(scroll)
+            .setPositiveButton("Fermer", null)
+            .create()
+        dialog.setOnShowListener {
+            lifecycleScope.launch {
+                while (dialog.isShowing) {
+                    body.text = model.performanceReport()
+                    delay(1000)
+                }
+            }
+        }
+        dialog.show()
     }
 
     private fun onlineDialog(kind: String) {
