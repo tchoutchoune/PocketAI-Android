@@ -56,7 +56,10 @@ internal class LocalDocumentReader(private val context: Context) {
                     name to size
                 }
             }
-        val name = metadata?.first?.takeIf { !it.isNullOrBlank() } ?: "document.txt"
+        val name = (metadata?.first?.takeIf { !it.isNullOrBlank() } ?: "document.txt")
+            .replace(Regex("[\\r\\n\\t]"), " ")
+            .trim()
+            .take(160)
         val declaredSize = metadata?.second
         require(declaredSize == null || declaredSize <= TextDocumentDecoder.MAX_BYTES) {
             "Le fichier $name dépasse 2 Mo. Sélectionne un fichier plus petit ou un extrait."
@@ -83,7 +86,7 @@ internal class LocalDocumentReader(private val context: Context) {
         require(text.isNotBlank()) { "Le fichier $name ne contient pas de texte exploitable." }
 
         LocalAttachment(
-            displayName = name.take(160),
+            displayName = name,
             mimeType = mime.take(120),
             text = text,
             sourceBytes = bytes.size.toLong(),
