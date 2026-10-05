@@ -60,6 +60,9 @@ bool needs_end_of_turn = false;
 bool context_dirty = false;
 int shifts = 0;
 int turn_evictions = 0;
+int gpu_load_attempts = 0;
+int context_backoffs = 0;
+int tuned_thread_choice = 0;
 int64_t generation_start = 0;
 int64_t generation_end = 0;
 int64_t prompt_us = 0;
@@ -77,6 +80,11 @@ void private_backend_log(ggml_log_level level, const char *, void *) {
 
 bool abort_decode(void *) { return cancelled.load(std::memory_order_relaxed); }
 bool load_progress(float, void *) { return !cancelled.load(std::memory_order_relaxed); }
+
+void note_fallback(const std::string &message) {
+    if (!fallback.empty()) fallback += "; ";
+    fallback += message;
+}
 
 void throw_io(JNIEnv *env, const char *message) {
     const auto type = env->FindClass("java/io/IOException");
@@ -160,17 +168,27 @@ void free_model() {
     gpu_layers = 0;
 }
 
-bool load_selected_model(bool use_gpu) {
+bool load_selected_model_layers(int layers) {
+    const bool use_gpu = layers > 0 && gpu;
     auto params = llama_model_default_params();
     ggml_backend_dev_t devices[2] = {use_gpu ? gpu : nullptr, nullptr};
     params.devices = devices;
-    params.n_gpu_layers = use_gpu ? options.gpu_layers : 0;
+    params.n_gpu_layers = use_gpu ? layers : 0;
     params.split_mode = LLAMA_SPLIT_MODE_NONE;
     params.progress_callback = load_progress;
     params.progress_callback_user_data = nullptr;
+    ++gpu_load_attempts;
     model = llama_model_load_from_file(model_path.c_str(), params);
-    if (model) gpu_layers = use_gpu ? std::min(options.gpu_layers, llama_model_n_layer(model) + 1) : 0;
+    if (model) gpu_layers = use_gpu ? std::min(layers, llama_model_n_layer(model) + 1) : 0;
     return model != nullptr;
+}
+
+bool reload_model_layers(int layers) {
+    free_context();
+    if (model) { llama_model_free(model); model = nullptr; }
+    gpu_layers = 0;
+    try { return load_selected_model_layers(layers); }
+    catch (...) { return false; }
 }
 
 llama_context *new_context(int requested = 0) {
@@ -352,6 +370,9 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_configureNative(JNIEnv *env, jo
     thread_limit.store(threads);
     active_threads = threads;
     fallback.clear();
+    gpu_load_attempts = 0;
+    context_backoffs = 0;
+    tuned_thread_choice = 0;
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -370,17 +391,45 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstr
     free_model();
     model_path = java_text(env, path);
     fallback.clear();
+    gpu_load_attempts = 0;
+    context_backoffs = 0;
     const bool want_gpu = options.gpu_layers > 0 && gpu;
-    if (options.gpu_layers > 0 && !gpu) fallback = "Vulkan device unavailable; CPU selected";
-    try { if (load_selected_model(want_gpu)) return 0; }
-    catch (...) { log_event(ANDROID_LOG_WARN, "Model backend load failed"); }
+    if (options.gpu_layers > 0 && !gpu) note_fallback("Vulkan device unavailable; CPU selected");
+
+    if (!want_gpu) {
+        try { return load_selected_model_layers(0) ? 0 : 1; }
+        catch (...) { return 1; }
+    }
+
+    // Fast path: request the maximum selected offload. llama.cpp clamps this to the model.
+    try { if (load_selected_model_layers(options.gpu_layers)) return 0; }
+    catch (...) { log_event(ANDROID_LOG_WARN, "Maximum Vulkan offload failed"); }
     if (cancelled.load()) return 3;
-    if (want_gpu) {
-        if (model) { llama_model_free(model); model = nullptr; }
-        gpu_layers = 0;
-        fallback = "GPU model allocation failed; CPU fallback";
-        log_event(ANDROID_LOG_WARN, "Retrying model on CPU");
-        try { if (load_selected_model(false)) return 0; } catch (...) { }
+    if (model) { llama_model_free(model); model = nullptr; }
+
+    // Load once on CPU to discover the exact layer count, then retry useful partial offloads.
+    int model_layers = 0;
+    try {
+        if (load_selected_model_layers(0)) model_layers = llama_model_n_layer(model) + 1;
+    } catch (...) { model_layers = 0; }
+    if (cancelled.load()) return 3;
+    if (!model) return 1;
+    llama_model_free(model); model = nullptr;
+
+    const int requested = std::min(options.gpu_layers, model_layers);
+    for (const int layers : pocketai::gpu_layer_candidates(requested)) {
+        if (cancelled.load()) return 3;
+        if (layers == requested || layers == 0) continue;
+        if (reload_model_layers(layers)) {
+            note_fallback("Vulkan model load auto-tuned to " + std::to_string(gpu_layers) + " layers");
+            return 0;
+        }
+    }
+
+    log_event(ANDROID_LOG_WARN, "Partial Vulkan model loading failed; selecting CPU");
+    if (reload_model_layers(0)) {
+        note_fallback("Vulkan model allocation failed; CPU selected");
+        return 0;
     }
     return 1;
 }
@@ -388,15 +437,43 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstr
 extern "C" JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv *, jobject) {
     if (!model) return 1;
+    const int requested_context = options.context;
+    const int initial_gpu_layers = gpu_layers;
+
     free_context();
-    try { context = new_context(); } catch (...) { context = nullptr; }
-    if (!context && gpu_layers > 0 && !cancelled.load()) {
-        llama_model_free(model); model = nullptr;
-        gpu_layers = 0;
-        fallback = "GPU context allocation failed; CPU fallback";
-        log_event(ANDROID_LOG_WARN, "Retrying context on CPU");
-        try { if (load_selected_model(false)) context = new_context(); } catch (...) { context = nullptr; }
+    try { context = new_context(requested_context); } catch (...) { context = nullptr; }
+
+    // Preserve the requested context first: progressively reduce Vulkan offload before
+    // sacrificing context length. This avoids the old all-or-nothing GPU -> CPU jump.
+    if (!context && initial_gpu_layers > 0 && !cancelled.load()) {
+        for (const int layers : pocketai::gpu_layer_candidates(initial_gpu_layers)) {
+            if (layers >= initial_gpu_layers) continue;
+            if (cancelled.load()) break;
+            if (!reload_model_layers(layers)) continue;
+            try { context = new_context(requested_context); } catch (...) { context = nullptr; }
+            if (context) {
+                note_fallback("Vulkan context auto-tuned " + std::to_string(initial_gpu_layers) +
+                              " -> " + std::to_string(gpu_layers) + " layers");
+                break;
+            }
+        }
     }
+
+    // If the requested context still does not fit, retain the current backend and back
+    // down through standard context sizes. promptCapacity() always exposes the real size.
+    if (!context && model && !cancelled.load()) {
+        for (const int candidate : pocketai::context_backoff_candidates(requested_context)) {
+            free_context();
+            try { context = new_context(candidate); } catch (...) { context = nullptr; }
+            if (context) {
+                ++context_backoffs;
+                note_fallback("context auto-tuned " + std::to_string(requested_context) +
+                              " -> " + std::to_string(candidate));
+                break;
+            }
+        }
+    }
+
     if (!context || cancelled.load()) { free_context(); return 1; }
     try {
         batch = llama_batch_init(options.batch, 0, 1);
@@ -444,6 +521,83 @@ extern "C" JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_promptCapacityNative(JNIEnv *, jobject) {
     if (!context) return -1;
     return std::max(0, static_cast<int>(llama_n_ctx(context)) - static_cast<int>(system_position) - HEADROOM - 1);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_tuneThreadsNative(JNIEnv *, jobject, jint maximum) {
+    if (!model || !context || maximum < 1 || maximum > 32) return -1;
+    llama_context *bench_context = nullptr;
+    llama_batch bench_batch{};
+    bool allocated = false;
+    try {
+        bench_context = new_context(512);
+        if (!bench_context) return -1;
+        bench_batch = llama_batch_init(1, 0, 1);
+        allocated = true;
+        if (!bench_batch.token || !bench_batch.pos || !bench_batch.seq_id || !bench_batch.logits)
+            throw std::runtime_error("thread tune batch allocation");
+
+        const auto candidates = pocketai::thread_candidates(static_cast<int>(maximum));
+
+        const auto vocab = llama_model_get_vocab(model);
+        auto token = llama_vocab_bos(vocab);
+        if (token < 0) token = 0;
+        double best_speed = -1.0;
+        int best_threads = std::min(static_cast<int>(maximum), options.threads);
+        std::vector<int> tested;
+
+        const auto benchmark = [&](int threads) {
+            if (cancelled.load()) throw std::runtime_error("cancelled");
+            llama_memory_clear(llama_get_memory(bench_context), false);
+            llama_set_n_threads(bench_context, threads, threads);
+
+            // One warm-up token is enough to wake CPU/GPU clocks without making tuning intrusive.
+            common_batch_clear(bench_batch);
+            common_batch_add(bench_batch, token, 0, {0}, true);
+            if (llama_decode(bench_context, bench_batch)) throw std::runtime_error("thread tune warmup");
+
+            llama_memory_clear(llama_get_memory(bench_context), false);
+            const auto started = ggml_time_us();
+            constexpr int TOKENS = 6;
+            for (int i = 0; i < TOKENS; ++i) {
+                if (cancelled.load()) throw std::runtime_error("cancelled");
+                common_batch_clear(bench_batch);
+                common_batch_add(bench_batch, token, i, {0}, true);
+                if (llama_decode(bench_context, bench_batch)) throw std::runtime_error("thread tune decode");
+            }
+            const auto elapsed = std::max<int64_t>(1, ggml_time_us() - started);
+            return TOKENS * 1e6 / elapsed;
+        };
+
+        const auto consider = [&](int threads) {
+            if (threads < 1 || threads > maximum ||
+                std::find(tested.begin(), tested.end(), threads) != tested.end()) return;
+            const double speed = benchmark(threads);
+            tested.push_back(threads);
+            if (speed > best_speed) {
+                best_speed = speed;
+                best_threads = threads;
+            }
+        };
+
+        for (const int threads : candidates) consider(threads);
+        const int coarse_best = best_threads;
+        consider(coarse_best - 1);
+        consider(coarse_best + 1);
+
+        llama_batch_free(bench_batch);
+        llama_free(bench_context);
+        tuned_thread_choice = best_threads;
+        thread_limit.store(best_threads);
+        active_threads = std::max(1, std::min(options.threads, best_threads));
+        llama_set_n_threads(context, active_threads, active_threads);
+        log_event(ANDROID_LOG_INFO, "CPU thread auto-tune completed");
+        return best_threads;
+    } catch (...) {
+        if (allocated) llama_batch_free(bench_batch);
+        if (bench_context) llama_free(bench_context);
+        return cancelled.load() ? -2 : -1;
+    }
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -550,9 +704,12 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_nativeDiagnostics(JNIEnv *env, 
     out.precision(3);
     out << "Vulkan GPU: " << (gpu_description.empty() ? "unavailable (device/driver unsupported or backend absent)" : gpu_description) << '\n';
     out << "Requested: " << (options.gpu_layers ? "Vulkan" : "CPU") << "; active: " << (context ? gpu_layers > 0 ? "Vulkan + CPU" : "CPU" : "no model") << '\n';
-    out << "GPU layers: " << gpu_layers << "; fallback: " << (fallback.empty() ? "none" : fallback) << '\n';
-    out << "Threads: " << active_threads << " / " << options.threads << "; thermal limit: " << thread_limit.load() << '\n';
-    out << "Context: " << (context ? llama_n_ctx(context) : options.context) << "; batch: " << options.batch << "; temperature: " << options.temperature << '\n';
+    out << "GPU layers: " << gpu_layers << "; load attempts: " << gpu_load_attempts
+        << "; fallback: " << (fallback.empty() ? "none" : fallback) << '\n';
+    out << "Threads: " << active_threads << " / " << options.threads << "; thermal/preferred limit: " << thread_limit.load()
+        << "; auto-tuned: " << (tuned_thread_choice ? std::to_string(tuned_thread_choice) : "not run") << '\n';
+    out << "Context: " << (context ? llama_n_ctx(context) : options.context) << " / requested " << options.context
+        << "; backoffs: " << context_backoffs << "; batch: " << options.batch << "; temperature: " << options.temperature << '\n';
     out << "Generated: " << budget.produced << " / " << budget.limit << "; context shifts: " << shifts
         << "; turn evictions: " << turn_evictions << "; resident turns: " << turns.size() << '\n';
     const int64_t duration = generation_start ? (generation_end ? generation_end : ggml_time_us()) - generation_start : 0;

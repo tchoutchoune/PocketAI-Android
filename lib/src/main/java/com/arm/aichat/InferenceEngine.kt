@@ -25,6 +25,9 @@ interface InferenceEngine {
     /** Maximum token count a single new user turn can occupy while preserving the system prompt. */
     suspend fun promptCapacity(): Int
 
+    /** Benchmark the loaded backend and select the fastest CPU thread count up to [maxThreads]. */
+    suspend fun tuneThreads(maxThreads: Int): Int
+
     /** Cancel a native decode or model load without waiting for the inference dispatcher. */
     fun cancelGeneration()
 

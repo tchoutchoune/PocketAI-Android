@@ -20,6 +20,37 @@ inline int discard_count(int position, int system, int required, int capacity) {
     return std::min(history, std::max(position + required - capacity, std::max(1, history / 2)));
 }
 
+inline std::vector<int> gpu_layer_candidates(int requested) {
+    std::vector<int> result;
+    const auto add = [&](int value) {
+        value = std::max(0, value);
+        if (std::find(result.begin(), result.end(), value) == result.end()) result.push_back(value);
+    };
+    add(requested);
+    if (requested > 1) add(std::max(1, requested * 3 / 4));
+    if (requested > 1) add(std::max(1, requested / 2));
+    if (requested > 1) add(std::max(1, requested / 4));
+    add(0);
+    return result;
+}
+
+inline std::vector<int> context_backoff_candidates(int requested) {
+    std::vector<int> result;
+    for (int value : {32768, 16384, 8192, 4096, 2048, 1024, 512}) {
+        if (value < requested) result.push_back(value);
+    }
+    return result;
+}
+
+inline std::vector<int> thread_candidates(int maximum) {
+    if (maximum <= 1) return {1};
+    std::vector<int> result;
+    for (int value : {2, 4, 6, 8, maximum}) {
+        if (value <= maximum && std::find(result.begin(), result.end(), value) == result.end()) result.push_back(value);
+    }
+    return result;
+}
+
 // Complete UTF-8 prefixes only; an unfinished multibyte token waits for the next token.
 inline bool complete_utf8(const std::string &text) {
     for (size_t i = 0; i < text.size();) {

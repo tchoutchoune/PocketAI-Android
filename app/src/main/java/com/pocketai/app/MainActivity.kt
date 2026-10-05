@@ -36,6 +36,7 @@ import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.textfield.TextInputLayout
 import com.google.android.material.switchmaterial.SwitchMaterial
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -324,9 +325,9 @@ class MainActivity : AppCompatActivity() {
                     toast("Profil appliqué au prochain chargement du modèle")
                 }.setNegativeButton("Fermer", null).show()
         })
-        settingsPanel.addView(text("La RAM détermine la taille du contexte ; les cœurs CPU et Vulkan sont détectés automatiquement. La chauffe réduit les threads pendant la génération. Le GPU est activé seulement si le moteur le confirme.", 14f))
+        settingsPanel.addView(text("PocketAI adapte le contexte à la RAM, cherche automatiquement le meilleur nombre de couches Vulkan et calibre les threads CPU sur le modèle chargé. En cas de chauffe, les threads sont réduits dynamiquement.", 14f))
         settingsPanel.addView(button("Longueur maximale : ${model.maxTokens} tokens") {
-            val values = intArrayOf(256, 512, 1024, 2048)
+            val values = intArrayOf(256, 512, 1024, 2048, 4096, 8192)
             MaterialAlertDialogBuilder(this).setTitle("Longueur des réponses")
                 .setItems(values.map { "$it tokens" }.toTypedArray()) { _, index -> model.maxTokens = values[index]; renderSettings() }.show()
         })
@@ -336,11 +337,17 @@ class MainActivity : AppCompatActivity() {
         settingsPanel.addView(button("Images · ${if (model.settings.hasImageKey) "configurées" else "à configurer"}") { onlineDialog("image") })
         settingsPanel.addView(button("Vidéos · ${if (model.settings.hasFalKey) "configurées" else "à configurer"}") { onlineDialog("video") })
         settingsPanel.addView(text("Diagnostics", 18f, true))
+        settingsPanel.addView(button("Performances en direct") { showPerformanceDialog() })
         settingsPanel.addView(button("Voir le matériel et le moteur") {
             MaterialAlertDialogBuilder(this).setTitle("Diagnostic matériel")
                 .setMessage(HardwareProfile.detect(this).summary + "\n\n" + model.state.value.diagnostics.ifBlank { "Charge un modèle pour confirmer le moteur utilisé." })
                 .setPositiveButton("Fermer", null).show()
         })
+        if (model.state.value.modelName != null) {
+            settingsPanel.addView(button("Recalibrer les threads CPU") { model.retunePerformance() }
+                .apply { isEnabled = !model.state.value.busy })
+            settingsPanel.addView(text("Le recalibrage compare plusieurs nombres de threads sur le modèle et le backend actuellement chargés. Le résultat est mémorisé pour les prochains chargements.", 13f))
+        }
         settingsPanel.addView(button("Exporter les logs de débogage") {
             if (pendingSave == null && !exportInProgress) lifecycleScope.launch {
                 exportInProgress = true
@@ -350,6 +357,35 @@ class MainActivity : AppCompatActivity() {
             } else toast("Termine l’enregistrement en cours.")
         })
         settingsPanel.addView(text("Les logs contiennent le matériel, les réglages et les erreurs techniques. Le texte de tes conversations et les clés API ne sont pas journalisés.", 13f))
+    }
+
+    private fun showPerformanceDialog() {
+        val body = TextView(this).apply {
+            textSize = 13f
+            setTextColor(Color.parseColor("#D6E2EA"))
+            typeface = android.graphics.Typeface.MONOSPACE
+            setTextIsSelectable(true)
+            setPadding(dp(16), dp(8), dp(16), dp(16))
+        }
+        val scroll = ScrollView(this).apply {
+            isFillViewport = true
+            addView(body, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        val dialog = MaterialAlertDialogBuilder(this)
+            .setTitle("Performances PocketAI")
+            .setView(scroll)
+            .setPositiveButton("Fermer", null)
+            .create()
+        dialog.setOnShowListener {
+            lifecycleScope.launch {
+                while (dialog.isShowing) {
+                    val report = withContext(Dispatchers.Default) { model.performanceReport() }
+                    if (dialog.isShowing) body.text = report
+                    delay(1000)
+                }
+            }
+        }
+        dialog.show()
     }
 
     private fun onlineDialog(kind: String) {

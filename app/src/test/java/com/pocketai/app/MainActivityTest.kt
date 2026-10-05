@@ -77,4 +77,13 @@ class MainActivityTest {
         assertEquals("Bonjour", input.text.toString())
         assertTrue(ViewModelProvider(activity)[ChatViewModel::class.java].state.value.messages.isEmpty())
     }
+
+    @Test fun responseLengthSupportsLargeButBoundedGenerationBudgets() {
+        val activity = start()
+        val model = ViewModelProvider(activity)[ChatViewModel::class.java]
+        model.maxTokens = 8192
+        assertEquals(8192, model.maxTokens)
+        model.maxTokens = 100_000
+        assertEquals(8192, model.maxTokens)
+    }
 }
