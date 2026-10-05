@@ -159,7 +159,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 profile.thermalStatus < PowerManager.THERMAL_STATUS_MODERATE &&
                 performanceMode != "eco"
             if (canTune) {
-                val key = threadTuneKey(file, profile, activeGpuLayers, actualContext)
+                val key = threadTuneKey(file, profile, activeGpuLayers, actualContext, requestedOptions.threads)
                 val cached = prefs.getInt(key, 0).takeIf { it in 1..requestedOptions.threads }
                 selectedThreads = if (cached != null) {
                     inference.setThreadLimit(cached)
@@ -235,7 +235,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             val tuned = inference().tuneThreads(ceiling)
             activeOptions = activeOptions.copy(threads = tuned)
             thermalListener.onThermalStatusChanged(runCatching { power.currentThermalStatus }.getOrDefault(0))
-            prefs.edit().putInt(threadTuneKey(file, profile, gpuLayers, contextSize), tuned).apply()
+            prefs.edit().putInt(threadTuneKey(file, profile, gpuLayers, contextSize, ceiling), tuned).apply()
             val info = inference().diagnostics()
             logs.event("thread_retuned threads=$tuned max=$ceiling gpu_layers=$gpuLayers context=$contextSize")
             update { it.copy(status = "Recalibrage terminé · $tuned threads", diagnostics = info) }
@@ -247,7 +247,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         profile: HardwareProfile,
         gpuLayers: Int,
         contextSize: Int,
-    ): String = "thread_tune_v1_${file.name.hashCode()}_${file.length()}_${profile.cpuCores}_${gpuLayers}_$contextSize"
+        maxThreads: Int,
+    ): String = "thread_tune_v1_${file.name.hashCode()}_${file.length()}_${profile.cpuCores}_${gpuLayers}_${contextSize}_t$maxThreads"
 
     private data class PreparedPrompt(val text: String, val tokens: Int, val capacity: Int)
 
