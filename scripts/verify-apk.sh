@@ -32,7 +32,8 @@ with ZipFile(apk) as z:
     (out/'PAGE-ALIGNMENT.txt').write_text(f'All {len(libs)} ARM64 native libraries support 16 KB page alignment.\n')
 badging=(out/'PACKAGE.txt').read_text()
 assert "name='com.pocketai.app.vulkanfix'" in badging
-assert "versionCode='421'" in badging\nassert "versionName='4.2.1-vulkanfix'" in badging
+assert "versionCode='421'" in badging
+assert "versionName='4.2.1-vulkanfix'" in badging
 print(f'Validated {len(libs)} ARM64 native libraries, including Vulkan')
 PY
 cp "$TASK_APK" "$TASK_REPO/out/PocketAI-4.2.1-VulkanFix-arm64-debug.apk"
