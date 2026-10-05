@@ -33,18 +33,54 @@ Status: hardware validation required. Passing CI is not a Vulkan device certific
    all GPU candidates failing, cancellation, invalid CPU/GPU logits and resource ownership.
 
 These tests exercise production control flow but do not execute real Vulkan kernels.
-CI also builds ARM64/Vulkan, executes JVM tests and checks APK signing, native libraries
-and 16 KiB ELF alignment. Instrumentation tests are compiled, not run on CI.
+CI also builds ARM64/Vulkan, executes JVM tests and checks APK signing, native libraries,
+16 KiB ELF alignment and the generated instrumentation APK. Instrumentation tests are
+compiled and packaged by CI but must run on the physical Adreno 840 device.
+
+The real-device test now checks deterministic semantics, not merely non-empty output.
+The first turn must produce 4 for 2+2, the second turn must use conversation history
+and produce 5, invalid UTF-8 is rejected and a repeated-character run such as the
+previously observed `@@@@` corruption fails the test.
 
 ## Identify the tested binary
 
 Use the artifact `PocketAI-4.2.2-arm64-vulkan-test` for the exact CI commit.
+It contains:
+
+- `PocketAI-4.2.2-arm64-vulkan-test.apk`: isolated UI build,
+  package `com.pocketai.app.vulkanvalidation`, label `PocketAI Vulkan Test`.
+- `PocketAI-4.2.2-engine-androidTest.apk`: engine instrumentation test.
+- `DEVICE-SMOKE.sh`: ADB helper that installs the instrumentation APK, optionally
+  pushes a local GGUF, runs CPU and requested-Vulkan passes and captures diagnostics.
+- `ADRENO-840-VALIDATION.md`, `SOURCE-COMMIT.txt`, `SHA256.txt` and verification evidence.
+
 Record `SOURCE-COMMIT.txt`, `SHA256.txt`, APK version, model SHA256, Android build
 and GPU driver. The diagnostic session embeds the source revision and application ID.
-The test app installs separately as `com.pocketai.app.vulkanvalidation`, labelled
-`PocketAI Vulkan Test`. Its models/preferences are separate from an existing installation.
-The CI debug signing key may change between builds: upgrading an earlier test install
-can require removing only that test app. Do not uninstall the user's main app.
+The UI validation build is isolated from the normal PocketAI package. Its models and
+preferences are therefore separate. The CI debug signing key may change between builds:
+upgrading an earlier test install can require removing only the validation package.
+Do not uninstall the user's main app.
+
+## One-command engine validation
+
+Recommended from a computer with Android platform-tools and the exact GGUF available locally:
+
+```bash
+bash DEVICE-SMOKE.sh --local-model /path/to/Qwen2.5-3B-Instruct-Q4_K_M.gguf
+```
+
+That mode proves reliability even if PocketAI automatically falls all the way back to CPU.
+To validate that the requested Vulkan pass remains active:
+
+```bash
+bash DEVICE-SMOKE.sh --local-model /path/to/Qwen2.5-3B-Instruct-Q4_K_M.gguf --require-vulkan
+```
+
+The helper refuses to treat an instrumentation skip as success and writes both the
+instrumentation result and filtered native/device diagnostics beside the script.
+
+An existing device path can be used with `--device-model`, but it must be readable
+by the instrumentation package. If Android scoped storage blocks it, use `--local-model`.
 
 ## Required device matrix
 
@@ -53,6 +89,7 @@ Keep a CPU reference with identical model and prompts.
 
 | Case | Acceptance |
 | --- | --- |
+| Automated CPU + requested-Vulkan smoke test | Correct numeric semantics across two turns; no `@@@@`-style degeneracy; no invalid UTF-8; raw decode status clean |
 | Cold load and first short prompt, then a second turn | Non-empty coherent responses; no immediate decode error |
 | Formatted prompts around 10, 29, 255, 256, 257 tokens and multiple batches | Prefill/logit/generation transitions work |
 | Output override | Confirm output projection placement with an instrumented graph/backend trace; layer count alone is insufficient |
