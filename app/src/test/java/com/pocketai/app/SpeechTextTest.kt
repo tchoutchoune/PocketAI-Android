@@ -11,7 +11,7 @@ class SpeechTextTest {
             "# Titre\nVoici **une réponse** avec [un lien](https://example.org/a?secret=x).\n" +
                 "```kotlin\nval secret = \"ne pas lire\"\n```"
         )
-        assertEquals("Titre Voici une réponse avec un lien . Bloc de code.", spoken)
+        assertEquals("Titre Voici une réponse avec un lien. Bloc de code.", spoken)
     }
 
     @Test
