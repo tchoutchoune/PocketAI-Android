@@ -236,20 +236,25 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderModels() {
         modelsPanel.removeAllViews(); pad(modelsPanel)
+        val profile = HardwareProfile.detect(this)
         modelsPanel.addView(text("Le bon modèle pour ton téléphone", 22f, true))
-        modelsPanel.addView(text(HardwareProfile.detect(this).summary, 14f))
-        modelsPanel.addView(text("Commence par 0,5B pour la rapidité. Un modèle plus grand demande davantage de mémoire. Les fichiers restent sur ton téléphone.", 14f))
+        modelsPanel.addView(text(profile.summary, 14f))
+        modelsPanel.addView(text("PocketAI estime la marge mémoire avec la RAM réellement disponible. « Idéal » privilégie la fluidité ; « Exigeant » peut réduire automatiquement le contexte ou le GPU. Les fichiers restent sur ton téléphone.", 14f))
         modelsPanel.addView(button("Importer un fichier GGUF") { importPicker.launch(arrayOf("*/*")) }.apply { isEnabled = !model.state.value.busy })
         modelsPanel.addView(text("Modèles installés", 18f, true))
         val installed = model.models.installed()
-        if (installed.isEmpty()) modelsPanel.addView(text("Aucun modèle pour l’instant. Importe un GGUF ou télécharge un modèle ci-dessous.", 14f))
+        if (installed.isEmpty()) modelsPanel.addView(text("Aucun modèle pour l’instant. Importe un GGUF ou choisis un modèle vérifié ci-dessous.", 14f))
         installed.forEach { file ->
+            val advice = profile.adviseModel(file.length(), model.performanceMode)
             val contents = column()
             contents.addView(text(file.nameWithoutExtension, 16f, true))
-            contents.addView(text("${"%.2f".format(file.length() / (1024.0 * 1024 * 1024))} Go · GGUF local", 13f))
+            contents.addView(text("${advice.fit.label} · ${"%.2f".format(file.length() / (1024.0 * 1024 * 1024))} Go · contexte ~${advice.contextTokens / 1024.0}K · ${if (advice.gpuCandidate) "GPU candidat" else "CPU prévu"}", 13f))
+            contents.addView(text(advice.detail, 12f))
             val controls = row()
             val loaded = model.state.value.modelName == file.nameWithoutExtension
-            controls.addView(button(if (loaded) "Chargé" else "Charger") { model.loadModel(file); tabs.getTabAt(0)?.select() }.apply { isEnabled = !model.state.value.busy && !loaded })
+            controls.addView(button(if (loaded) "Chargé" else "Charger") { model.loadModel(file); tabs.getTabAt(0)?.select() }.apply {
+                isEnabled = !model.state.value.busy && !loaded && advice.fit != ModelFit.AVOID
+            })
             controls.addView(button("Supprimer") {
                 MaterialAlertDialogBuilder(this).setTitle("Supprimer ce modèle ?").setMessage(file.name)
                     .setNegativeButton("Annuler", null).setPositiveButton("Supprimer") { _, _ ->
@@ -260,20 +265,27 @@ class MainActivity : AppCompatActivity() {
         }
         if (model.state.value.modelName != null) modelsPanel.addView(button("Décharger et libérer la mémoire") { model.unloadModel() }.apply { isEnabled = !model.state.value.busy })
         modelsPanel.addView(text("Catalogue vérifié", 18f, true))
-        ModelRepository.catalogue.forEach { entry ->
-            val contents = column()
-            contents.addView(text(entry.title, 17f, true))
-            contents.addView(text(entry.description, 14f))
-            contents.addView(text("${"%.2f".format(entry.sizeBytes / (1024.0 * 1024 * 1024))} Go · intégrité SHA-256 vérifiée", 12f))
-            val controls = row()
-            controls.addView(button("Télécharger") {
-                MaterialAlertDialogBuilder(this).setTitle("Télécharger ${entry.title} ?")
-                    .setMessage("Le téléchargement utilise Internet et ${"%.2f".format(entry.sizeBytes / (1024.0 * 1024 * 1024))} Go de stockage. Consulte la licence du modèle avant utilisation.")
-                    .setNegativeButton("Annuler", null).setPositiveButton("Télécharger") { _, _ -> model.downloadModel(entry) }.show()
-            }.apply { isEnabled = !model.state.value.busy })
-            controls.addView(button("Licence") { openLink(entry.licenseUrl) })
-            contents.addView(controls); modelsPanel.addView(card(contents))
-        }
+        ModelRepository.catalogue
+            .map { it to profile.adviseModel(it.sizeBytes, model.performanceMode) }
+            .sortedWith(compareBy<Pair<ModelEntry, ModelAdvice>> { it.second.fit.ordinal }.thenBy { it.first.sizeBytes })
+            .forEach { (entry, advice) ->
+                val expectedName = Uri.parse(entry.url).lastPathSegment.orEmpty()
+                val alreadyInstalled = installed.any { it.name.equals(expectedName, ignoreCase = true) }
+                val contents = column()
+                contents.addView(text("${entry.title} · ${advice.fit.label}", 17f, true))
+                contents.addView(text(entry.description, 14f))
+                if (entry.useCases.isNotBlank()) contents.addView(text("Idéal pour : ${entry.useCases}", 13f))
+                contents.addView(text("${advice.detail} Contexte prévu ~${advice.contextTokens / 1024.0}K · ${if (advice.gpuCandidate) "GPU candidat" else "CPU prévu"}.", 12f))
+                contents.addView(text("${"%.2f".format(entry.sizeBytes / (1024.0 * 1024 * 1024))} Go · intégrité SHA-256 vérifiée", 12f))
+                val controls = row()
+                controls.addView(button(if (alreadyInstalled) "Déjà installé" else if (advice.fit == ModelFit.AVOID) "Mémoire insuffisante" else "Télécharger") {
+                    MaterialAlertDialogBuilder(this).setTitle("Télécharger ${entry.title} ?")
+                        .setMessage("Le téléchargement utilise Internet et ${"%.2f".format(entry.sizeBytes / (1024.0 * 1024 * 1024))} Go de stockage. Consulte la licence du modèle avant utilisation.")
+                        .setNegativeButton("Annuler", null).setPositiveButton("Télécharger") { _, _ -> model.downloadModel(entry) }.show()
+                }.apply { isEnabled = !model.state.value.busy && !alreadyInstalled && advice.fit != ModelFit.AVOID })
+                controls.addView(button("Licence") { openLink(entry.licenseUrl) })
+                contents.addView(controls); modelsPanel.addView(card(contents))
+            }
     }
 
     private fun renderCreation() {
