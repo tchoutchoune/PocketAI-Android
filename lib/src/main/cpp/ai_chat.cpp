@@ -459,9 +459,14 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(JNIEnv *env, 
             auto eot = llama_vocab_eot(vocab);
             if (eot < 0) eot = llama_vocab_eos(vocab);
             if (eot < 0) { context_dirty = true; return 2; }
-            const int result = decode_prompt({eot}, false);
-            if (result) return result;
-            if (!turns.empty()) turns.back().end = position;
+            // Reserve room first. If this evicts the previous turn entirely, its EOT
+            // must not be decoded as an orphan token at the beginning of the new turn.
+            if (!make_room(1)) { context_dirty = true; return 1; }
+            if (!turns.empty()) {
+                const int result = decode_prompt({eot}, false);
+                if (result) return result;
+                turns.back().end = position;
+            }
             needs_end_of_turn = false;
         }
         const auto user = java_text(env, text);
@@ -489,7 +494,11 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(JNIEnv *env, 
         generation_eog = false;
         generating = true;
         return 0;
-    } catch (...) { context_dirty = true; return 2; }
+    } catch (...) {
+        current_turn_start = -1;
+        context_dirty = true;
+        return 2;
+    }
 }
 
 extern "C" JNIEXPORT jstring JNICALL
