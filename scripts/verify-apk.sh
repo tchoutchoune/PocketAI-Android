@@ -5,10 +5,20 @@ TASK_SDK=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}
 test -n "$TASK_SDK"
 TASK_APK="$TASK_REPO/app/build/outputs/apk/debug/app-debug.apk"
 test -s "$TASK_APK"
+
+TASK_TEST_APK=$(find "$TASK_REPO/lib/build/outputs/apk/androidTest" -type f -name '*-androidTest.apk' -print -quit 2>/dev/null || true)
+test -n "$TASK_TEST_APK"
+test -s "$TASK_TEST_APK"
+
 mkdir -p "$TASK_REPO/out"
 unzip -t "$TASK_APK" > "$TASK_REPO/out/ZIP-CHECK.txt"
 "$TASK_SDK/build-tools/35.0.0/apksigner" verify --verbose "$TASK_APK" > "$TASK_REPO/out/SIGNATURE.txt"
 "$TASK_SDK/build-tools/35.0.0/aapt" dump badging "$TASK_APK" > "$TASK_REPO/out/PACKAGE.txt"
+
+unzip -t "$TASK_TEST_APK" > "$TASK_REPO/out/ENGINE-TEST-ZIP-CHECK.txt"
+"$TASK_SDK/build-tools/35.0.0/apksigner" verify --verbose "$TASK_TEST_APK" > "$TASK_REPO/out/ENGINE-TEST-SIGNATURE.txt"
+"$TASK_SDK/build-tools/35.0.0/aapt" dump badging "$TASK_TEST_APK" > "$TASK_REPO/out/ENGINE-TEST-PACKAGE.txt"
+
 python3 - "$TASK_APK" "$TASK_REPO/out" <<'PY'
 from pathlib import Path
 from zipfile import ZipFile
@@ -33,10 +43,18 @@ with ZipFile(apk) as z:
 badging=(out/'PACKAGE.txt').read_text()
 assert "name='com.pocketai.app.vulkanvalidation'" in badging
 assert "versionCode='40202'" in badging
-print(f'Validated {len(libs)} ARM64 native libraries, including Vulkan')
+test_badging=(out/'ENGINE-TEST-PACKAGE.txt').read_text()
+assert "instrumentation" in test_badging and "androidx.test.runner.AndroidJUnitRunner" in test_badging, test_badging
+print(f'Validated {len(libs)} ARM64 native libraries, including Vulkan, plus the device instrumentation APK')
 PY
+
 cp "$TASK_APK" "$TASK_REPO/out/PocketAI-4.2.2-arm64-vulkan-test.apk"
+cp "$TASK_TEST_APK" "$TASK_REPO/out/PocketAI-4.2.2-engine-androidTest.apk"
+cp "$TASK_REPO/scripts/device-smoke.sh" "$TASK_REPO/out/DEVICE-SMOKE.sh"
+cp "$TASK_REPO/docs/ADRENO-840-VALIDATION.md" "$TASK_REPO/out/ADRENO-840-VALIDATION.md"
+
 cd "$TASK_REPO/out"
-sha256sum PocketAI-4.2.2-arm64-vulkan-test.apk > SHA256.txt
+sha256sum PocketAI-4.2.2-arm64-vulkan-test.apk PocketAI-4.2.2-engine-androidTest.apk > SHA256.txt
 git -C "$TASK_REPO" rev-parse HEAD > SOURCE-COMMIT.txt
 printf '%s\n' "Revision embedded in APK: ${POCKETAI_SOURCE_REVISION:-local}" > BUILD-IDENTITY.txt
+printf '%s\n'     'Manual UI APK: PocketAI-4.2.2-arm64-vulkan-test.apk'     'Engine instrumentation APK: PocketAI-4.2.2-engine-androidTest.apk'     'Real-device helper: bash DEVICE-SMOKE.sh --local-model /path/to/Qwen2.5-3B-Instruct-Q4_K_M.gguf'     'Add --require-vulkan to reject a reliability pass obtained only through CPU fallback.'     > DEVICE-TEST.txt
