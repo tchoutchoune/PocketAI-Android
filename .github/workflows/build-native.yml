@@ -10,6 +10,7 @@ on:
       - '*.gradle.kts'
       - 'gradle.properties'
       - 'scripts/**'
+      - 'docs/ADRENO-840-VALIDATION.md'
       - '.github/workflows/build-native.yml'
 
 permissions:
