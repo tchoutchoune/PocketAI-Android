@@ -48,6 +48,7 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
     private external fun nativeDiagnostics(): String
     private external fun countPromptTokensNative(userPrompt: String): Int
     private external fun promptCapacityNative(): Int
+    private external fun tuneThreadsNative(maxThreads: Int): Int
     private external fun benchModel(pp: Int, tg: Int, pl: Int, nr: Int): String
     private external fun processSystemPrompt(systemPrompt: String): Int
     private external fun processUserPrompt(userPrompt: String, predictLength: Int): Int
@@ -132,6 +133,24 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
             check(modelLoaded && _state.value is InferenceEngine.State.ModelReady) { "Model is not ready" }
             promptCapacityNative().also {
                 if (it < 1) throw IOException("Prompt capacity is unavailable")
+            }
+        }
+    }
+
+    override suspend fun tuneThreads(maxThreads: Int): Int = withContext(dispatcher) {
+        awaitInitialization()
+        require(maxThreads in 1..32) { "Maximum thread count must be between 1 and 32" }
+        mutex.withLock {
+            check(!closing && !destroyed) { "Inference engine is closing or has been destroyed" }
+            check(modelLoaded && _state.value is InferenceEngine.State.ModelReady) { "Model is not ready" }
+            startOperation()
+            _state.value = InferenceEngine.State.Benchmarking
+            try {
+                tuneThreadsNative(maxThreads).also {
+                    if (it < 1) throw IOException("CPU thread auto-tune failed")
+                }
+            } finally {
+                _state.value = InferenceEngine.State.ModelReady
             }
         }
     }
