@@ -14,8 +14,8 @@ import java.util.Locale
  * reports the backend/layers from llama.cpp diagnostics instead of presenting a fabricated value.
  */
 class PerformanceMonitor(context: Context) {
-    private val activityManager = context.applicationContext.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-    private val powerManager = context.applicationContext.getSystemService(Context.POWER_SERVICE) as PowerManager
+    private val activityManager = context.applicationContext.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+    private val powerManager = context.applicationContext.getSystemService(Context.POWER_SERVICE) as? PowerManager
     private val cores = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
     private var lastWallMs = SystemClock.elapsedRealtime()
     private var lastCpuMs = Process.getElapsedCpuTime()
@@ -30,15 +30,16 @@ class PerformanceMonitor(context: Context) {
         lastCpuMs = nowCpu
 
         val cpuOfDevice = (cpuDelta * 100.0 / wallDelta / cores).coerceIn(0.0, 100.0)
-        val memory = ActivityManager.MemoryInfo().also(activityManager::getMemoryInfo)
+        val memory = ActivityManager.MemoryInfo().also { activityManager?.getMemoryInfo(it) }
         val processPssKb = runCatching {
-            activityManager.getProcessMemoryInfo(intArrayOf(Process.myPid())).firstOrNull()?.totalPss ?: 0
+            activityManager?.getProcessMemoryInfo(intArrayOf(Process.myPid()))?.firstOrNull()?.totalPss ?: 0
         }.getOrDefault(0)
+        val thermalStatus = runCatching { powerManager?.currentThermalStatus ?: 0 }.getOrDefault(0)
         val thermal = when {
-            powerManager.currentThermalStatus >= PowerManager.THERMAL_STATUS_CRITICAL -> "critique"
-            powerManager.currentThermalStatus >= PowerManager.THERMAL_STATUS_SEVERE -> "élevé"
-            powerManager.currentThermalStatus >= PowerManager.THERMAL_STATUS_MODERATE -> "modéré"
-            powerManager.currentThermalStatus >= PowerManager.THERMAL_STATUS_LIGHT -> "léger"
+            thermalStatus >= PowerManager.THERMAL_STATUS_CRITICAL -> "critique"
+            thermalStatus >= PowerManager.THERMAL_STATUS_SEVERE -> "élevé"
+            thermalStatus >= PowerManager.THERMAL_STATUS_MODERATE -> "modéré"
+            thermalStatus >= PowerManager.THERMAL_STATUS_LIGHT -> "léger"
             else -> "normal"
         }
 
@@ -50,7 +51,7 @@ class PerformanceMonitor(context: Context) {
             appendLine("RAM PocketAI (PSS) ≈ ${mib(processPssKb)} Mo")
             appendLine("RAM système disponible : ${gib(memory.availMem)} / ${gib(memory.totalMem)} Go")
             appendLine("Thermique Android : $thermal")
-            appendLine("Économie d’énergie : ${if (powerManager.isPowerSaveMode) "active" else "inactive"}")
+            appendLine("Économie d’énergie : ${if (powerManager?.isPowerSaveMode == true) "active" else "inactive"}")
             appendLine()
             appendLine("GPU : Android ne fournit pas de pourcentage d’utilisation portable et fiable.")
             appendLine("PocketAI affiche ci-dessous le backend Vulkan/CPU et les couches réellement actives.")
