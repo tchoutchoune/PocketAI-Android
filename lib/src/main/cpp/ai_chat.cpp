@@ -259,11 +259,8 @@ void add_message(const std::string &role, const std::string &content) {
     message.role = role;
     message.content = content;
     messages.push_back(std::move(message));
-    // Templates need recent role ordering; keep the native history bounded as the KV cache slides.
-    if (messages.size() > 64) {
-        const size_t first = messages.front().role == "system" ? 1 : 0;
-        messages.erase(messages.begin() + first, messages.begin() + first + 2);
-    }
+    // Message history is pruned only when the corresponding KV-cache turn is evicted.
+    // Keeping both structures in lockstep prevents chat-template history from drifting.
 }
 
 llama_tokens tokenize_input(const std::string &text, bool parse_special) {
@@ -435,7 +432,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_countPromptTokensNative(JNIEnv 
         const auto user = java_text(env, text);
         const bool chat_template = common_chat_templates_was_explicit(templates.get());
         const auto formatted = chat_template ? format_message("user", user, true) : user;
-        return static_cast<jint>(tokenize_input(formatted, chat_template).size());
+        const auto tokens = tokenize_input(formatted, chat_template);
+        return static_cast<jint>(tokens.size() + (needs_end_of_turn && !turns.empty() ? 1 : 0));
     } catch (...) {
         throw_io(env, "Prompt tokenization failed");
         return -1;
