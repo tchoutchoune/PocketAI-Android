@@ -98,7 +98,7 @@ static void reset() {
     fail_gpu = fail_output = fail_all = fail_replay = cancel_on_failure = nan_logits = fail_prefill = false;
     loads.clear(); decode_diagnostics = {}; runtime_recoveries = 0;
     gpu_probe_failures = 0; fallback.clear();
-    options = {4, 2048, 256, 37, 0.0f};
+    options = {4, 2048, 256, 37, false, 0.0f};
     gpu = reinterpret_cast<ggml_backend_dev_t>(1);
     model_path = "fake";
     assert(load_selected_model_layers(37));
@@ -122,6 +122,13 @@ static void prefix() {
     budget.start(20); budget.consume();
 }
 int main() {
+    reset();
+    free_model();
+    options.prefer_cpu_output = true;
+    assert(load_selected_model_layers(options.gpu_layers, options.prefer_cpu_output));
+    assert(output_on_cpu && loads.back() == std::make_pair(37, true));
+    free_model();
+
     reset();
     fail_prefill = true;
     prepare();
