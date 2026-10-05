@@ -216,19 +216,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 return PreparedPrompt(prompt, tokens, capacity)
             }
 
-            history = when {
-                history.size >= 2 -> history.drop(2)
-                history.isNotEmpty() -> emptyList()
-                else -> history
+            if (history.isNotEmpty()) {
+                history = if (history.size >= 2) history.drop(2) else emptyList()
+                return@repeat
             }
-            if (history.isEmpty() && sources.isNotEmpty() && sourceSnippetChars > 240) {
+            if (sources.isNotEmpty() && sourceSnippetChars > 240) {
                 sourceSnippetChars = maxOf(240, sourceSnippetChars * 2 / 3)
-            } else if (history.isEmpty() && (sources.isEmpty() || sourceSnippetChars <= 240)) {
-                throw IllegalArgumentException(
-                    "La question occupe $tokens tokens pour une capacité de $capacity. " +
-                        "Raccourcis-la ou utilise un profil avec davantage de contexte."
-                )
+                return@repeat
             }
+            throw IllegalArgumentException(
+                "La question occupe $tokens tokens pour une capacité de $capacity. " +
+                    "Raccourcis-la ou utilise un profil avec davantage de contexte."
+            )
         }
         throw IllegalArgumentException("Impossible d'ajuster le prompt au contexte du modèle.")
     }
