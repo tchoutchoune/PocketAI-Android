@@ -141,6 +141,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun performanceReport(): String = performance.report(state.value.diagnostics)
 
+    suspend fun refreshEngineDiagnostics(): String = withContext(Dispatchers.Default) {
+        val info = inference().diagnostics()
+        update { it.copy(diagnostics = info) }
+        info
+    }
+
     fun importModel(uri: android.net.Uri) = task("Importation du modèle…") {
         val file = models.import(uri)
         update { it.copy(status = "${file.name} importé") }
