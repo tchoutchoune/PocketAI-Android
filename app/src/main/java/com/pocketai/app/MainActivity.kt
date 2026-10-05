@@ -324,9 +324,9 @@ class MainActivity : AppCompatActivity() {
                     toast("Profil appliqué au prochain chargement du modèle")
                 }.setNegativeButton("Fermer", null).show()
         })
-        settingsPanel.addView(text("La RAM détermine la taille du contexte ; les cœurs CPU et Vulkan sont détectés automatiquement. La chauffe réduit les threads pendant la génération. Le GPU est activé seulement si le moteur le confirme.", 14f))
+        settingsPanel.addView(text("PocketAI adapte le contexte à la RAM, cherche automatiquement le meilleur nombre de couches Vulkan et calibre les threads CPU sur le modèle chargé. En cas de chauffe, les threads sont réduits dynamiquement.", 14f))
         settingsPanel.addView(button("Longueur maximale : ${model.maxTokens} tokens") {
-            val values = intArrayOf(256, 512, 1024, 2048)
+            val values = intArrayOf(256, 512, 1024, 2048, 4096, 8192)
             MaterialAlertDialogBuilder(this).setTitle("Longueur des réponses")
                 .setItems(values.map { "$it tokens" }.toTypedArray()) { _, index -> model.maxTokens = values[index]; renderSettings() }.show()
         })
