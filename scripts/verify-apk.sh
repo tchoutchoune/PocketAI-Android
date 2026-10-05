@@ -32,7 +32,8 @@ with ZipFile(apk) as z:
     (out/'PAGE-ALIGNMENT.txt').write_text(f'All {len(libs)} ARM64 native libraries support 16 KB page alignment.\n')
 badging=(out/'PACKAGE.txt').read_text()
 assert "name='com.pocketai.app.test'" in badging
-assert "versionCode='400'" in badging\nassert "versionName='4.0-test'" in badging
+assert "versionCode='400'" in badging
+assert "versionName='4.0-test'" in badging
 print(f'Validated side-by-side test APK with {len(libs)} ARM64 native libraries, including Vulkan')
 PY
 cp "$TASK_APK" "$TASK_REPO/out/PocketAI-4.2-test-arm64-debug.apk"
