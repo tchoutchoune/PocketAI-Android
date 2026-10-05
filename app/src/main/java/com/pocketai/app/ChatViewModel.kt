@@ -213,6 +213,32 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         update { it.copy(status = "Modèle déchargé") }
     }
 
+    fun retunePerformance() {
+        val file = activeFile ?: run {
+            update { it.copy(error = "Charge d’abord un modèle à recalibrer.") }
+            return
+        }
+        task("Recalibrage CPU sur ce modèle…") {
+            val profile = HardwareProfile.detect(getApplication())
+            require(!profile.powerSave) { "Désactive le mode économie d’énergie avant le recalibrage." }
+            require(profile.thermalStatus < PowerManager.THERMAL_STATUS_MODERATE) {
+                "Le téléphone est trop chaud pour un benchmark fiable. Laisse-le refroidir puis relance le recalibrage."
+            }
+            val ceiling = profile.recommend(file.length(), performanceMode).threads.coerceAtLeast(1)
+            val infoBefore = inference().diagnostics()
+            val gpuLayers = Regex("GPU layers: (\\d+)").find(infoBefore)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            val contextSize = Regex("Context: (\\d+)").find(infoBefore)?.groupValues?.get(1)?.toIntOrNull()
+                ?: activeOptions.contextSize
+            val tuned = inference().tuneThreads(ceiling)
+            activeOptions = activeOptions.copy(threads = tuned)
+            inference().setThreadLimit(tuned)
+            prefs.edit().putInt(threadTuneKey(file, profile, gpuLayers, contextSize), tuned).apply()
+            val info = inference().diagnostics()
+            logs.event("thread_retuned threads=$tuned max=$ceiling gpu_layers=$gpuLayers context=$contextSize")
+            update { it.copy(status = "Recalibrage terminé · $tuned threads", diagnostics = info) }
+        }
+    }
+
     private fun threadTuneKey(
         file: File,
         profile: HardwareProfile,
