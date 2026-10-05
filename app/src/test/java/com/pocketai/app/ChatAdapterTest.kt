@@ -8,6 +8,7 @@ import android.text.style.ClickableSpan
 import android.view.View
 import android.widget.LinearLayout
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -52,9 +53,13 @@ class ChatAdapterTest {
         val holder = adapter.onCreateViewHolder(LinearLayout(activity), 0)
         adapter.onBindViewHolder(holder, 0)
         assertEquals(View.GONE, holder.actions.visibility)
+        assertFalse(holder.body.movementMethod is LinkMovementMethod)
+        assertEquals("Début de réponse", holder.body.text.toString())
+
         messages[0] = messages[0].copy(isStreaming = false)
         adapter.onBindViewHolder(holder, 0)
         assertEquals(View.VISIBLE, holder.actions.visibility)
+        assertTrue(holder.body.movementMethod is LinkMovementMethod)
     }
 
     private fun activity(): Activity = Robolectric.buildActivity(Activity::class.java).setup().get().apply {
