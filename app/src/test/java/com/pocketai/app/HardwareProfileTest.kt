@@ -36,4 +36,19 @@ class HardwareProfileTest {
         val options = capable.copy(cpuCores = 1, bigCores = 0).recommend(mode = "balanced")
         assertEquals(1, options.threads)
     }
+
+    @Test fun modernHighMemoryPhoneGetsLargerAdaptiveContexts() {
+        assertEquals(4096, capable.recommend(gib, "balanced").contextSize)
+        assertEquals(16384, capable.recommend(gib, "performance").contextSize)
+
+        val flagship = capable.copy(totalRamBytes = 16 * gib, availableRamBytes = 14 * gib)
+        assertEquals(32768, flagship.recommend(gib, "performance").contextSize)
+    }
+
+    @Test fun performanceProfileRequestsMaximumGpuOffloadAndLargerBatch() {
+        val options = capable.recommend(gib, "performance")
+        assertEquals(256, options.gpuLayers)
+        assertEquals(512, options.batchSize)
+        assertTrue(options.threads <= capable.cpuCores)
+    }
 }
