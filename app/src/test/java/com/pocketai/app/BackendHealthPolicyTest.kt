@@ -21,32 +21,33 @@ class BackendHealthPolicyTest {
 
         assertTrue(health.requestedVulkan)
         assertEquals(37, health.activeGpuLayers)
+        assertFalse(health.outputOnCpu)
         assertFalse(health.compatibilityEvent)
-        assertNull(health.learnedGpuLimit)
+        assertNull(health.learnedProfile)
         assertEquals("Vulkan 37 couches", BackendHealthPolicy.statusLabel(health))
     }
 
     @Test
-    fun learnsReducedLayerCeilingAfterProbeFailure() {
+    fun learnsExactCpuOutputPlacementAfterProbeFailure() {
         val health = BackendHealthPolicy.parse(
             """
             Requested: Vulkan; active: Vulkan + CPU
-            GPU layers: 18; load attempts: 4; logits probe failures: 2; fallback: validated offload 37 -> 18
-            Backend warnings: 2; errors: 0; last decode code: 0; phase: probe.generation
+            GPU layers: 37; load attempts: 2; logits probe failures: 1; fallback: validated offload 37 -> 37 output tensors on CPU
+            Backend warnings: 1; errors: 0; last decode code: 0; phase: probe.generation
             Output placement policy: CPU tensor overrides; host op offload disabled; runtime recoveries: 0
             """.trimIndent(),
         )!!
 
         assertTrue(health.compatibilityEvent)
-        assertEquals(18, health.learnedGpuLimit)
-        assertEquals(
-            18,
-            BackendHealthPolicy.applyLearnedLimit(
-                InferenceOptions(gpuLayers = 128),
-                health.learnedGpuLimit,
-                "balanced",
-            ).gpuLayers,
+        assertEquals(LearnedBackendProfile(37, true), health.learnedProfile)
+        val applied = BackendHealthPolicy.applyLearnedProfile(
+            InferenceOptions(gpuLayers = 128),
+            health.learnedProfile,
+            "balanced",
         )
+        assertEquals(37, applied.gpuLayers)
+        assertTrue(applied.preferCpuOutput)
+        assertTrue(BackendHealthPolicy.statusLabel(health).contains("sortie CPU"))
     }
 
     @Test
@@ -60,22 +61,44 @@ class BackendHealthPolicyTest {
             """.trimIndent(),
         )!!
 
-        assertEquals(0, health.learnedGpuLimit)
-        assertEquals(
-            0,
-            BackendHealthPolicy.applyLearnedLimit(
-                InferenceOptions(gpuLayers = 128),
-                health.learnedGpuLimit,
-                "balanced",
-            ).gpuLayers,
+        assertEquals(LearnedBackendProfile(0, false), health.learnedProfile)
+        val applied = BackendHealthPolicy.applyLearnedProfile(
+            InferenceOptions(gpuLayers = 128),
+            health.learnedProfile,
+            "balanced",
         )
+        assertEquals(0, applied.gpuLayers)
+        assertFalse(applied.preferCpuOutput)
         assertEquals("CPU · récupération automatique", BackendHealthPolicy.statusLabel(health))
     }
 
     @Test
-    fun performanceModeExplicitlyRetriesGpu() {
+    fun performanceModeExplicitlyRetriesDefaultGpuPlacement() {
         val options = InferenceOptions(gpuLayers = 128)
-        assertEquals(128, BackendHealthPolicy.applyLearnedLimit(options, 0, "performance").gpuLayers)
+        val applied = BackendHealthPolicy.applyLearnedProfile(
+            options,
+            LearnedBackendProfile(37, true),
+            "performance",
+        )
+        assertEquals(options, applied)
+    }
+
+    @Test
+    fun saferProfileKeepsCpuOutputForEqualLayerCount() {
+        assertEquals(
+            LearnedBackendProfile(37, true),
+            BackendHealthPolicy.saferProfile(
+                LearnedBackendProfile(37, false),
+                LearnedBackendProfile(37, true),
+            ),
+        )
+        assertEquals(
+            LearnedBackendProfile(18, true),
+            BackendHealthPolicy.saferProfile(
+                LearnedBackendProfile(37, true),
+                LearnedBackendProfile(18, true),
+            ),
+        )
     }
 
     @Test
@@ -90,7 +113,7 @@ class BackendHealthPolicyTest {
         )!!
 
         assertFalse(health.compatibilityEvent)
-        assertNull(health.learnedGpuLimit)
+        assertNull(health.learnedProfile)
     }
 
     @Test
