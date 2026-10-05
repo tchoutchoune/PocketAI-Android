@@ -26,8 +26,8 @@ class ChatAdapter(
     private val messages: MutableList<ChatMessage>,
     private val onExport: (ChatMessage) -> Unit,
     private val onCopy: (ChatMessage) -> Unit,
-    private val onSpeak: (ChatMessage) -> Unit,
-    private val speakingMessageId: () -> String?,
+    private val onSpeak: (ChatMessage) -> Unit = {},
+    private val speakingMessageId: () -> String? = { null },
 ) : RecyclerView.Adapter<ChatAdapter.MessageHolder>() {
     private val markdown = Markwon.builder(context).usePlugin(object : AbstractMarkwonPlugin() {
         override fun configureConfiguration(builder: MarkwonConfiguration.Builder) {
