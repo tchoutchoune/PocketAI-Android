@@ -5,14 +5,14 @@ internal object SpeechText {
     fun prepare(raw: String): String {
         var text = ResponseText.visible(raw)
         text = text.replace(
-            Regex("(?s)\`\`\`.*?\`\`\`|~~~.*?~~~"),
+            Regex("(?s)```.*?```|~~~.*?~~~"),
             " Bloc de code. ",
         )
         text = text.replace(Regex("!\\[([^]]*)]\\([^)]*\\)"), "$1")
         text = text.replace(Regex("\\[([^]]+)]\\([^)]*\\)"), "$1")
         text = text.replace(Regex("https?://\\S+", RegexOption.IGNORE_CASE), " lien ")
         text = text.replace(Regex("(?m)^\\s{0,3}#{1,6}\\s+"), "")
-        text = text.replace(Regex("[*_\`>]+"), " ")
+        text = text.replace(Regex("[*_`>]+"), " ")
         return text.replace(Regex("\\s+"), " ").trim()
     }
 
