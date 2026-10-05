@@ -74,6 +74,10 @@ cp "$TASK_REPO/docs/ADRENO-840-VALIDATION.md" "$TASK_REPO/out/ADRENO-840-VALIDAT
 
 cd "$TASK_REPO/out"
 sha256sum PocketAI-4.2.2-arm64-opencl-probe.apk PocketAI-4.2.2-engine-androidTest.apk > SHA256.txt
-git -C "$TASK_REPO" rev-parse HEAD > SOURCE-COMMIT.txt
-printf '%s\n' "Revision embedded in APK: ${POCKETAI_SOURCE_REVISION:-local}" > BUILD-IDENTITY.txt
+if [[ ! "${POCKETAI_SOURCE_REVISION:-}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "POCKETAI_SOURCE_REVISION is missing or invalid during artifact verification" >&2
+    exit 1
+fi
+printf '%s\n' "$POCKETAI_SOURCE_REVISION" > SOURCE-COMMIT.txt
+printf '%s\n' "Revision embedded in APK: $POCKETAI_SOURCE_REVISION" > BUILD-IDENTITY.txt
 printf '%s\n'     'Manual UI APK: PocketAI-4.2.2-arm64-opencl-probe.apk'     'Engine instrumentation APK: PocketAI-4.2.2-engine-androidTest.apk'     'OpenCL runtime probe (no model required): bash OPENCL-PROBE.sh'     'Real-device semantic helper: bash DEVICE-SMOKE.sh --local-model /path/to/Qwen2.5-3B-Instruct-Q4_K_M.gguf'     'Add --require-vulkan to reject a reliability pass obtained only through CPU fallback.'     > DEVICE-TEST.txt
