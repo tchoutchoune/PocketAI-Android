@@ -164,12 +164,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     cached
                 } else {
                     update { it.copy(status = "Optimisation CPU · benchmark des threads…") }
-                    runCatching { inference.tuneThreads(requestedOptions.threads) }.getOrElse { error ->
+                    try {
+                        inference.tuneThreads(requestedOptions.threads).also { tuned ->
+                            prefs.edit().putInt(key, tuned).apply()
+                            logs.event("thread_tuned threads=$tuned max=${requestedOptions.threads} gpu_layers=$activeGpuLayers context=$actualContext")
+                        }
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Exception) {
                         logs.failure("thread_auto_tune", error)
                         requestedOptions.threads
-                    }.also { tuned ->
-                        prefs.edit().putInt(key, tuned).apply()
-                        logs.event("thread_tuned threads=$tuned max=${requestedOptions.threads} gpu_layers=$activeGpuLayers context=$actualContext")
                     }
                 }
             }
