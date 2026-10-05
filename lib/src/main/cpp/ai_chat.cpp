@@ -62,6 +62,8 @@ int shifts = 0;
 int turn_evictions = 0;
 int gpu_load_attempts = 0;
 int context_backoffs = 0;
+int gpu_probe_failures = 0;
+int last_decode_code = 0;
 int tuned_thread_choice = 0;
 int64_t generation_start = 0;
 int64_t generation_end = 0;
@@ -191,6 +193,32 @@ bool reload_model_layers(int layers) {
     catch (...) { return false; }
 }
 
+bool probe_logits(llama_context *candidate) {
+    if (!candidate || !model || gpu_layers <= 0) return candidate != nullptr;
+    llama_batch probe{};
+    bool allocated = false;
+    try {
+        probe = llama_batch_init(1, 0, 1);
+        allocated = true;
+        if (!probe.token || !probe.pos || !probe.seq_id || !probe.logits) return false;
+        const auto vocab = llama_model_get_vocab(model);
+        auto token = llama_vocab_bos(vocab);
+        if (token < 0) token = llama_vocab_eos(vocab);
+        if (token < 0) token = 0;
+        common_batch_clear(probe);
+        common_batch_add(probe, token, 0, {0}, true);
+        apply_threads(candidate);
+        const int result = llama_decode(candidate, probe);
+        last_decode_code = result;
+        llama_memory_clear(llama_get_memory(candidate), false);
+        llama_batch_free(probe);
+        return result == 0;
+    } catch (...) {
+        if (allocated) llama_batch_free(probe);
+        return false;
+    }
+}
+
 llama_context *new_context(int requested = 0) {
     auto params = llama_context_default_params();
     const int trained = llama_model_n_ctx_train(model);
@@ -258,7 +286,13 @@ int decode_prompt(const llama_tokens &tokens, bool last_logit) {
         for (int i = 0; i < count; ++i)
             common_batch_add(batch, tokens[offset + i], position + i, {0}, last_logit && offset + i + 1 == tokens.size());
         const int result = llama_decode(context, batch);
-        if (result) { context_dirty = true; return cancelled.load() ? 3 : 2; }
+        last_decode_code = result;
+        if (result) {
+            context_dirty = true;
+            if (cancelled.load()) return 3;
+            if (result == 1) return 1;
+            return 2;
+        }
         position += count;
         offset += count;
     }
@@ -372,6 +406,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_configureNative(JNIEnv *env, jo
     fallback.clear();
     gpu_load_attempts = 0;
     context_backoffs = 0;
+    gpu_probe_failures = 0;
+    last_decode_code = 0;
     tuned_thread_choice = 0;
 }
 
@@ -393,6 +429,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstr
     fallback.clear();
     gpu_load_attempts = 0;
     context_backoffs = 0;
+    gpu_probe_failures = 0;
+    last_decode_code = 0;
     const bool want_gpu = options.gpu_layers > 0 && gpu;
     if (options.gpu_layers > 0 && !gpu) note_fallback("Vulkan device unavailable; CPU selected");
 
@@ -440,20 +478,40 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv *, jobject) {
     const int requested_context = options.context;
     const int initial_gpu_layers = gpu_layers;
 
-    free_context();
-    try { context = new_context(requested_context); } catch (...) { context = nullptr; }
+    const auto try_context = [&](int requested) {
+        try { context = new_context(requested); } catch (...) { context = nullptr; }
+        if (context && gpu_layers > 0 && !probe_logits(context)) {
+            ++gpu_probe_failures;
+            log_event(ANDROID_LOG_WARN, "Vulkan logits probe failed; reducing GPU offload");
+            llama_free(context);
+            context = nullptr;
+        }
+        return context != nullptr;
+    };
 
-    // Preserve the requested context first: progressively reduce Vulkan offload before
-    // sacrificing context length. This avoids the old all-or-nothing GPU -> CPU jump.
+    free_context();
+    try_context(requested_context);
+
+    // A model can load and even ingest tokens on Vulkan while failing only when its output
+    // logits are requested. Validate that path before accepting the backend. In particular,
+    // keep the final output layer on CPU first when full offload is unstable on mobile GPUs.
     if (!context && initial_gpu_layers > 0 && !cancelled.load()) {
+        std::vector<int> candidates;
+        const int transformer_layers = llama_model_n_layer(model);
+        if (transformer_layers > 0 && transformer_layers < initial_gpu_layers)
+            candidates.push_back(transformer_layers);
         for (const int layers : pocketai::gpu_layer_candidates(initial_gpu_layers)) {
-            if (layers >= initial_gpu_layers) continue;
+            if (layers < initial_gpu_layers &&
+                std::find(candidates.begin(), candidates.end(), layers) == candidates.end())
+                candidates.push_back(layers);
+        }
+
+        for (const int layers : candidates) {
             if (cancelled.load()) break;
             if (!reload_model_layers(layers)) continue;
-            try { context = new_context(requested_context); } catch (...) { context = nullptr; }
-            if (context) {
-                note_fallback("Vulkan context auto-tuned " + std::to_string(initial_gpu_layers) +
-                              " -> " + std::to_string(gpu_layers) + " layers");
+            if (try_context(requested_context)) {
+                note_fallback("Vulkan runtime auto-tuned " + std::to_string(initial_gpu_layers) +
+                              " -> " + std::to_string(gpu_layers) + " layers after logits probe");
                 break;
             }
         }
@@ -464,8 +522,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv *, jobject) {
     if (!context && model && !cancelled.load()) {
         for (const int candidate : pocketai::context_backoff_candidates(requested_context)) {
             free_context();
-            try { context = new_context(candidate); } catch (...) { context = nullptr; }
-            if (context) {
+            if (try_context(candidate)) {
                 ++context_backoffs;
                 note_fallback("context auto-tuned " + std::to_string(requested_context) +
                               " -> " + std::to_string(candidate));
@@ -705,6 +762,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_nativeDiagnostics(JNIEnv *env, 
     out << "Vulkan GPU: " << (gpu_description.empty() ? "unavailable (device/driver unsupported or backend absent)" : gpu_description) << '\n';
     out << "Requested: " << (options.gpu_layers ? "Vulkan" : "CPU") << "; active: " << (context ? gpu_layers > 0 ? "Vulkan + CPU" : "CPU" : "no model") << '\n';
     out << "GPU layers: " << gpu_layers << "; load attempts: " << gpu_load_attempts
+        << "; logits probe failures: " << gpu_probe_failures
         << "; fallback: " << (fallback.empty() ? "none" : fallback) << '\n';
     out << "Threads: " << active_threads << " / " << options.threads << "; thermal/preferred limit: " << thread_limit.load()
         << "; auto-tuned: " << (tuned_thread_choice ? std::to_string(tuned_thread_choice) : "not run") << '\n';
@@ -714,7 +772,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_nativeDiagnostics(JNIEnv *env, 
         << "; turn evictions: " << turn_evictions << "; resident turns: " << turns.size() << '\n';
     const int64_t duration = generation_start ? (generation_end ? generation_end : ggml_time_us()) - generation_start : 0;
     out << "Generation: " << (duration > 0 ? budget.produced * 1e6 / duration : 0.0) << " tokens/s; prompt: " << (prompt_us > 0 ? prompt_tokens * 1e6 / prompt_us : 0.0) << " tokens/s\n";
-    out << "Backend warnings: " << backend_warnings.load() << "; errors: " << backend_errors.load() << '\n';
+    out << "Backend warnings: " << backend_warnings.load() << "; errors: " << backend_errors.load()
+        << "; last decode code: " << last_decode_code << '\n';
     out << "Prompt/content logging: disabled\n" << llama_print_system_info();
     return android_text(env, out.str());
 }
