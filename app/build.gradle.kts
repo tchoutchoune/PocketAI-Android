@@ -25,9 +25,9 @@ android {
     buildTypes {
         debug {
             isMinifyEnabled = false
-            applicationIdSuffix = ".vulkanvalidation"
-            versionNameSuffix = "-vulkan-test"
-            resValue("string", "app_name", "PocketAI Vulkan Test")
+            applicationIdSuffix = ".openclprobe"
+            versionNameSuffix = "-opencl-probe"
+            resValue("string", "app_name", "PocketAI OpenCL Probe")
         }
         release {
             isMinifyEnabled = true
