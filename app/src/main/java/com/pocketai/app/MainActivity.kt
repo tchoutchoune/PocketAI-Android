@@ -64,6 +64,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var stopButton: MaterialButton
     private lateinit var newButton: MaterialButton
     private var selectedTab = 0
+    private val streamingFollow = StreamingFollowState()
+    private var userDraggingMessages = false
 
     private val importPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let(model::importModel)
@@ -161,14 +163,20 @@ class MainActivity : AppCompatActivity() {
                     sendButton.text = if (state.busy) "Arrêter" else "Envoyer"
                     input.isEnabled = !state.busy
                     webToggle.isEnabled = !state.busy
-                    val wasAtBottom = !messageList.canScrollVertically(1)
                     val oldCount = shownMessages.size
                     if (shownMessages != state.messages) {
-                        val changed = shownMessages.size == state.messages.size && shownMessages.dropLast(1) == state.messages.dropLast(1)
-                        shownMessages.clear(); shownMessages.addAll(state.messages)
-                        if (changed && shownMessages.isNotEmpty()) adapter.notifyItemChanged(shownMessages.lastIndex)
-                        else adapter.notifyDataSetChanged()
-                        if (wasAtBottom || state.messages.size > oldCount) messageList.scrollToPosition((shownMessages.size - 1).coerceAtLeast(0))
+                        val changed = shownMessages.size == state.messages.size &&
+                            shownMessages.dropLast(1) == state.messages.dropLast(1)
+                        val newMessage = state.messages.size > oldCount
+                        shownMessages.clear()
+                        shownMessages.addAll(state.messages)
+                        if (newMessage) streamingFollow.onNewMessage()
+                        if (changed && shownMessages.isNotEmpty()) {
+                            adapter.notifyMessageContentChanged(shownMessages.lastIndex)
+                        } else {
+                            adapter.notifyDataSetChanged()
+                        }
+                        if (streamingFollow.following) scrollChatToBottom()
                     }
                     val key = state.busy to state.modelName
                     if (key != lastModelsKey) { renderModels(); lastModelsKey = key }
@@ -208,6 +216,23 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(4), dp(8), dp(4), dp(8))
             clipToPadding = false
             itemAnimator = null
+            addOnScrollListener(object : RecyclerView.OnScrollListener() {
+                override fun onScrollStateChanged(recyclerView: RecyclerView, newState: Int) {
+                    when (newState) {
+                        RecyclerView.SCROLL_STATE_DRAGGING -> userDraggingMessages = true
+                        RecyclerView.SCROLL_STATE_IDLE -> {
+                            if (userDraggingMessages) {
+                                streamingFollow.onUserViewport(isNearMessageBottom())
+                                userDraggingMessages = false
+                            }
+                        }
+                    }
+                }
+
+                override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
+                    if (userDraggingMessages) streamingFollow.onUserViewport(isNearMessageBottom())
+                }
+            })
         }
         chat.addView(messageList, LinearLayout.LayoutParams(-1, 0, 1f))
         val compose = row().apply { gravity = Gravity.BOTTOM; setPadding(dp(12), dp(6), dp(12), dp(8)) }
@@ -232,6 +257,27 @@ class MainActivity : AppCompatActivity() {
         }.apply { contentDescription = "Envoyer la question ou arrêter la génération" }
         compose.addView(sendButton, LinearLayout.LayoutParams(-2, dp(58)).apply { leftMargin = dp(8) })
         chat.addView(compose)
+    }
+
+    private fun isNearMessageBottom(): Boolean {
+        if (!::messageList.isInitialized || adapter.itemCount == 0) return true
+        val manager = messageList.layoutManager as? LinearLayoutManager ?: return !messageList.canScrollVertically(1)
+        val lastPosition = adapter.itemCount - 1
+        if (manager.findLastVisibleItemPosition() != lastPosition) return false
+        val lastView = manager.findViewByPosition(lastPosition) ?: return !messageList.canScrollVertically(1)
+        val viewportBottom = messageList.height - messageList.paddingBottom
+        return lastView.bottom <= viewportBottom + dp(96)
+    }
+
+    private fun scrollChatToBottom() {
+        if (!streamingFollow.following || adapter.itemCount == 0) return
+        messageList.post {
+            if (streamingFollow.following && adapter.itemCount > 0) {
+                // Unlike scrollToPosition(), this reaches the bottom even when the final
+                // message itself is taller than the RecyclerView viewport.
+                messageList.scrollBy(0, Int.MAX_VALUE)
+            }
+        }
     }
 
     private fun renderModels() {
