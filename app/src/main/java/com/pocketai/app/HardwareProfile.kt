@@ -30,29 +30,42 @@ data class HardwareProfile(
         val warm = thermalStatus >= PowerManager.THERMAL_STATUS_MODERATE
         val eco = normalizedMode == "eco" || powerSave || hot
         val performant = normalizedMode == "performance"
-        val usableRam = minOf(availableRamBytes.coerceAtLeast(0), totalRamBytes * 65 / 100)
-        val afterWeights = (usableRam - modelBytes.coerceAtLeast(0) - 384 * MIB).coerceAtLeast(0)
+        // Leave a hard reserve for Android and transient llama.cpp/Vulkan buffers.
+        // The native engine can still back the context down if the real allocation is tighter.
+        val usableRam = minOf(availableRamBytes.coerceAtLeast(0), totalRamBytes * 70 / 100)
+        val afterWeights = (usableRam - modelBytes.coerceAtLeast(0) - 512 * MIB).coerceAtLeast(0)
         val context = when {
-            eco || afterWeights < 384 * MIB -> 1024
-            performant && totalRamBytes >= 8 * GIB && afterWeights >= 1536 * MIB -> 4096
+            eco || afterWeights < 512 * MIB -> 1024
+            afterWeights < 1024 * MIB -> 2048
+            performant && totalRamBytes >= 16 * GIB && afterWeights >= 8 * GIB -> 32768
+            performant && totalRamBytes >= 12 * GIB && afterWeights >= 5 * GIB -> 16384
+            performant && totalRamBytes >= 8 * GIB && afterWeights >= 3 * GIB -> 8192
+            performant && afterWeights >= 1536 * MIB -> 4096
+            totalRamBytes >= 8 * GIB && afterWeights >= 2 * GIB -> 4096
             else -> 2048
         }
         val threads = when {
             eco -> minOf(2, cpuCores)
             warm -> minOf(3, bigCores.coerceAtLeast(1))
-            performant -> minOf(8, bigCores.coerceAtLeast(1))
-            else -> minOf(4, bigCores.coerceAtLeast(1))
+            performant -> minOf(8, cpuCores)
+            else -> minOf(6, maxOf(bigCores, minOf(4, cpuCores)))
         }.coerceAtLeast(1)
         val gpuLayers = when {
             normalizedMode == "cpu" || eco || warm || vulkanVersion == null -> 0
-            afterWeights < 768 * MIB -> 0
-            performant && afterWeights >= 1536 * MIB -> 16
-            else -> 8
+            afterWeights < 1024 * MIB -> 0
+            performant && afterWeights >= 2 * GIB -> 256 // "as many as the model/device can sustain"
+            else -> 128
+        }
+        val batch = when {
+            eco || afterWeights < 512 * MIB -> 64
+            performant && context >= 8192 && afterWeights >= 3 * GIB -> 512
+            performant -> 256
+            else -> 128
         }
         return InferenceOptions(
             threads = threads,
             contextSize = context,
-            batchSize = if (eco || afterWeights < 384 * MIB) 64 else if (performant) 256 else 128,
+            batchSize = batch,
             gpuLayers = gpuLayers,
             temperature = 0.6f,
         )
