@@ -44,9 +44,8 @@ inline std::vector<int> context_backoff_candidates(int requested) {
 
 inline std::vector<int> thread_candidates(int maximum) {
     std::vector<int> result;
-    for (int value : {1, 2, 3, 4, 6, 8, maximum}) {
-        if (value <= maximum && std::find(result.begin(), result.end(), value) == result.end()) result.push_back(value);
-    }
+    for (int value = 1; value <= std::min(maximum, 8); ++value) result.push_back(value);
+    if (maximum > 8) result.push_back(maximum);
     return result;
 }
 
