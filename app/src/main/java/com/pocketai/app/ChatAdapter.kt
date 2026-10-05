@@ -109,7 +109,6 @@ class ChatAdapter(
         holder.heading.text = if (message.isUser) "Vous" else "PocketAI"
         if (message.isUser) {
             holder.body.setTextIsSelectable(true)
-            holder.body.movementMethod = null
             holder.body.text = visible
         } else if (message.isStreaming) {
             // Streaming must stay cheap: parsing the whole Markdown tree for every token batch
