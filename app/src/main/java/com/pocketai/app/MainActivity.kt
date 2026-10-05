@@ -379,7 +379,8 @@ class MainActivity : AppCompatActivity() {
         dialog.setOnShowListener {
             lifecycleScope.launch {
                 while (dialog.isShowing) {
-                    body.text = model.performanceReport()
+                    val report = withContext(Dispatchers.Default) { model.performanceReport() }
+                    if (dialog.isShowing) body.text = report
                     delay(1000)
                 }
             }
