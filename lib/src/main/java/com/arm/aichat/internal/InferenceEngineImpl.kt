@@ -46,6 +46,7 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
     private external fun load(modelPath: String): Int
     private external fun prepare(): Int
     private external fun nativeDiagnostics(): String
+    private external fun isContextReadyNative(): Boolean
     private external fun countPromptTokensNative(userPrompt: String): Int
     private external fun promptCapacityNative(): Int
     private external fun tuneThreadsNative(maxThreads: Int): Int
@@ -150,7 +151,7 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
                     if (it < 1) throw IOException("CPU thread auto-tune failed")
                 }
             } finally {
-                _state.value = InferenceEngine.State.ModelReady
+                finishOperation()
             }
         }
     }
@@ -164,6 +165,12 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
         require(threads in 1..32) { "Thread limit must be between 1 and 32" }
         thermalThreadLimit = threads
         synchronized(nativeControlLock) { if (nativeLoaded && !closing) setThreadLimitNative(threads) }
+    }
+
+    private fun finishOperation() {
+        modelLoaded = isContextReadyNative()
+        _state.value = if (modelLoaded) InferenceEngine.State.ModelReady
+            else InferenceEngine.State.Error(IOException("Le moteur a épuisé ses replis. Recharge le modèle."))
     }
 
     private fun startOperation() {
@@ -219,7 +226,7 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
                 if (cancelled) throw CancellationException("Prompt processing cancelled")
                 if (result != 0) throw IOException("System prompt processing failed ($result); reduce its size")
             } finally {
-                _state.value = InferenceEngine.State.ModelReady
+                finishOperation()
             }
         }
     }
@@ -249,7 +256,7 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
                 throw e
             } finally {
                 finishGeneration()
-                _state.value = InferenceEngine.State.ModelReady
+                finishOperation()
                 Log.i(TAG, if (cancelled) "Generation cancelled" else "Generation finished")
             }
         }
@@ -264,7 +271,7 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
             startOperation()
             _state.value = InferenceEngine.State.Benchmarking
             try { benchModel(pp, tg, pl, nr) }
-            finally { _state.value = InferenceEngine.State.ModelReady }
+            finally { finishOperation() }
         }
     }
 

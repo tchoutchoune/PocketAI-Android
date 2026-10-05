@@ -10,13 +10,25 @@ android {
         applicationId = "com.pocketai.app"
         minSdk = 33
         targetSdk = 36
-        versionCode = 400
-        versionName = "4.0"
+        versionCode = 40202
+        versionName = "4.2.2"
+        resValue("string", "app_name", "PocketAI")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk { abiFilters += "arm64-v8a" }
     }
+    buildFeatures { buildConfig = true }
+    defaultConfig {
+        val sourceRevision = providers.environmentVariable("POCKETAI_SOURCE_REVISION").orElse("local").get()
+        require(sourceRevision == "local" || sourceRevision.matches(Regex("[0-9a-f]{40}")))
+        buildConfigField("String", "SOURCE_REVISION", "\"$sourceRevision\"")
+    }
     buildTypes {
-        debug { isMinifyEnabled = false }
+        debug {
+            isMinifyEnabled = false
+            applicationIdSuffix = ".vulkanvalidation"
+            versionNameSuffix = "-vulkan-test"
+            resValue("string", "app_name", "PocketAI Vulkan Test")
+        }
         release {
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")

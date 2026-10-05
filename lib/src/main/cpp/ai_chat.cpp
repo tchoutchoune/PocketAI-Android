@@ -15,6 +15,9 @@
 #include "llama.h"
 #include "ggml-backend.h"
 #include "inference_helpers.h"
+#include "runtime_policy.h"
+#include "native_batch.h"
+#include <memory>
 
 namespace {
 constexpr int HEADROOM = 8;
@@ -27,8 +30,12 @@ struct Options {
 } options;
 llama_model *model = nullptr;
 llama_context *context = nullptr;
-llama_batch batch{};
-bool batch_allocated = false;
+std::unique_ptr<NativeBatch> batch;
+llama_tokens resident_tokens;
+llama_tokens sampled_tokens;
+bool output_on_cpu = false;
+int runtime_recoveries = 0;
+pocketai::DecodeDiagnostics decode_diagnostics;
 common_chat_templates_ptr templates;
 common_sampler *sampler = nullptr;
 std::vector<common_chat_msg> messages;
@@ -63,7 +70,6 @@ int turn_evictions = 0;
 int gpu_load_attempts = 0;
 int context_backoffs = 0;
 int gpu_probe_failures = 0;
-int last_decode_code = 0;
 int tuned_thread_choice = 0;
 int64_t generation_start = 0;
 int64_t generation_end = 0;
@@ -133,6 +139,8 @@ void clear_conversation() {
     if (sampler) common_sampler_reset(sampler);
     messages.clear();
     turns.clear();
+    resident_tokens.clear();
+    sampled_tokens.clear();
     current_turn_start = -1;
     position = system_position = 0;
     shifts = 0;
@@ -151,10 +159,12 @@ void free_context() {
     needs_end_of_turn = false;
     if (sampler) { common_sampler_free(sampler); sampler = nullptr; }
     templates.reset();
-    if (batch_allocated) { llama_batch_free(batch); batch = {}; batch_allocated = false; }
+    batch.reset();
     if (context) { llama_free(context); context = nullptr; }
     messages.clear();
     turns.clear();
+    resident_tokens.clear();
+    sampled_tokens.clear();
     current_turn_start = -1;
     position = system_position = 0;
     cached_bytes.clear();
@@ -168,53 +178,99 @@ void free_model() {
     model_path.clear();
     system_prompt.clear();
     gpu_layers = 0;
+    output_on_cpu = false;
 }
 
-bool load_selected_model_layers(int layers) {
+bool load_selected_model_layers(int layers, bool cpu_output = false) {
     const bool use_gpu = layers > 0 && gpu;
     auto params = llama_model_default_params();
     ggml_backend_dev_t devices[2] = {use_gpu ? gpu : nullptr, nullptr};
     params.devices = devices;
     params.n_gpu_layers = use_gpu ? layers : 0;
     params.split_mode = LLAMA_SPLIT_MODE_NONE;
+    // Keep these descriptors alive for the model lifetime (including lazy loads).
+    static llama_model_tensor_buft_override output_overrides[2]{};
+    if (use_gpu && cpu_output) {
+        auto cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (!cpu) return false;
+        output_overrides[0] = {"^(output|output_norm|token_embd)\\.(weight|bias)$", ggml_backend_dev_buffer_type(cpu)};
+        output_overrides[1] = {nullptr, nullptr};
+        params.tensor_buft_overrides = output_overrides;
+    }
     params.progress_callback = load_progress;
     params.progress_callback_user_data = nullptr;
     ++gpu_load_attempts;
     model = llama_model_load_from_file(model_path.c_str(), params);
-    if (model) gpu_layers = use_gpu ? std::min(layers, llama_model_n_layer(model) + 1) : 0;
+    if (model) {
+        gpu_layers = use_gpu ? std::min(layers, llama_model_n_layer(model) + 1) : 0;
+        output_on_cpu = use_gpu && cpu_output;
+    }
     return model != nullptr;
 }
 
-bool reload_model_layers(int layers) {
+bool reload_model_layers(int layers, bool cpu_output = false) {
     free_context();
     if (model) { llama_model_free(model); model = nullptr; }
     gpu_layers = 0;
-    try { return load_selected_model_layers(layers); }
+    output_on_cpu = false;
+    try { return load_selected_model_layers(layers, cpu_output); }
     catch (...) { return false; }
 }
 
-bool probe_logits(llama_context *candidate) {
-    if (!candidate || !model || gpu_layers <= 0) return candidate != nullptr;
-    llama_batch probe{};
-    bool allocated = false;
+// All calls go through this wrapper, including tuning, probes and generation.
+// Return values are private to this wrapper; raw llama_decode codes stay intact.
+constexpr int DECODE_EXCEPTION = -10000;
+constexpr int INVALID_LOGITS = -10001;
+int checked_decode(llama_context *target, llama_batch input, bool logits, const char *phase) {
     try {
-        probe = llama_batch_init(1, 0, 1);
-        allocated = true;
-        if (!probe.token || !probe.pos || !probe.seq_id || !probe.logits) return false;
-        const auto vocab = llama_model_get_vocab(model);
-        auto token = llama_vocab_bos(vocab);
-        if (token < 0) token = llama_vocab_eos(vocab);
-        if (token < 0) token = 0;
-        common_batch_clear(probe);
-        common_batch_add(probe, token, 0, {0}, true);
-        apply_threads(candidate);
-        const int result = llama_decode(candidate, probe);
-        last_decode_code = result;
-        llama_memory_clear(llama_get_memory(candidate), false);
-        llama_batch_free(probe);
-        return result == 0;
+        const int raw = llama_decode(target, input);
+        decode_diagnostics.record(raw, phase, gpu_layers);
+        if (raw != 0) return raw;
+        if (logits) {
+            const auto values = llama_get_logits_ith(target, -1); // synchronizes GPU work and readback
+            if (!pocketai::valid_logits(values, llama_vocab_n_tokens(llama_model_get_vocab(model)))) {
+                decode_diagnostics.failure(phase, gpu_layers, "invalid logits");
+                return INVALID_LOGITS;
+            }
+        } else {
+            llama_synchronize(target);
+        }
+        return 0;
     } catch (...) {
-        if (allocated) llama_batch_free(probe);
+        decode_diagnostics.failure(phase, gpu_layers, "native exception (no fabricated decode code)");
+        return DECODE_EXCEPTION;
+    }
+}
+
+bool probe_logits(llama_context *candidate) {
+    if (!candidate || !model) return false;
+    try {
+        const int n = std::min<int>(llama_n_batch(candidate), static_cast<int>(llama_n_ctx(candidate)) - HEADROOM - 12);
+        if (n < 1) return false;
+        NativeBatch probe(n);
+        auto token = llama_vocab_bos(llama_model_get_vocab(model));
+        if (token < 0) token = llama_vocab_eos(llama_model_get_vocab(model));
+        if (token < 0) token = 0;
+        llama_tokens tokens(n, token);
+        // A short prefill, a full batch after existing KV entries, then sequential
+        // decoding exercise graph transitions missed by a BOS-only probe.
+        int pos = 0;
+        bool ok = true;
+        for (int count : {std::min(10, n), n, 1, 1}) {
+            if (cancelled.load()) { ok = false; break; }
+            apply_threads(candidate);
+            if (checked_decode(candidate, probe.make(tokens.data(), count, pos, true), true,
+                               count == 1 ? "probe.generation" : "probe.prefill") != 0) {
+                ok = false;
+                break;
+            }
+            pos += count;
+        }
+        llama_synchronize(candidate);
+        llama_memory_clear(llama_get_memory(candidate), false);
+        return ok && !cancelled.load();
+    } catch (...) {
+        decode_diagnostics.failure("probe", gpu_layers, "allocation or native exception");
         return false;
     }
 }
@@ -228,7 +284,7 @@ llama_context *new_context(int requested = 0) {
     active_threads = std::max(1, std::min(options.threads, thread_limit.load(std::memory_order_relaxed)));
     params.n_threads = params.n_threads_batch = active_threads;
     params.offload_kqv = gpu_layers > 0;
-    params.op_offload = gpu_layers > 0;
+    params.op_offload = gpu_layers > 0 && !output_on_cpu; // do not send CPU output weights back to Vulkan
     params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
     params.abort_callback = abort_decode;
     params.abort_callback_data = nullptr;
@@ -253,6 +309,7 @@ bool evict_oldest_turn() {
     const llama_pos discard = end - start;
     if (!llama_memory_seq_rm(llama_get_memory(context), 0, start, end)) return false;
     llama_memory_seq_add(llama_get_memory(context), 0, end, position, -discard);
+    resident_tokens.erase(resident_tokens.begin() + start, resident_tokens.begin() + end);
     position -= discard;
     turns.erase(turns.begin());
     for (auto &turn : turns) {
@@ -276,22 +333,36 @@ bool make_room(int required) {
     return true;
 }
 
+bool recover_context(const llama_tokens &retry_tokens, bool logits, const char *phase);
+
+int decode_main(const llama_tokens &tokens, bool logits, const char *phase) {
+    if (cancelled.load()) return 2;
+    resident_tokens.reserve(resident_tokens.size() + tokens.size());
+    apply_threads();
+    const int result = checked_decode(context, batch->make(tokens.data(), tokens.size(), position, logits), logits, phase);
+    if (result == 0) {
+        resident_tokens.insert(resident_tokens.end(), tokens.begin(), tokens.end());
+        return 0;
+    }
+    // KV capacity and cancellation are not GPU compatibility failures.
+    if (result == 1 || result == 2 || cancelled.load() || gpu_layers <= 0) return result;
+    // Each candidate must pass the actual failed batch, not only the synthetic
+    // probe, before it is accepted. This keeps the fallback list finite.
+    return recover_context(tokens, logits, phase) ? 0 : result;
+}
+
 int decode_prompt(const llama_tokens &tokens, bool last_logit) {
     for (size_t offset = 0; offset < tokens.size();) {
         if (cancelled.load()) { context_dirty = true; return 3; }
-        const int count = std::min(options.batch, static_cast<int>(tokens.size() - offset));
+        const int count = std::min<int>(llama_n_batch(context), tokens.size() - offset);
         if (!make_room(count)) { context_dirty = true; return 1; }
-        apply_threads();
-        common_batch_clear(batch);
-        for (int i = 0; i < count; ++i)
-            common_batch_add(batch, tokens[offset + i], position + i, {0}, last_logit && offset + i + 1 == tokens.size());
-        const int result = llama_decode(context, batch);
-        last_decode_code = result;
+        const llama_tokens part(tokens.begin() + offset, tokens.begin() + offset + count);
+        const int result = decode_main(part, last_logit && offset + count == tokens.size(),
+                                      last_logit ? "prompt.user" : "prompt.history");
         if (result) {
             context_dirty = true;
-            if (cancelled.load()) return 3;
-            if (result == 1) return 1;
-            return 2;
+            if (cancelled.load() || result == 2) return 3;
+            return result == 1 ? 1 : 2;
         }
         position += count;
         offset += count;
@@ -407,7 +478,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_configureNative(JNIEnv *env, jo
     gpu_load_attempts = 0;
     context_backoffs = 0;
     gpu_probe_failures = 0;
-    last_decode_code = 0;
+    decode_diagnostics = {};
+    runtime_recoveries = 0;
     tuned_thread_choice = 0;
 }
 
@@ -430,7 +502,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstr
     gpu_load_attempts = 0;
     context_backoffs = 0;
     gpu_probe_failures = 0;
-    last_decode_code = 0;
+    decode_diagnostics = {};
+    runtime_recoveries = 0;
     const bool want_gpu = options.gpu_layers > 0 && gpu;
     if (options.gpu_layers > 0 && !gpu) note_fallback("Vulkan device unavailable; CPU selected");
 
@@ -455,10 +528,10 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstr
     llama_model_free(model); model = nullptr;
 
     const int requested = std::min(options.gpu_layers, model_layers);
-    for (const int layers : pocketai::gpu_layer_candidates(requested)) {
+    for (const auto choice : pocketai::fallback_choices(requested, false)) {
         if (cancelled.load()) return 3;
-        if (layers == requested || layers == 0) continue;
-        if (reload_model_layers(layers)) {
+        if (choice.layers == 0) continue;
+        if (reload_model_layers(choice.layers, choice.output_cpu)) {
             note_fallback("Vulkan model load auto-tuned to " + std::to_string(gpu_layers) + " layers");
             return 0;
         }
@@ -472,82 +545,136 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstr
     return 1;
 }
 
-extern "C" JNIEXPORT jint JNICALL
-Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv *, jobject) {
-    if (!model) return 1;
-    const int requested_context = options.context;
-    const int initial_gpu_layers = gpu_layers;
-
-    const auto try_context = [&](int requested) {
-        try { context = new_context(requested); } catch (...) { context = nullptr; }
-        if (context && gpu_layers > 0 && !probe_logits(context)) {
-            ++gpu_probe_failures;
-            log_event(ANDROID_LOG_WARN, "Vulkan logits probe failed; reducing GPU offload");
-            llama_free(context);
-            context = nullptr;
-        }
-        return context != nullptr;
-    };
-
-    free_context();
-    try_context(requested_context);
-
-    // A model can load and even ingest tokens on Vulkan while failing only when its output
-    // logits are requested. Validate that path before accepting the backend. In particular,
-    // keep the final output layer on CPU first when full offload is unstable on mobile GPUs.
-    if (!context && initial_gpu_layers > 0 && !cancelled.load()) {
-        std::vector<int> candidates;
-        const int transformer_layers = llama_model_n_layer(model);
-        if (transformer_layers > 0 && transformer_layers < initial_gpu_layers)
-            candidates.push_back(transformer_layers);
-        for (const int layers : pocketai::gpu_layer_candidates(initial_gpu_layers)) {
-            if (layers < initial_gpu_layers &&
-                std::find(candidates.begin(), candidates.end(), layers) == candidates.end())
-                candidates.push_back(layers);
-        }
-
-        for (const int layers : candidates) {
-            if (cancelled.load()) break;
-            if (!reload_model_layers(layers)) continue;
-            if (try_context(requested_context)) {
-                note_fallback("Vulkan runtime auto-tuned " + std::to_string(initial_gpu_layers) +
-                              " -> " + std::to_string(gpu_layers) + " layers after logits probe");
-                break;
-            }
-        }
+namespace {
+bool try_context(int requested) {
+    try { context = new_context(requested); }
+    catch (...) { context = nullptr; }
+    if (!context) {
+        decode_diagnostics.failure("context", gpu_layers, "allocation failed");
+        return false;
     }
-
-    // If the requested context still does not fit, retain the current backend and back
-    // down through standard context sizes. promptCapacity() always exposes the real size.
-    if (!context && model && !cancelled.load()) {
-        for (const int candidate : pocketai::context_backoff_candidates(requested_context)) {
-            free_context();
-            if (try_context(candidate)) {
-                ++context_backoffs;
-                note_fallback("context auto-tuned " + std::to_string(requested_context) +
-                              " -> " + std::to_string(candidate));
-                break;
-            }
-        }
+    if (!probe_logits(context)) {
+        if (gpu_layers > 0 && !cancelled.load()) ++gpu_probe_failures;
+        llama_free(context);
+        context = nullptr;
     }
+    return context != nullptr;
+}
 
-    if (!context || cancelled.load()) { free_context(); return 1; }
+bool initialize_context_resources() {
     try {
-        batch = llama_batch_init(options.batch, 0, 1);
-        batch_allocated = true;
-        if (!batch.token || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits) { free_context(); return 1; }
+        batch = std::make_unique<NativeBatch>(llama_n_batch(context));
         templates = common_chat_templates_init(model, "");
         common_params_sampling sampling;
         sampling.temp = options.temperature;
         sampler = common_sampler_init(model, sampling);
-        if (!sampler || !templates) { free_context(); return 1; }
+        if (!sampler || !templates) { free_context(); return false; }
         clear_conversation();
-        shifts = 0;
+        return true;
+    } catch (...) { free_context(); return false; }
+}
+
+bool recover_context(const llama_tokens &retry_tokens, bool logits, const char *phase) {
+    if (!context || gpu_layers <= 0 || cancelled.load()) return false;
+    const int old_layers = gpu_layers;
+    const bool old_output = output_on_cpu;
+    const int old_ctx = llama_n_ctx(context);
+    if (resident_tokens.size() != static_cast<size_t>(position)) return false;
+    // Copy before unloading: model/template/sampler pointers cannot survive a reload.
+    auto saved_tokens = resident_tokens;
+    auto restored_tokens = resident_tokens;
+    restored_tokens.insert(restored_tokens.end(), retry_tokens.begin(), retry_tokens.end());
+    auto saved_sampled = sampled_tokens;
+    auto saved_messages = messages;
+    auto saved_turns = turns;
+    const auto saved_position = position;
+    const auto saved_system = system_position;
+    const auto saved_turn_start = current_turn_start;
+    auto saved_assistant = assistant_text;
+    auto saved_bytes = cached_bytes;
+    const bool saved_generating = generating, saved_eog = generation_eog, saved_eot = needs_end_of_turn;
+    const int saved_shifts = shifts, saved_evictions = turn_evictions;
+
+    const bool restored = pocketai::try_fallbacks(old_layers, old_output,
+        [] { return cancelled.load(); }, [&](pocketai::BackendChoice choice) {
+            try {
+            if (!reload_model_layers(choice.layers, choice.output_cpu)) return false;
+            // Runtime recovery never shrinks context or silently discards conversation.
+            if (!try_context(old_ctx) || !initialize_context_resources()) return false;
+            NativeBatch replay(llama_n_batch(context));
+            for (size_t offset = 0; offset < saved_tokens.size();) {
+                if (cancelled.load()) return false;
+                const int count = std::min<size_t>(llama_n_batch(context), saved_tokens.size() - offset);
+                const bool last = offset + count == saved_tokens.size();
+                if (checked_decode(context, replay.make(saved_tokens.data() + offset, count, offset, last),
+                                   last, "recovery.replay") != 0) return false;
+                offset += count;
+            }
+            for (const auto token : saved_sampled) common_sampler_accept(sampler, token, true);
+            return checked_decode(context, batch->make(retry_tokens.data(), retry_tokens.size(), saved_position, logits),
+                                  logits, phase) == 0;
+            } catch (...) {
+                decode_diagnostics.failure("recovery", choice.layers, "allocation or native exception");
+                return false;
+            }
+        });
+    if (!restored) { free_context(); return false; }
+    resident_tokens = std::move(restored_tokens);
+    sampled_tokens = std::move(saved_sampled);
+    messages = std::move(saved_messages);
+    turns = std::move(saved_turns);
+    position = saved_position;
+    system_position = saved_system;
+    current_turn_start = saved_turn_start;
+    assistant_text = std::move(saved_assistant);
+    cached_bytes = std::move(saved_bytes);
+    generating = saved_generating;
+    generation_eog = saved_eog;
+    needs_end_of_turn = saved_eot;
+    shifts = saved_shifts;
+    turn_evictions = saved_evictions;
+    ++runtime_recoveries;
+    note_fallback("runtime recovery " + std::to_string(old_layers) + " -> " + std::to_string(gpu_layers) +
+                  (output_on_cpu ? " output tensors on CPU" : gpu_layers == 0 ? " CPU" : " GPU"));
+    return true;
+}
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv *, jobject) {
+    if (!model) return 1;
+    try {
+        const int requested_context = options.context;
+        const int initial_gpu_layers = gpu_layers;
+        const bool initial_output_cpu = output_on_cpu;
+        free_context();
+        if (!try_context(requested_context) && initial_gpu_layers > 0 && !cancelled.load()) {
+            pocketai::try_fallbacks(initial_gpu_layers, initial_output_cpu,
+                [] { return cancelled.load(); }, [&](pocketai::BackendChoice choice) {
+                    if (!reload_model_layers(choice.layers, choice.output_cpu)) return false;
+                    if (!try_context(requested_context)) return false;
+                    note_fallback("validated offload " + std::to_string(initial_gpu_layers) + " -> " +
+                                  std::to_string(gpu_layers) + (output_on_cpu ? " output tensors on CPU" : " CPU"));
+                    return true;
+                });
+        }
+        if (!context && model && !cancelled.load()) {
+            for (int candidate : pocketai::context_backoff_candidates(requested_context)) {
+                if (cancelled.load()) break;
+                free_context();
+                if (try_context(candidate)) {
+                    ++context_backoffs;
+                    note_fallback("context auto-tuned " + std::to_string(requested_context) + " -> " + std::to_string(candidate));
+                    break;
+                }
+            }
+        }
+        if (!context || cancelled.load() || !initialize_context_resources()) { free_context(); return 1; }
         budget.start(0);
         prompt_tokens = 0;
         prompt_us = 0;
         generation_start = generation_end = 0;
-        log_event(ANDROID_LOG_INFO, gpu_layers > 0 ? "Vulkan model ready" : "CPU model ready");
+        log_event(ANDROID_LOG_INFO, gpu_layers > 0 ? "Vulkan model ready (prefill and logits validated)" : "CPU model ready");
         return 0;
     } catch (...) { free_context(); return 1; }
 }
@@ -584,15 +711,12 @@ extern "C" JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_tuneThreadsNative(JNIEnv *, jobject, jint maximum) {
     if (!model || !context || maximum < 1 || maximum > 32) return -1;
     llama_context *bench_context = nullptr;
-    llama_batch bench_batch{};
-    bool allocated = false;
+    std::unique_ptr<NativeBatch> bench_batch;
     try {
         bench_context = new_context(512);
         if (!bench_context) return -1;
-        bench_batch = llama_batch_init(1, 0, 1);
-        allocated = true;
-        if (!bench_batch.token || !bench_batch.pos || !bench_batch.seq_id || !bench_batch.logits)
-            throw std::runtime_error("thread tune batch allocation");
+        if (!probe_logits(bench_context)) throw std::runtime_error("thread tune validation");
+        bench_batch = std::make_unique<NativeBatch>(1);
 
         const auto candidates = pocketai::thread_candidates(static_cast<int>(maximum));
 
@@ -609,18 +733,16 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_tuneThreadsNative(JNIEnv *, job
             llama_set_n_threads(bench_context, threads, threads);
 
             // One warm-up token is enough to wake CPU/GPU clocks without making tuning intrusive.
-            common_batch_clear(bench_batch);
-            common_batch_add(bench_batch, token, 0, {0}, true);
-            if (llama_decode(bench_context, bench_batch)) throw std::runtime_error("thread tune warmup");
+            if (checked_decode(bench_context, bench_batch->make(&token, 1, 0, true), true, "tune.warmup"))
+                throw std::runtime_error("thread tune warmup");
 
             llama_memory_clear(llama_get_memory(bench_context), false);
             const auto started = ggml_time_us();
             constexpr int TOKENS = 6;
             for (int i = 0; i < TOKENS; ++i) {
                 if (cancelled.load()) throw std::runtime_error("cancelled");
-                common_batch_clear(bench_batch);
-                common_batch_add(bench_batch, token, i, {0}, true);
-                if (llama_decode(bench_context, bench_batch)) throw std::runtime_error("thread tune decode");
+                if (checked_decode(bench_context, bench_batch->make(&token, 1, i, true), true, "tune.generation"))
+                    throw std::runtime_error("thread tune decode");
             }
             const auto elapsed = std::max<int64_t>(1, ggml_time_us() - started);
             return TOKENS * 1e6 / elapsed;
@@ -642,8 +764,9 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_tuneThreadsNative(JNIEnv *, job
         consider(coarse_best - 1);
         consider(coarse_best + 1);
 
-        llama_batch_free(bench_batch);
+        bench_batch.reset();
         llama_free(bench_context);
+        bench_context = nullptr;
         tuned_thread_choice = best_threads;
         thread_limit.store(best_threads);
         active_threads = std::max(1, std::min(options.threads, best_threads));
@@ -651,7 +774,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_tuneThreadsNative(JNIEnv *, job
         log_event(ANDROID_LOG_INFO, "CPU thread auto-tune completed");
         return best_threads;
     } catch (...) {
-        if (allocated) llama_batch_free(bench_batch);
+        bench_batch.reset();
         if (bench_context) llama_free(bench_context);
         return cancelled.load() ? -2 : -1;
     }
@@ -686,6 +809,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(JNIEnv *env, 
         cached_bytes.clear();
         assistant_text.clear();
         common_sampler_reset(sampler);
+        sampled_tokens.clear();
         const auto start = ggml_time_us();
         if (!make_room(static_cast<int>(tokens.size()))) { context_dirty = true; return 1; }
         current_turn_start = position;
@@ -719,16 +843,16 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(JNIEnv *env, 
             throw_io(env, "This model cannot slide its context; reset the conversation"); return nullptr;
         }
         apply_threads();
+        sampled_tokens.reserve(sampled_tokens.size() + 1);
         const auto token = common_sampler_sample(sampler, context, -1);
-        common_sampler_accept(sampler, token, true);
-        common_batch_clear(batch);
-        common_batch_add(batch, token, position, {0}, true);
-        if (llama_decode(context, batch)) {
+        if (decode_main({token}, true, "generation")) {
             context_dirty = true;
             finish_generation();
             if (!cancelled.load()) throw_io(env, "Native token decode failed; reset or reduce model/context size");
             return nullptr;
         }
+        common_sampler_accept(sampler, token, true);
+        sampled_tokens.push_back(token);
         ++position;
         if (llama_vocab_is_eog(llama_model_get_vocab(model), token)) { generation_eog = true; finish_generation(); return nullptr; }
         budget.consume();
@@ -773,7 +897,11 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_nativeDiagnostics(JNIEnv *env, 
     const int64_t duration = generation_start ? (generation_end ? generation_end : ggml_time_us()) - generation_start : 0;
     out << "Generation: " << (duration > 0 ? budget.produced * 1e6 / duration : 0.0) << " tokens/s; prompt: " << (prompt_us > 0 ? prompt_tokens * 1e6 / prompt_us : 0.0) << " tokens/s\n";
     out << "Backend warnings: " << backend_warnings.load() << "; errors: " << backend_errors.load()
-        << "; last decode code: " << last_decode_code << '\n';
+        << "; last decode code: " << (decode_diagnostics.has_code ? std::to_string(decode_diagnostics.code) : "not run")
+        << "; phase: " << decode_diagnostics.phase << '\n';
+    out << "Output placement policy: " << (gpu_layers == 0 ? "CPU" : output_on_cpu ? "CPU tensor overrides; host op offload disabled" : "backend default")
+        << "; runtime recoveries: " << runtime_recoveries << '\n';
+    for (const auto &failure : decode_diagnostics.failures) out << "Failure: " << failure << '\n';
     out << "Prompt/content logging: disabled\n" << llama_print_system_info();
     return android_text(env, out.str());
 }
@@ -783,18 +911,16 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_benchModel(JNIEnv *env, jobject
     if (!model || pp < 1 || pp > options.context - HEADROOM || tg < 1 || tg > options.context - HEADROOM || pl != 1 || nr < 1 || nr > 5)
         return android_text(env, "Invalid benchmark parameters for the configured context");
     llama_context *bench_context = nullptr;
-    llama_batch bench_batch{};
-    bool allocated = false;
+    std::unique_ptr<NativeBatch> bench_batch;
     try {
-        bench_context = new_context();
+        bench_context = new_context(context ? llama_n_ctx(context) : options.context);
         if (!bench_context) return android_text(env, "Benchmark context allocation failed");
         if (pp > static_cast<int>(llama_n_ctx(bench_context)) - HEADROOM || tg > static_cast<int>(llama_n_ctx(bench_context)) - HEADROOM) {
             llama_free(bench_context);
             return android_text(env, "Benchmark exceeds the model context");
         }
-        bench_batch = llama_batch_init(options.batch, 0, 1);
-        allocated = true;
-        if (!bench_batch.token || !bench_batch.pos || !bench_batch.seq_id || !bench_batch.logits) throw std::runtime_error("batch allocation");
+        if (!probe_logits(bench_context)) throw std::runtime_error("benchmark validation");
+        bench_batch = std::make_unique<NativeBatch>(llama_n_batch(bench_context));
         double prompt_speed = 0, generation_speed = 0;
         const auto vocab = llama_model_get_vocab(model);
         auto token = llama_vocab_bos(vocab);
@@ -805,10 +931,11 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_benchModel(JNIEnv *env, jobject
             for (int offset = 0; offset < pp;) {
                 if (cancelled.load()) throw std::runtime_error("cancelled");
                 apply_threads(bench_context);
-                common_batch_clear(bench_batch);
-                const int count = std::min(options.batch, pp - offset);
-                for (int i = 0; i < count; ++i) common_batch_add(bench_batch, token, offset + i, {0}, offset + i + 1 == pp);
-                if (llama_decode(bench_context, bench_batch)) throw std::runtime_error("decode");
+                const int count = std::min<int>(llama_n_batch(bench_context), pp - offset);
+                const llama_tokens tokens(count, token);
+                const bool last = offset + count == pp;
+                if (checked_decode(bench_context, bench_batch->make(tokens.data(), count, offset, last), last, "benchmark.prefill"))
+                    throw std::runtime_error("decode");
                 offset += count;
             }
             prompt_speed += pp * 1e6 / std::max<int64_t>(1, ggml_time_us() - start);
@@ -817,20 +944,20 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_benchModel(JNIEnv *env, jobject
             for (int i = 0; i < tg; ++i) {
                 if (cancelled.load()) throw std::runtime_error("cancelled");
                 apply_threads(bench_context);
-                common_batch_clear(bench_batch);
-                common_batch_add(bench_batch, token, i, {0}, true);
-                if (llama_decode(bench_context, bench_batch)) throw std::runtime_error("decode");
+                if (checked_decode(bench_context, bench_batch->make(&token, 1, i, true), true, "benchmark.generation"))
+                    throw std::runtime_error("decode");
             }
             generation_speed += tg * 1e6 / std::max<int64_t>(1, ggml_time_us() - generation);
         }
-        llama_batch_free(bench_batch);
+        bench_batch.reset();
         llama_free(bench_context);
+        bench_context = nullptr;
         std::ostringstream out;
         out.precision(3);
         out << "Prompt: " << prompt_speed / nr << " tokens/s\nGeneration: " << generation_speed / nr << " tokens/s\nBackend: " << (gpu_layers > 0 ? "Vulkan + CPU" : "CPU");
         return android_text(env, out.str());
     } catch (...) {
-        if (allocated) llama_batch_free(bench_batch);
+        bench_batch.reset();
         if (bench_context) llama_free(bench_context);
         return android_text(env, cancelled.load() ? "Benchmark cancelled" : "Benchmark failed (allocation or decode)");
     }
@@ -844,3 +971,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_unload(JNIEnv *, jobject) {
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_shutdown(JNIEnv *, jobject) { llama_backend_free(); }
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_isContextReadyNative(JNIEnv *, jobject) {
+    return context && sampler && templates && batch ? JNI_TRUE : JNI_FALSE;
+}

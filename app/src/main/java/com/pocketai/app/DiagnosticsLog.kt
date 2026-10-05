@@ -15,7 +15,7 @@ class DiagnosticsLog(context: Context) {
         val version = runCatching {
             context.packageManager.getPackageInfo(context.packageName, 0).versionName
         }.getOrNull() ?: "unknown"
-        event("session app=$version android=${Build.VERSION.SDK_INT} " +
+        event("session app=$version revision=${BuildConfig.SOURCE_REVISION} package=${context.packageName} android=${Build.VERSION.SDK_INT} " +
             "device=${Build.MANUFACTURER} ${Build.MODEL} abis=${Build.SUPPORTED_ABIS.joinToString()}")
         runCatching { event("hardware ${HardwareProfile.detect(context)}") }
     }
