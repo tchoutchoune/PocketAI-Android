@@ -46,6 +46,8 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
     private external fun load(modelPath: String): Int
     private external fun prepare(): Int
     private external fun nativeDiagnostics(): String
+    private external fun countPromptTokensNative(userPrompt: String): Int
+    private external fun promptCapacityNative(): Int
     private external fun benchModel(pp: Int, tg: Int, pl: Int, nr: Int): String
     private external fun processSystemPrompt(systemPrompt: String): Int
     private external fun processUserPrompt(userPrompt: String, predictLength: Int): Int
@@ -108,6 +110,29 @@ internal class InferenceEngineImpl private constructor(nativeLibDir: String) : I
         mutex.withLock {
             check(!closing && !destroyed) { "Inference engine is closing or has been destroyed" }
             nativeDiagnostics()
+        }
+    }
+
+    override suspend fun promptTokenCount(message: String): Int = withContext(dispatcher) {
+        awaitInitialization()
+        require(message.isNotBlank()) { "Message must not be empty" }
+        mutex.withLock {
+            check(!closing && !destroyed) { "Inference engine is closing or has been destroyed" }
+            check(modelLoaded && _state.value is InferenceEngine.State.ModelReady) { "Model is not ready" }
+            countPromptTokensNative(message).also {
+                if (it < 0) throw IOException("Prompt tokenization failed")
+            }
+        }
+    }
+
+    override suspend fun promptCapacity(): Int = withContext(dispatcher) {
+        awaitInitialization()
+        mutex.withLock {
+            check(!closing && !destroyed) { "Inference engine is closing or has been destroyed" }
+            check(modelLoaded && _state.value is InferenceEngine.State.ModelReady) { "Model is not ready" }
+            promptCapacityNative().also {
+                if (it < 1) throw IOException("Prompt capacity is unavailable")
+            }
         }
     }
 
