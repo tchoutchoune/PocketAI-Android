@@ -58,7 +58,7 @@ class DeviceInferenceTest {
     fun cpuAndRequestedVulkanProduceCoherentTextAcrossTurns() = runBlocking {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val context = instrumentation.targetContext
-        val path = instrumentation.arguments.getString("modelPath")
+        val path = InstrumentationRegistry.getArguments().getString("modelPath")
         assumeTrue("Supply a readable GGUF modelPath on the real device", path != null && File(path).canRead())
 
         val engine = AiChat.getInferenceEngine(context)
