@@ -341,6 +341,11 @@ class MainActivity : AppCompatActivity() {
                 .setMessage(HardwareProfile.detect(this).summary + "\n\n" + model.state.value.diagnostics.ifBlank { "Charge un modèle pour confirmer le moteur utilisé." })
                 .setPositiveButton("Fermer", null).show()
         })
+        if (model.state.value.modelName != null) {
+            settingsPanel.addView(button("Recalibrer les threads CPU") { model.retunePerformance() }
+                .apply { isEnabled = !model.state.value.busy })
+            settingsPanel.addView(text("Le recalibrage compare plusieurs nombres de threads sur le modèle et le backend actuellement chargés. Le résultat est mémorisé pour les prochains chargements.", 13f))
+        }
         settingsPanel.addView(button("Exporter les logs de débogage") {
             if (pendingSave == null && !exportInProgress) lifecycleScope.launch {
                 exportInProgress = true
