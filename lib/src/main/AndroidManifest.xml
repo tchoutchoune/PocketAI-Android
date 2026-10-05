@@ -1,4 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-
+    <application>
+        <!-- Optional Qualcomm OpenCL libraries. These declarations grant linker
+             namespace visibility when the device exposes them; installation
+             remains valid when the vendor does not. -->
+        <uses-native-library android:name="libOpenCL.so" android:required="false" />
+        <uses-native-library android:name="libOpenCL_adreno.so" android:required="false" />
+    </application>
 </manifest>
