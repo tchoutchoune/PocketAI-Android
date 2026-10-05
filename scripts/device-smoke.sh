@@ -92,7 +92,10 @@ LOGCAT="$OUT_DIR/device-logcat-$STAMP.txt"
 "${ADB[@]}" logcat -c || true
 echo "Running CPU + requested Vulkan semantic smoke test..."
 set +e
-"${ADB[@]}" shell am instrument -w -r     -e modelPath "$DEVICE_MODEL"     "$TEST_PACKAGE/$RUNNER" | tee "$REPORT"
+"${ADB[@]}" shell am instrument -w -r \
+    -e class com.arm.aichat.DeviceInferenceTest \
+    -e modelPath "$DEVICE_MODEL" \
+    "$TEST_PACKAGE/$RUNNER" | tee "$REPORT"
 TEST_STATUS=${PIPESTATUS[0]}
 set -e
 

@@ -18,6 +18,9 @@
 #include "runtime_policy.h"
 #include "native_batch.h"
 #include <memory>
+#ifdef __ANDROID__
+#include <dlfcn.h>
+#endif
 
 namespace {
 constexpr int HEADROOM = 8;
@@ -51,6 +54,7 @@ std::string cached_bytes;
 std::string assistant_text;
 std::string fallback;
 std::string gpu_description;
+std::string opencl_probe_description;
 ggml_backend_dev_t gpu = nullptr;
 int gpu_layers = 0;
 int active_threads = 4;
@@ -88,6 +92,25 @@ void private_backend_log(ggml_log_level level, const char *, void *) {
 
 bool abort_decode(void *) { return cancelled.load(std::memory_order_relaxed); }
 bool load_progress(float, void *) { return !cancelled.load(std::memory_order_relaxed); }
+
+std::string probe_opencl_runtime() {
+#ifdef __ANDROID__
+    std::string result;
+    for (const char *name : {"libOpenCL.so", "libOpenCL_adreno.so"}) {
+        // This is only a linker-namespace capability probe. It does not initialize
+        // OpenCL, create a context, or select it as an inference backend.
+        dlerror();
+        void *handle = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+        const bool api = handle && dlsym(handle, "clGetPlatformIDs");
+        if (!result.empty()) result += "; ";
+        result += std::string(name) + (api ? " loadable" : handle ? " missing clGetPlatformIDs" : " unavailable");
+        if (handle) dlclose(handle);
+    }
+    return result;
+#else
+    return "not probed outside Android";
+#endif
+}
 
 void note_fallback(const std::string &message) {
     if (!fallback.empty()) fallback += "; ";
@@ -442,6 +465,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_init(JNIEnv *env, jobject, jstr
         }
         gpu = nullptr;
         gpu_description.clear();
+        opencl_probe_description = probe_opencl_runtime();
         try {
             auto reg = ggml_backend_reg_by_name("Vulkan");
             if (reg) {
@@ -884,6 +908,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_nativeDiagnostics(JNIEnv *env, 
     std::ostringstream out;
     out.precision(3);
     out << "Vulkan GPU: " << (gpu_description.empty() ? "unavailable (device/driver unsupported or backend absent)" : gpu_description) << '\n';
+    out << "OpenCL runtime probe: " << (opencl_probe_description.empty() ? "not run" : opencl_probe_description)
+        << " (diagnostic only; not an active inference backend)\n";
     out << "Requested: " << (options.gpu_layers ? "Vulkan" : "CPU") << "; active: " << (context ? gpu_layers > 0 ? "Vulkan + CPU" : "CPU" : "no model") << '\n';
     out << "GPU layers: " << gpu_layers << "; load attempts: " << gpu_load_attempts
         << "; logits probe failures: " << gpu_probe_failures

@@ -71,7 +71,7 @@ jobs:
       - name: Upload APKs and verification evidence
         uses: actions/upload-artifact@v6
         with:
-          name: PocketAI-4.2.2-arm64-vulkan-test
+          name: PocketAI-4.2.2-opencl-runtime-probe
           path: out/*
           retention-days: 14
           if-no-files-found: error

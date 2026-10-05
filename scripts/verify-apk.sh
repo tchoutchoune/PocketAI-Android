@@ -52,8 +52,10 @@ test_libs = verify_native_apk(test_apk, 'ENGINE-TEST-NATIVE-LIBS.txt')
 )
 
 badging=(out/'PACKAGE.txt').read_text()
-assert "name='com.pocketai.app.vulkanvalidation'" in badging
+assert "name='com.pocketai.app.openclprobe'" in badging
 assert "versionCode='40202'" in badging
+assert "uses-native-library-not-required:'libOpenCL.so'" in badging, badging
+assert "uses-native-library-not-required:'libOpenCL_adreno.so'" in badging, badging
 
 test_badging=(out/'ENGINE-TEST-PACKAGE.txt').read_text()
 assert "name='com.arm.aichat.test'" in test_badging, test_badging
@@ -64,13 +66,14 @@ assert "targetPackage='com.arm.aichat.test'" in test_badging, test_badging
 print(f'Validated UI ({app_libs} libs) and instrumentation ({test_libs} libs) APKs, including Vulkan and 16 KB alignment')
 PY
 
-cp "$TASK_APK" "$TASK_REPO/out/PocketAI-4.2.2-arm64-vulkan-test.apk"
+cp "$TASK_APK" "$TASK_REPO/out/PocketAI-4.2.2-arm64-opencl-probe.apk"
 cp "$TASK_TEST_APK" "$TASK_REPO/out/PocketAI-4.2.2-engine-androidTest.apk"
 cp "$TASK_REPO/scripts/device-smoke.sh" "$TASK_REPO/out/DEVICE-SMOKE.sh"
+cp "$TASK_REPO/scripts/opencl-probe.sh" "$TASK_REPO/out/OPENCL-PROBE.sh"
 cp "$TASK_REPO/docs/ADRENO-840-VALIDATION.md" "$TASK_REPO/out/ADRENO-840-VALIDATION.md"
 
 cd "$TASK_REPO/out"
-sha256sum PocketAI-4.2.2-arm64-vulkan-test.apk PocketAI-4.2.2-engine-androidTest.apk > SHA256.txt
+sha256sum PocketAI-4.2.2-arm64-opencl-probe.apk PocketAI-4.2.2-engine-androidTest.apk > SHA256.txt
 git -C "$TASK_REPO" rev-parse HEAD > SOURCE-COMMIT.txt
 printf '%s\n' "Revision embedded in APK: ${POCKETAI_SOURCE_REVISION:-local}" > BUILD-IDENTITY.txt
-printf '%s\n'     'Manual UI APK: PocketAI-4.2.2-arm64-vulkan-test.apk'     'Engine instrumentation APK: PocketAI-4.2.2-engine-androidTest.apk'     'Real-device helper: bash DEVICE-SMOKE.sh --local-model /path/to/Qwen2.5-3B-Instruct-Q4_K_M.gguf'     'Add --require-vulkan to reject a reliability pass obtained only through CPU fallback.'     > DEVICE-TEST.txt
+printf '%s\n'     'Manual UI APK: PocketAI-4.2.2-arm64-opencl-probe.apk'     'Engine instrumentation APK: PocketAI-4.2.2-engine-androidTest.apk'     'OpenCL runtime probe (no model required): bash OPENCL-PROBE.sh'     'Real-device semantic helper: bash DEVICE-SMOKE.sh --local-model /path/to/Qwen2.5-3B-Instruct-Q4_K_M.gguf'     'Add --require-vulkan to reject a reliability pass obtained only through CPU fallback.'     > DEVICE-TEST.txt
