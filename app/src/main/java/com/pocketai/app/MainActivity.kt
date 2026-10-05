@@ -64,6 +64,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var stopButton: MaterialButton
     private lateinit var newButton: MaterialButton
     private var selectedTab = 0
+    private var speech: LocalSpeech? = null
+    private var speakingMessageId: String? = null
 
     private val importPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let(model::importModel)
@@ -197,11 +199,23 @@ class MainActivity : AppCompatActivity() {
         }
         toggleRow.addView(webToggle, LinearLayout.LayoutParams(-1, -2))
         chat.addView(toggleRow)
-        adapter = ChatAdapter(this, shownMessages, ::chooseExport) { message ->
-            val clipboard = getSystemService(ClipboardManager::class.java)
-            clipboard.setPrimaryClip(ClipData.newPlainText("PocketAI", (if (message.isUser) message.content else ResponseText.visible(message.content))))
-            toast("Réponse copiée")
-        }
+        adapter = ChatAdapter(
+            context = this,
+            messages = shownMessages,
+            onExport = ::chooseExport,
+            onCopy = { message ->
+                val clipboard = getSystemService(ClipboardManager::class.java)
+                clipboard.setPrimaryClip(
+                    ClipData.newPlainText(
+                        "PocketAI",
+                        if (message.isUser) message.content else ResponseText.visible(message.content),
+                    )
+                )
+                toast("Réponse copiée")
+            },
+            onSpeak = ::toggleSpeech,
+            speakingMessageId = { speakingMessageId },
+        )
         messageList = RecyclerView(this).apply {
             layoutManager = LinearLayoutManager(this@MainActivity).apply { stackFromEnd = true }
             adapter = this@MainActivity.adapter
@@ -503,6 +517,23 @@ class MainActivity : AppCompatActivity() {
         dialog.show()
     }
 
+    private fun toggleSpeech(message: ChatMessage) {
+        if (message.isUser || message.isStreaming) return
+        val controller = speech ?: LocalSpeech(
+            context = this,
+            onActiveMessageChanged = { id ->
+                runOnUiThread {
+                    speakingMessageId = id
+                    if (::adapter.isInitialized) adapter.notifyDataSetChanged()
+                }
+            },
+            onError = { error ->
+                runOnUiThread { showError(error) }
+            },
+        ).also { speech = it }
+        controller.toggle(message.id, message.content)
+    }
+
     private fun chooseExport(message: ChatMessage) {
         val files = ResponseText.extractFiles(message.content)
         val formats = ExportFormat.entries
@@ -568,6 +599,12 @@ class MainActivity : AppCompatActivity() {
         outState.putInt("tab", selectedTab)
         outState.putString("draft", input.text?.toString().orEmpty())
         pendingSave?.let { outState.putString("pendingPath", it.file.absolutePath); outState.putString("pendingMime", it.mimeType); outState.putString("pendingName", it.displayName) }
+    }
+
+    override fun onDestroy() {
+        speech?.shutdown()
+        speech = null
+        super.onDestroy()
     }
 
     private fun showError(message: String) { MaterialAlertDialogBuilder(this).setTitle("PocketAI").setMessage(message).setPositiveButton("Compris", null).show() }
