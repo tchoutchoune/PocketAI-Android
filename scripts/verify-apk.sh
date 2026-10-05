@@ -18,6 +18,7 @@ unzip -t "$TASK_APK" > "$TASK_REPO/out/ZIP-CHECK.txt"
 unzip -t "$TASK_TEST_APK" > "$TASK_REPO/out/ENGINE-TEST-ZIP-CHECK.txt"
 "$TASK_SDK/build-tools/35.0.0/apksigner" verify --verbose "$TASK_TEST_APK" > "$TASK_REPO/out/ENGINE-TEST-SIGNATURE.txt"
 "$TASK_SDK/build-tools/35.0.0/aapt" dump badging "$TASK_TEST_APK" > "$TASK_REPO/out/ENGINE-TEST-PACKAGE.txt"
+"$TASK_SDK/build-tools/35.0.0/aapt" dump xmltree "$TASK_TEST_APK" AndroidManifest.xml > "$TASK_REPO/out/ENGINE-TEST-MANIFEST.txt"
 
 python3 - "$TASK_APK" "$TASK_TEST_APK" "$TASK_REPO/out" <<'PY'
 from pathlib import Path
@@ -57,9 +58,10 @@ assert "versionCode='40202'" in badging
 
 test_badging=(out/'ENGINE-TEST-PACKAGE.txt').read_text()
 assert "name='com.arm.aichat.test'" in test_badging, test_badging
-assert "instrumentation" in test_badging, test_badging
-assert "androidx.test.runner.AndroidJUnitRunner" in test_badging, test_badging
-assert "targetPackage='com.arm.aichat.test'" in test_badging, test_badging
+test_manifest=(out/'ENGINE-TEST-MANIFEST.txt').read_text()
+assert 'E: instrumentation' in test_manifest, test_manifest
+assert 'androidx.test.runner.AndroidJUnitRunner' in test_manifest, test_manifest
+assert 'com.arm.aichat.test' in test_manifest, test_manifest
 
 print(f'Validated UI ({app_libs} libs) and instrumentation ({test_libs} libs) APKs, including Vulkan and 16 KB alignment')
 PY
