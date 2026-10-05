@@ -231,7 +231,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 ?: activeOptions.contextSize
             val tuned = inference().tuneThreads(ceiling)
             activeOptions = activeOptions.copy(threads = tuned)
-            inference().setThreadLimit(tuned)
+            thermalListener.onThermalStatusChanged(runCatching { power.currentThermalStatus }.getOrDefault(0))
             prefs.edit().putInt(threadTuneKey(file, profile, gpuLayers, contextSize), tuned).apply()
             val info = inference().diagnostics()
             logs.event("thread_retuned threads=$tuned max=$ceiling gpu_layers=$gpuLayers context=$contextSize")
