@@ -421,7 +421,12 @@ class MainActivity : AppCompatActivity() {
                     toast("Profil appliqué au prochain chargement du modèle")
                 }.setNegativeButton("Fermer", null).show()
         })
-        settingsPanel.addView(text("PocketAI adapte le contexte à la RAM, cherche automatiquement le meilleur nombre de couches Vulkan et calibre les threads CPU sur le modèle chargé. En cas de chauffe, les threads sont réduits dynamiquement.", 14f))
+        settingsPanel.addView(text("PocketAI adapte le contexte à la RAM, cherche automatiquement le meilleur nombre de couches Vulkan et calibre les threads CPU sur le modèle chargé. Si un backend GPU échoue réellement, l’application mémorise automatiquement un plafond sûr pour ce modèle et cet appareil. Le mode Performances permet de forcer un nouveau test.", 14f))
+        settingsPanel.addView(button("Réinitialiser l’adaptation GPU") {
+            model.clearBackendLearning()
+            toast("Le prochain chargement retestera le GPU en mode automatique.")
+            renderSettings()
+        })
         settingsPanel.addView(button("Longueur maximale : ${model.maxTokens} tokens") {
             val values = intArrayOf(256, 512, 1024, 2048, 4096, 8192)
             MaterialAlertDialogBuilder(this).setTitle("Longueur des réponses")
