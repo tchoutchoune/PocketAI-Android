@@ -1,4 +1,4 @@
-# Validation OnePlus / Adreno 840 — PR #5
+# Validation OnePlus / Adreno 840 — PocketAI 4.3 integration
 
 Status: hardware validation required. Passing CI is not a Vulkan device certification.
 
@@ -44,12 +44,12 @@ previously observed `@@@@` corruption fails the test.
 
 ## Identify the tested binary
 
-Use the artifact `PocketAI-4.2.2-arm64-vulkan-test` for the exact CI commit.
+Use the artifact `PocketAI-4.3.0-integration` for the exact CI commit.
 It contains:
 
-- `PocketAI-4.2.2-arm64-vulkan-test.apk`: isolated UI build,
-  package `com.pocketai.app.vulkanvalidation`, label `PocketAI Vulkan Test`.
-- `PocketAI-4.2.2-engine-androidTest.apk`: engine instrumentation test.
+- `PocketAI-4.3.0-integration.apk`: isolated UI build,
+  package `com.pocketai.app.integration`, label `PocketAI 4.3 Test`.
+- `PocketAI-4.3.0-engine-androidTest.apk`: engine instrumentation test.
 - `DEVICE-SMOKE.sh`: ADB helper that installs the instrumentation APK, optionally
   pushes a local GGUF, runs CPU and requested-Vulkan passes and captures diagnostics.
 - `ADRENO-840-VALIDATION.md`, `SOURCE-COMMIT.txt`, `SHA256.txt` and verification evidence.

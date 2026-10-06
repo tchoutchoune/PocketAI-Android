@@ -50,6 +50,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var sendButton: MaterialButton
     private lateinit var input: TextInputEditText
     private lateinit var webToggle: SwitchMaterial
+    private lateinit var attachmentButton: MaterialButton
     private lateinit var chat: LinearLayout
     private lateinit var modelsPanel: LinearLayout
     private lateinit var creationPanel: LinearLayout
@@ -64,9 +65,16 @@ class MainActivity : AppCompatActivity() {
     private lateinit var stopButton: MaterialButton
     private lateinit var newButton: MaterialButton
     private var selectedTab = 0
+    private val streamingFollow = StreamingFollowState()
+    private var userDraggingMessages = false
+    private var speech: LocalSpeech? = null
+    private var speakingMessageId: String? = null
 
     private val importPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let(model::importModel)
+    }
+    private val attachmentPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let(model::attachDocument)
     }
     private val savePicker = registerForActivityResult(object : ActivityResultContracts.CreateDocument("*/*") {
         override fun createIntent(context: android.content.Context, input: String): Intent =
@@ -161,14 +169,23 @@ class MainActivity : AppCompatActivity() {
                     sendButton.text = if (state.busy) "Arrêter" else "Envoyer"
                     input.isEnabled = !state.busy
                     webToggle.isEnabled = !state.busy
-                    val wasAtBottom = !messageList.canScrollVertically(1)
+                    attachmentButton.isEnabled = !state.busy
+                    attachmentButton.text = state.attachment?.let { "📎 " + it.displayName.take(18) } ?: "Joindre"
+                    attachmentButton.contentDescription = state.attachment?.let { "Document joint : ${it.displayName}" } ?: "Joindre un document local"
                     val oldCount = shownMessages.size
                     if (shownMessages != state.messages) {
-                        val changed = shownMessages.size == state.messages.size && shownMessages.dropLast(1) == state.messages.dropLast(1)
-                        shownMessages.clear(); shownMessages.addAll(state.messages)
-                        if (changed && shownMessages.isNotEmpty()) adapter.notifyItemChanged(shownMessages.lastIndex)
-                        else adapter.notifyDataSetChanged()
-                        if (wasAtBottom || state.messages.size > oldCount) messageList.scrollToPosition((shownMessages.size - 1).coerceAtLeast(0))
+                        val changed = shownMessages.size == state.messages.size &&
+                            shownMessages.dropLast(1) == state.messages.dropLast(1)
+                        val newMessage = state.messages.size > oldCount
+                        shownMessages.clear()
+                        shownMessages.addAll(state.messages)
+                        if (newMessage) streamingFollow.onNewMessage()
+                        if (changed && shownMessages.isNotEmpty()) {
+                            adapter.notifyMessageContentChanged(shownMessages.lastIndex)
+                        } else {
+                            adapter.notifyDataSetChanged()
+                        }
+                        if (streamingFollow.following) scrollChatToBottom()
                     }
                     val key = state.busy to state.modelName
                     if (key != lastModelsKey) { renderModels(); lastModelsKey = key }
@@ -195,19 +212,52 @@ class MainActivity : AppCompatActivity() {
                 } else model.settings.webSearchEnabled = checked
             }
         }
-        toggleRow.addView(webToggle, LinearLayout.LayoutParams(-1, -2))
-        chat.addView(toggleRow)
-        adapter = ChatAdapter(this, shownMessages, ::chooseExport) { message ->
-            val clipboard = getSystemService(ClipboardManager::class.java)
-            clipboard.setPrimaryClip(ClipData.newPlainText("PocketAI", (if (message.isUser) message.content else ResponseText.visible(message.content))))
-            toast("Réponse copiée")
+        toggleRow.addView(webToggle, LinearLayout.LayoutParams(0, -2, 1f))
+        attachmentButton = button("Joindre") { attachmentAction() }.apply {
+            contentDescription = "Joindre un document local"
         }
+        toggleRow.addView(attachmentButton, LinearLayout.LayoutParams(-2, dp(48)).apply { leftMargin = dp(6) })
+        chat.addView(toggleRow)
+        adapter = ChatAdapter(
+            context = this,
+            messages = shownMessages,
+            onExport = ::chooseExport,
+            onCopy = { message ->
+                val clipboard = getSystemService(ClipboardManager::class.java)
+                clipboard.setPrimaryClip(
+                    ClipData.newPlainText(
+                        "PocketAI",
+                        if (message.isUser) message.content else ResponseText.visible(message.content),
+                    )
+                )
+                toast("Réponse copiée")
+            },
+            onSpeak = ::toggleSpeech,
+            speakingMessageId = { speakingMessageId },
+        )
         messageList = RecyclerView(this).apply {
             layoutManager = LinearLayoutManager(this@MainActivity).apply { stackFromEnd = true }
             adapter = this@MainActivity.adapter
             setPadding(dp(4), dp(8), dp(4), dp(8))
             clipToPadding = false
             itemAnimator = null
+            addOnScrollListener(object : RecyclerView.OnScrollListener() {
+                override fun onScrollStateChanged(recyclerView: RecyclerView, newState: Int) {
+                    when (newState) {
+                        RecyclerView.SCROLL_STATE_DRAGGING -> userDraggingMessages = true
+                        RecyclerView.SCROLL_STATE_IDLE -> {
+                            if (userDraggingMessages) {
+                                streamingFollow.onUserViewport(isNearMessageBottom())
+                                userDraggingMessages = false
+                            }
+                        }
+                    }
+                }
+
+                override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
+                    if (userDraggingMessages) streamingFollow.onUserViewport(isNearMessageBottom())
+                }
+            })
         }
         chat.addView(messageList, LinearLayout.LayoutParams(-1, 0, 1f))
         val compose = row().apply { gravity = Gravity.BOTTOM; setPadding(dp(12), dp(6), dp(12), dp(8)) }
@@ -223,7 +273,7 @@ class MainActivity : AppCompatActivity() {
         sendButton = button("Envoyer") {
             if (model.state.value.busy) model.stop() else {
                 val prompt = input.text?.toString()?.trim().orEmpty()
-                if (prompt.isNotEmpty()) {
+                if (prompt.isNotEmpty() || model.state.value.attachment != null) {
                     val ready = model.state.value.modelName != null
                     model.send(prompt)
                     if (ready) input.setText("")
@@ -234,22 +284,61 @@ class MainActivity : AppCompatActivity() {
         chat.addView(compose)
     }
 
+    private fun isNearMessageBottom(): Boolean {
+        if (!::messageList.isInitialized || adapter.itemCount == 0) return true
+        val manager = messageList.layoutManager as? LinearLayoutManager ?: return !messageList.canScrollVertically(1)
+        val lastPosition = adapter.itemCount - 1
+        if (manager.findLastVisibleItemPosition() != lastPosition) return false
+        val lastView = manager.findViewByPosition(lastPosition) ?: return !messageList.canScrollVertically(1)
+        val viewportBottom = messageList.height - messageList.paddingBottom
+        return lastView.bottom <= viewportBottom + dp(96)
+    }
+
+    private fun scrollChatToBottom() {
+        if (!streamingFollow.following || adapter.itemCount == 0) return
+        messageList.post {
+            if (streamingFollow.following && adapter.itemCount > 0) {
+                messageList.scrollBy(0, Int.MAX_VALUE)
+            }
+        }
+    }
+
+    private fun attachmentAction() {
+        val attachment = model.state.value.attachment
+        if (attachment == null) {
+            attachmentPicker.launch(arrayOf("*/*"))
+            return
+        }
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Document local joint")
+            .setMessage("${attachment.displayName}\n${attachment.sourceBytes / 1024} Ko · ${attachment.mimeType}\n\nLe contenu sera envoyé uniquement au modèle local pour le prochain message.")
+            .setNegativeButton("Fermer", null)
+            .setNeutralButton("Retirer") { _, _ -> model.clearAttachment() }
+            .setPositiveButton("Remplacer") { _, _ -> attachmentPicker.launch(arrayOf("*/*")) }
+            .show()
+    }
+
     private fun renderModels() {
         modelsPanel.removeAllViews(); pad(modelsPanel)
+        val profile = HardwareProfile.detect(this)
         modelsPanel.addView(text("Le bon modèle pour ton téléphone", 22f, true))
-        modelsPanel.addView(text(HardwareProfile.detect(this).summary, 14f))
-        modelsPanel.addView(text("Commence par 0,5B pour la rapidité. Un modèle plus grand demande davantage de mémoire. Les fichiers restent sur ton téléphone.", 14f))
+        modelsPanel.addView(text(profile.summary, 14f))
+        modelsPanel.addView(text("PocketAI estime la marge mémoire avec la RAM réellement disponible. « Idéal » privilégie la fluidité ; « Exigeant » peut réduire automatiquement le contexte ou le GPU. Les fichiers restent sur ton téléphone.", 14f))
         modelsPanel.addView(button("Importer un fichier GGUF") { importPicker.launch(arrayOf("*/*")) }.apply { isEnabled = !model.state.value.busy })
         modelsPanel.addView(text("Modèles installés", 18f, true))
         val installed = model.models.installed()
-        if (installed.isEmpty()) modelsPanel.addView(text("Aucun modèle pour l’instant. Importe un GGUF ou télécharge un modèle ci-dessous.", 14f))
+        if (installed.isEmpty()) modelsPanel.addView(text("Aucun modèle pour l’instant. Importe un GGUF ou choisis un modèle vérifié ci-dessous.", 14f))
         installed.forEach { file ->
+            val advice = profile.adviseModel(file.length(), model.performanceMode)
             val contents = column()
             contents.addView(text(file.nameWithoutExtension, 16f, true))
-            contents.addView(text("${"%.2f".format(file.length() / (1024.0 * 1024 * 1024))} Go · GGUF local", 13f))
+            contents.addView(text("${advice.fit.label} · ${"%.2f".format(file.length() / (1024.0 * 1024 * 1024))} Go · contexte ~${advice.contextTokens / 1024.0}K · ${if (advice.gpuCandidate) "GPU candidat" else "CPU prévu"}", 13f))
+            contents.addView(text(advice.detail, 12f))
             val controls = row()
             val loaded = model.state.value.modelName == file.nameWithoutExtension
-            controls.addView(button(if (loaded) "Chargé" else "Charger") { model.loadModel(file); tabs.getTabAt(0)?.select() }.apply { isEnabled = !model.state.value.busy && !loaded })
+            controls.addView(button(if (loaded) "Chargé" else "Charger") { model.loadModel(file); tabs.getTabAt(0)?.select() }.apply {
+                isEnabled = !model.state.value.busy && !loaded && advice.fit != ModelFit.AVOID
+            })
             controls.addView(button("Supprimer") {
                 MaterialAlertDialogBuilder(this).setTitle("Supprimer ce modèle ?").setMessage(file.name)
                     .setNegativeButton("Annuler", null).setPositiveButton("Supprimer") { _, _ ->
@@ -260,20 +349,27 @@ class MainActivity : AppCompatActivity() {
         }
         if (model.state.value.modelName != null) modelsPanel.addView(button("Décharger et libérer la mémoire") { model.unloadModel() }.apply { isEnabled = !model.state.value.busy })
         modelsPanel.addView(text("Catalogue vérifié", 18f, true))
-        ModelRepository.catalogue.forEach { entry ->
-            val contents = column()
-            contents.addView(text(entry.title, 17f, true))
-            contents.addView(text(entry.description, 14f))
-            contents.addView(text("${"%.2f".format(entry.sizeBytes / (1024.0 * 1024 * 1024))} Go · intégrité SHA-256 vérifiée", 12f))
-            val controls = row()
-            controls.addView(button("Télécharger") {
-                MaterialAlertDialogBuilder(this).setTitle("Télécharger ${entry.title} ?")
-                    .setMessage("Le téléchargement utilise Internet et ${"%.2f".format(entry.sizeBytes / (1024.0 * 1024 * 1024))} Go de stockage. Consulte la licence du modèle avant utilisation.")
-                    .setNegativeButton("Annuler", null).setPositiveButton("Télécharger") { _, _ -> model.downloadModel(entry) }.show()
-            }.apply { isEnabled = !model.state.value.busy })
-            controls.addView(button("Licence") { openLink(entry.licenseUrl) })
-            contents.addView(controls); modelsPanel.addView(card(contents))
-        }
+        ModelRepository.catalogue
+            .map { it to profile.adviseModel(it.sizeBytes, model.performanceMode) }
+            .sortedWith(compareBy<Pair<ModelEntry, ModelAdvice>> { it.second.fit.ordinal }.thenBy { it.first.sizeBytes })
+            .forEach { (entry, advice) ->
+                val expectedName = Uri.parse(entry.url).lastPathSegment.orEmpty()
+                val alreadyInstalled = installed.any { it.name.equals(expectedName, ignoreCase = true) }
+                val contents = column()
+                contents.addView(text("${entry.title} · ${advice.fit.label}", 17f, true))
+                contents.addView(text(entry.description, 14f))
+                if (entry.useCases.isNotBlank()) contents.addView(text("Idéal pour : ${entry.useCases}", 13f))
+                contents.addView(text("${advice.detail} Contexte prévu ~${advice.contextTokens / 1024.0}K · ${if (advice.gpuCandidate) "GPU candidat" else "CPU prévu"}.", 12f))
+                contents.addView(text("${"%.2f".format(entry.sizeBytes / (1024.0 * 1024 * 1024))} Go · intégrité SHA-256 vérifiée", 12f))
+                val controls = row()
+                controls.addView(button(if (alreadyInstalled) "Déjà installé" else if (advice.fit == ModelFit.AVOID) "Mémoire insuffisante" else "Télécharger") {
+                    MaterialAlertDialogBuilder(this).setTitle("Télécharger ${entry.title} ?")
+                        .setMessage("Le téléchargement utilise Internet et ${"%.2f".format(entry.sizeBytes / (1024.0 * 1024 * 1024))} Go de stockage. Consulte la licence du modèle avant utilisation.")
+                        .setNegativeButton("Annuler", null).setPositiveButton("Télécharger") { _, _ -> model.downloadModel(entry) }.show()
+                }.apply { isEnabled = !model.state.value.busy && !alreadyInstalled && advice.fit != ModelFit.AVOID })
+                controls.addView(button("Licence") { openLink(entry.licenseUrl) })
+                contents.addView(controls); modelsPanel.addView(card(contents))
+            }
     }
 
     private fun renderCreation() {
@@ -325,7 +421,12 @@ class MainActivity : AppCompatActivity() {
                     toast("Profil appliqué au prochain chargement du modèle")
                 }.setNegativeButton("Fermer", null).show()
         })
-        settingsPanel.addView(text("PocketAI adapte le contexte à la RAM, cherche automatiquement le meilleur nombre de couches Vulkan et calibre les threads CPU sur le modèle chargé. En cas de chauffe, les threads sont réduits dynamiquement.", 14f))
+        settingsPanel.addView(text("PocketAI adapte le contexte à la RAM, cherche automatiquement le meilleur nombre de couches Vulkan et calibre les threads CPU sur le modèle chargé. Si un backend GPU échoue réellement, l’application mémorise automatiquement un plafond sûr pour ce modèle et cet appareil. Le mode Performances permet de forcer un nouveau test.", 14f))
+        settingsPanel.addView(button("Réinitialiser l’adaptation GPU") {
+            model.clearBackendLearning()
+            toast("Le prochain chargement retestera le GPU en mode automatique.")
+            renderSettings()
+        })
         settingsPanel.addView(button("Longueur maximale : ${model.maxTokens} tokens") {
             val values = intArrayOf(256, 512, 1024, 2048, 4096, 8192)
             MaterialAlertDialogBuilder(this).setTitle("Longueur des réponses")
@@ -503,6 +604,23 @@ class MainActivity : AppCompatActivity() {
         dialog.show()
     }
 
+    private fun toggleSpeech(message: ChatMessage) {
+        if (message.isUser || message.isStreaming) return
+        val controller = speech ?: LocalSpeech(
+            context = this,
+            onActiveMessageChanged = { id ->
+                runOnUiThread {
+                    speakingMessageId = id
+                    if (::adapter.isInitialized) adapter.notifyDataSetChanged()
+                }
+            },
+            onError = { error ->
+                runOnUiThread { showError(error) }
+            },
+        ).also { speech = it }
+        controller.toggle(message.id, message.content)
+    }
+
     private fun chooseExport(message: ChatMessage) {
         val files = ResponseText.extractFiles(message.content)
         val formats = ExportFormat.entries
@@ -568,6 +686,12 @@ class MainActivity : AppCompatActivity() {
         outState.putInt("tab", selectedTab)
         outState.putString("draft", input.text?.toString().orEmpty())
         pendingSave?.let { outState.putString("pendingPath", it.file.absolutePath); outState.putString("pendingMime", it.mimeType); outState.putString("pendingName", it.displayName) }
+    }
+
+    override fun onDestroy() {
+        speech?.shutdown()
+        speech = null
+        super.onDestroy()
     }
 
     private fun showError(message: String) { MaterialAlertDialogBuilder(this).setTitle("PocketAI").setMessage(message).setPositiveButton("Compris", null).show() }

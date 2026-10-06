@@ -6,6 +6,7 @@ data class InferenceOptions(
     val contextSize: Int = 2048,
     val batchSize: Int = 256,
     val gpuLayers: Int = 0,
+    val preferCpuOutput: Boolean = false,
     val temperature: Float = 0.6f,
 ) {
     init {

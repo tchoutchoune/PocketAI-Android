@@ -1,4 +1,4 @@
-name: Build PocketAI 4
+name: Build PocketAI 4.3 Integration
 
 on:
   workflow_dispatch:
@@ -23,17 +23,63 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      GRADLE_USER_HOME: ${{ github.workspace }}/.gradle-user-home
+    steps:
+      - name: Checkout PocketAI
+        uses: actions/checkout@v6
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          log-accepted-android-sdk-licenses: false
+      - name: Install JVM-test Android platform
+        shell: bash
+        run: |
+          set -e
+          set +o pipefail
+          yes | sdkmanager --licenses >/dev/null
+          set -o pipefail
+          sdkmanager 'platforms;android-36' 'build-tools;35.0.0'
+      - name: Configure Gradle cache
+        uses: gradle/actions/setup-gradle@v6.4.0
+        with:
+          cache-cleanup: on-success
+      - name: Run JVM tests
+        run: |
+          ./gradlew :app:testDebugUnitTest :lib:testDebugUnitTest             --no-daemon --max-workers=4 '-Dorg.gradle.jvmargs=-Xmx4g'
+      - name: Upload JVM test reports
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: PocketAI-4.3-jvm-test-results
+          path: |
+            app/build/reports/tests/
+            lib/build/reports/tests/
+          retention-days: 7
+
   android:
     runs-on: ubuntu-24.04
     container: debian:trixie
     timeout-minutes: 35
     env:
       DEBIAN_FRONTEND: noninteractive
+      GRADLE_USER_HOME: ${{ github.workspace }}/.gradle-user-home
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPILERCHECK: content
+      CCACHE_MAXSIZE: 2G
     steps:
       - name: Install verified build prerequisites
         run: |
           apt-get update
-          apt-get install -y ca-certificates curl git unzip python3 gcc g++ make glslc libshaderc1 libvulkan-dev spirv-headers
+          apt-get install -y ca-certificates curl git unzip python3 gcc g++ make ccache glslc libshaderc1 libvulkan-dev spirv-headers
       - name: Checkout PocketAI
         uses: actions/checkout@v6
       - name: Checkout pinned llama.cpp
@@ -44,6 +90,17 @@ jobs:
           path: llama.cpp
           fetch-depth: 1
           lfs: false
+      - name: Restore Gradle and native compiler caches
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ github.workspace }}/.gradle-user-home/caches
+            ${{ github.workspace }}/.gradle-user-home/wrapper
+            ${{ github.workspace }}/.ccache
+          key: pocketai-${{ runner.os }}-ndk29-llama-db00347-${{ hashFiles('gradle/**', '*.gradle.kts', 'gradle.properties', 'app/**/*.gradle.kts', 'lib/**/*.gradle.kts') }}-${{ github.sha }}
+          restore-keys: |
+            pocketai-${{ runner.os }}-ndk29-llama-db00347-${{ hashFiles('gradle/**', '*.gradle.kts', 'gradle.properties', 'app/**/*.gradle.kts', 'lib/**/*.gradle.kts') }}-
+            pocketai-${{ runner.os }}-ndk29-llama-db00347-
       - name: Set up JDK 17
         uses: actions/setup-java@v5
         with:
@@ -61,6 +118,10 @@ jobs:
           yes | sdkmanager --licenses >/dev/null
           set -o pipefail
           sdkmanager 'platforms;android-36' 'build-tools;35.0.0' 'build-tools;36.0.0' 'ndk;29.0.13113456' 'cmake;3.31.6'
+      - name: Reset compiler cache statistics
+        run: |
+          ccache --max-size "$CCACHE_MAXSIZE"
+          ccache --zero-stats
       - name: Build and test ARM64 CPU + Vulkan
         shell: bash
         env:
@@ -68,10 +129,13 @@ jobs:
           POCKETAI_VULKAN_DIR: /usr
           CMAKE_BUILD_PARALLEL_LEVEL: '4'
         run: bash scripts/build.sh
+      - name: Report compiler cache statistics
+        if: always()
+        run: ccache --show-stats
       - name: Upload APKs and verification evidence
         uses: actions/upload-artifact@v6
         with:
-          name: PocketAI-4.2.2-arm64-vulkan-test
+          name: PocketAI-4.3.0-integration
           path: out/*
           retention-days: 14
           if-no-files-found: error
@@ -79,7 +143,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: PocketAI-4-test-results
+          name: PocketAI-4.3-test-results
           path: |
             app/build/reports/tests/
             lib/build/reports/tests/

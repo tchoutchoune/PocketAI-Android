@@ -10,8 +10,8 @@ android {
         applicationId = "com.pocketai.app"
         minSdk = 33
         targetSdk = 36
-        versionCode = 40202
-        versionName = "4.2.2"
+        versionCode = 40300
+        versionName = "4.3.0"
         resValue("string", "app_name", "PocketAI")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk { abiFilters += "arm64-v8a" }
@@ -25,9 +25,9 @@ android {
     buildTypes {
         debug {
             isMinifyEnabled = false
-            applicationIdSuffix = ".vulkanvalidation"
-            versionNameSuffix = "-vulkan-test"
-            resValue("string", "app_name", "PocketAI Vulkan Test")
+            applicationIdSuffix = ".integration"
+            versionNameSuffix = "-integration-test"
+            resValue("string", "app_name", "PocketAI 4.3 Test")
         }
         release {
             isMinifyEnabled = true
