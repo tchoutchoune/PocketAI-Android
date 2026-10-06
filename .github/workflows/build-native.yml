@@ -1,4 +1,4 @@
-name: Build PocketAI 4
+name: Build PocketAI 4.3 Integration
 
 on:
   workflow_dispatch:
@@ -59,7 +59,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: PocketAI-4-jvm-test-results
+          name: PocketAI-4.3-jvm-test-results
           path: |
             app/build/reports/tests/
             lib/build/reports/tests/
@@ -135,7 +135,7 @@ jobs:
       - name: Upload APKs and verification evidence
         uses: actions/upload-artifact@v6
         with:
-          name: PocketAI-4.2.2-arm64-vulkan-test
+          name: PocketAI-4.3.0-integration
           path: out/*
           retention-days: 14
           if-no-files-found: error
@@ -143,7 +143,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: PocketAI-4-test-results
+          name: PocketAI-4.3-test-results
           path: |
             app/build/reports/tests/
             lib/build/reports/tests/
