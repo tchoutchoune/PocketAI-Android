@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.security.MessageDigest
 
 internal data class ChatUiState(
     val messages: List<ChatMessage> = emptyList(),
@@ -58,6 +59,74 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
         engine?.setThreadLimit(limit)
         logs.event("thermal=$status thread_limit=$limit")
+    }
+
+    private fun backendLearningKey(file: File): String {
+        val identity = listOf(
+            file.name,
+            file.length().toString(),
+            android.os.Build.FINGERPRINT,
+            BuildConfig.SOURCE_REVISION,
+        ).joinToString("|")
+        val digest = MessageDigest.getInstance("SHA-256").digest(identity.toByteArray(Charsets.UTF_8))
+            .take(12).joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        return BACKEND_LIMIT_PREFIX + digest
+    }
+
+    private fun learnedBackendProfile(file: File): LearnedBackendProfile? {
+        val key = backendLearningKey(file)
+        val layers = prefs.getInt("${key}_layers", -1)
+        if (layers < 0) return null
+        return LearnedBackendProfile(
+            gpuLayers = layers,
+            cpuOutput = layers > 0 && prefs.getBoolean("${key}_cpu_output", false),
+        )
+    }
+
+    private fun persistBackendProfile(file: File, profile: LearnedBackendProfile) {
+        val key = backendLearningKey(file)
+        prefs.edit()
+            .putInt("${key}_layers", profile.gpuLayers)
+            .putBoolean("${key}_cpu_output", profile.gpuLayers > 0 && profile.cpuOutput)
+            .apply()
+    }
+
+    private fun quarantineGpuForSemanticFailure(file: File, reason: String) {
+        val previous = learnedBackendProfile(file)
+        persistBackendProfile(file, LearnedBackendProfile(gpuLayers = 0, cpuOutput = false))
+        logs.event(
+            "backend_semantic_quarantine reason=$reason previous=$previous active_gpu_layers=${activeOptions.gpuLayers}"
+        )
+    }
+
+    private fun learnBackendCompatibility(file: File, diagnostics: String): BackendHealth? {
+        val health = BackendHealthPolicy.parse(diagnostics) ?: return null
+        val learned = health.learnedProfile ?: return health
+        val previous = learnedBackendProfile(file)
+        val safer = BackendHealthPolicy.saferProfile(previous, learned)
+        persistBackendProfile(file, safer)
+        logs.event(
+            "backend_compatibility_learned gpu_layers=${safer.gpuLayers} cpu_output=${safer.cpuOutput} " +
+                "previous=$previous probe_failures=${health.logitsProbeFailures} runtime_recoveries=${health.runtimeRecoveries}"
+        )
+        return health
+    }
+
+    fun clearBackendLearning() {
+        val editor = prefs.edit()
+        var removed = 0
+        prefs.all.keys.filter { it.startsWith(BACKEND_LIMIT_PREFIX) }.forEach {
+            editor.remove(it)
+            removed++
+        }
+        editor.apply()
+        logs.event("backend_compatibility_cleared entries=$removed")
+        update {
+            it.copy(
+                status = if (removed > 0) "Adaptation GPU oubliée · le prochain chargement retestera Vulkan"
+                else "Aucune adaptation GPU mémorisée",
+            )
+        }
     }
 
     var performanceMode: String
@@ -183,12 +252,28 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             require(file.length() <= profile.availableRamBytes * 75 / 100) {
                 "La mémoire disponible est trop faible pour ce modèle. Ferme les autres applications ou choisis un modèle plus petit."
             }
-            val requestedOptions = profile.recommend(file.length(), performanceMode)
+            val recommendedOptions = profile.recommend(file.length(), performanceMode)
+            val learnedProfile = learnedBackendProfile(file)
+            val requestedOptions = BackendHealthPolicy.applyLearnedProfile(
+                recommendedOptions,
+                learnedProfile,
+                performanceMode,
+            )
+            val learnedProfileApplied = requestedOptions.gpuLayers != recommendedOptions.gpuLayers ||
+                requestedOptions.preferCpuOutput != recommendedOptions.preferCpuOutput
+            if (learnedProfileApplied) {
+                logs.event(
+                    "backend_compatibility_applied learned=$learnedProfile " +
+                        "recommended_gpu_layers=${recommendedOptions.gpuLayers} requested_gpu_layers=${requestedOptions.gpuLayers} " +
+                        "cpu_output=${requestedOptions.preferCpuOutput}"
+                )
+            }
             activeOptions = requestedOptions
             inference.configure(requestedOptions)
             inference.loadModel(file.absolutePath)
 
             val allocationInfo = inference.diagnostics()
+            val allocationHealth = learnBackendCompatibility(file, allocationInfo)
             val activeGpuLayers = Regex("GPU layers: (\\d+)").find(allocationInfo)?.groupValues?.get(1)?.toIntOrNull() ?: 0
             val actualContext = Regex("Context: (\\d+)").find(allocationInfo)?.groupValues?.get(1)?.toIntOrNull()
                 ?: requestedOptions.contextSize
@@ -199,7 +284,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 profile.thermalStatus < PowerManager.THERMAL_STATUS_MODERATE &&
                 performanceMode != "eco"
             if (canTune) {
-                val key = threadTuneKey(file, profile, activeGpuLayers, actualContext, requestedOptions.threads)
+                val key = threadTuneKey(
+                    file,
+                    profile,
+                    activeGpuLayers,
+                    allocationHealth?.outputOnCpu ?: requestedOptions.preferCpuOutput,
+                    actualContext,
+                    requestedOptions.threads,
+                )
                 val cached = prefs.getInt(key, 0).takeIf { it in 1..requestedOptions.threads }
                 selectedThreads = if (cached != null) {
                     inference.setThreadLimit(cached)
@@ -220,15 +312,27 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
             }
-            activeOptions = requestedOptions.copy(threads = selectedThreads, gpuLayers = activeGpuLayers, contextSize = actualContext)
+            activeOptions = requestedOptions.copy(
+                threads = selectedThreads,
+                gpuLayers = activeGpuLayers,
+                preferCpuOutput = allocationHealth?.outputOnCpu ?: requestedOptions.preferCpuOutput,
+                contextSize = actualContext,
+            )
 
             inference.setSystemPrompt(SYSTEM_PROMPT)
             thermalListener.onThermalStatusChanged(runCatching { power.currentThermalStatus }.getOrDefault(0))
             val info = inference.diagnostics()
             val finalContext = Regex("Context: (\\d+)").find(info)?.groupValues?.get(1)?.toIntOrNull() ?: actualContext
             val finalGpuLayers = Regex("GPU layers: (\\d+)").find(info)?.groupValues?.get(1)?.toIntOrNull() ?: activeGpuLayers
-            activeOptions = activeOptions.copy(gpuLayers = finalGpuLayers, contextSize = finalContext)
-            val backend = if (finalGpuLayers > 0) "$finalGpuLayers couches GPU" else "CPU"
+            val health = learnBackendCompatibility(file, info)
+            activeOptions = activeOptions.copy(
+                gpuLayers = finalGpuLayers,
+                preferCpuOutput = health?.outputOnCpu ?: activeOptions.preferCpuOutput,
+                contextSize = finalContext,
+            )
+            val backend = health?.let(BackendHealthPolicy::statusLabel)
+                ?: if (finalGpuLayers > 0) "$finalGpuLayers couches GPU" else "CPU"
+            val learnedNote = if (learnedProfileApplied) " · profil GPU appris" else ""
             activeFile = file
             needsHistoryRestore = true
             logs.event("model_ready requested=$requestedOptions active=$activeOptions diagnostics=$info")
@@ -236,7 +340,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             update {
                 it.copy(
                     modelName = file.nameWithoutExtension,
-                    status = "Prêt · $selectedThreads threads · ${"%.1f".format(finalContext / 1024.0)}K contexte · $backend",
+                    status = "Prêt · $selectedThreads threads · ${"%.1f".format(finalContext / 1024.0)}K contexte · $backend$learnedNote",
                     diagnostics = info,
                 )
             }
@@ -277,7 +381,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             val tuned = inference().tuneThreads(ceiling)
             activeOptions = activeOptions.copy(threads = tuned)
             thermalListener.onThermalStatusChanged(runCatching { power.currentThermalStatus }.getOrDefault(0))
-            prefs.edit().putInt(threadTuneKey(file, profile, gpuLayers, contextSize, ceiling), tuned).apply()
+            val backendHealth = BackendHealthPolicy.parse(infoBefore)
+            prefs.edit().putInt(
+                threadTuneKey(file, profile, gpuLayers, backendHealth?.outputOnCpu ?: activeOptions.preferCpuOutput, contextSize, ceiling),
+                tuned,
+            ).apply()
             val info = inference().diagnostics()
             logs.event("thread_retuned threads=$tuned max=$ceiling gpu_layers=$gpuLayers context=$contextSize")
             update { it.copy(status = "Recalibrage terminé · $tuned threads", diagnostics = info) }
@@ -288,9 +396,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         file: File,
         profile: HardwareProfile,
         gpuLayers: Int,
+        cpuOutput: Boolean,
         contextSize: Int,
         maxThreads: Int,
-    ): String = "thread_tune_v2_sync_${file.name.hashCode()}_${file.length()}_${profile.cpuCores}_${gpuLayers}_${contextSize}_t$maxThreads"
+    ): String = "thread_tune_v3_sync_${file.name.hashCode()}_${file.length()}_${profile.cpuCores}_${gpuLayers}_out${if (cpuOutput) 1 else 0}_${contextSize}_t$maxThreads"
 
     private data class PreparedPrompt(val text: String, val tokens: Int, val capacity: Int)
 
@@ -412,6 +521,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             val response = ChatMessage(content = "", isUser = false, isStreaming = true)
             update { it.copy(messages = it.messages + user + response) }
             val buffer = StringBuilder()
+            val outputGuard = OutputHealthGuard()
             var lastPaint = 0L
             val started = android.os.SystemClock.elapsedRealtime()
             var chunks = 0
@@ -422,6 +532,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             thermalListener.onThermalStatusChanged(runCatching { power.currentThermalStatus }.getOrDefault(0))
             try {
                 inference().sendUserPrompt(prepared.text, generationBudget).collect { token ->
+                    outputGuard.observe(token)?.let { throw DegenerateOutputException(it) }
                     buffer.append(token)
                     chunks++
                     val now = android.os.SystemClock.elapsedRealtime()
@@ -430,6 +541,23 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         update { s -> s.copy(messages = s.messages.map { if (it.id == response.id) it.copy(content = buffer.toString()) else it }) }
                     }
                 }
+            } catch (error: DegenerateOutputException) {
+                if (activeOptions.gpuLayers > 0) {
+                    activeFile?.let { quarantineGpuForSemanticFailure(it, error.reasonCode) }
+                }
+                needsHistoryRestore = true
+                update { s -> s.copy(messages = s.messages.map {
+                    if (it.id == response.id) it.copy(content = buffer.toString(), isStreaming = false) else it
+                }) }
+                throw IllegalStateException(
+                    if (activeOptions.gpuLayers > 0) {
+                        "PocketAI a stoppé une sortie GPU anormale. Ce modèle passera en CPU au prochain chargement automatique. " +
+                            "Recharge le modèle, ou utilise le mode Performances pour retester volontairement le GPU."
+                    } else {
+                        "PocketAI a stoppé une sortie locale anormale. Recharge le modèle et vérifie son intégrité."
+                    },
+                    error,
+                )
             } catch (error: Exception) {
                 needsHistoryRestore = true
                 update { s -> s.copy(messages = s.messages.map {
@@ -439,6 +567,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
             needsHistoryRestore = false
             val info = inference().diagnostics()
+            val backendHealth = activeFile?.let { learnBackendCompatibility(it, info) }
             val count = Regex("Generated: (\\d+) / (\\d+)").find(info)?.groupValues
             val reachedLimit = count != null && count[1].toInt() >= count[2].toInt() && count[2].toInt() > 0
             var answer = buffer.toString()
@@ -481,7 +610,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
             val elapsed = (android.os.SystemClock.elapsedRealtime() - started) / 1000.0
             logs.event("generation_completed duration_s=$elapsed emitted_chunks=$chunks diagnostics=$info")
-            update { it.copy(status = "Réponse terminée · ${"%.1f".format(elapsed)} s", attachment = null, diagnostics = info) }
+            val backendNote = backendHealth?.takeIf { it.compatibilityEvent }?.let {
+                " · " + BackendHealthPolicy.statusLabel(it)
+            }.orEmpty()
+            update { it.copy(status = "Réponse terminée · ${"%.1f".format(elapsed)} s$backendNote", attachment = null, diagnostics = info) }
         }
     }
 
@@ -544,6 +676,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     companion object {
+        private const val BACKEND_LIMIT_PREFIX = "backend_profile_"
         private const val ESTIMATED_CHARS_PER_TOKEN = 3
         private const val MIN_INITIAL_ATTACHMENT_CHARS = 6_000
         private const val MAX_ATTACHMENT_PROMPT_CHARS = 60_000
