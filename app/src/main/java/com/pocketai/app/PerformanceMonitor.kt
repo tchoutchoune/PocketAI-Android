@@ -46,6 +46,7 @@ class PerformanceMonitor(context: Context) {
         fun gib(bytes: Long) = String.format(Locale.FRANCE, "%.2f", bytes / (1024.0 * 1024 * 1024))
         fun mib(kib: Int) = String.format(Locale.FRANCE, "%.0f", kib / 1024.0)
 
+        val backendHealth = BackendHealthPolicy.parse(engineDiagnostics)
         return buildString {
             appendLine("CPU PocketAI ≈ ${String.format(Locale.FRANCE, "%.1f", cpuOfDevice)} % de la capacité totale ($cores cœurs)")
             appendLine("RAM PocketAI (PSS) ≈ ${mib(processPssKb)} Mo")
@@ -53,8 +54,21 @@ class PerformanceMonitor(context: Context) {
             appendLine("Thermique Android : $thermal")
             appendLine("Économie d’énergie : ${if (powerManager?.isPowerSaveMode == true) "active" else "inactive"}")
             appendLine()
+            if (backendHealth != null) {
+                appendLine("État moteur : ${BackendHealthPolicy.statusLabel(backendHealth)}")
+                appendLine(
+                    "Santé backend : " + when {
+                        !backendHealth.requestedVulkan -> "CPU de référence"
+                        backendHealth.runtimeRecoveries > 0 -> "récupération automatique déclenchée"
+                        backendHealth.logitsProbeFailures > 0 -> "Vulkan adapté après échec de validation"
+                        backendHealth.activeGpuLayers > 0 -> "Vulkan actif · validation technique réussie"
+                        else -> "CPU actif"
+                    }
+                )
+                appendLine()
+            }
             appendLine("GPU : Android ne fournit pas de pourcentage d’utilisation portable et fiable.")
-            appendLine("PocketAI affiche ci-dessous le backend Vulkan/CPU et les couches réellement actives.")
+            appendLine("Les lignes natives ci-dessous indiquent le backend réellement actif, les replis et les débits.")
             appendLine()
             append(engineDiagnostics.ifBlank { "Charge un modèle pour afficher les métriques du moteur." })
         }
