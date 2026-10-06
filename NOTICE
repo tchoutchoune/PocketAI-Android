@@ -1,1 +1,0 @@
-PocketAI Android includes an Android JNI inference wrapper adapted from llama.cpp examples/llama.android, copyright the llama.cpp authors, under the MIT License. llama.cpp is fetched at the revision pinned in scripts/setup.sh and is not vendored in this repository.
