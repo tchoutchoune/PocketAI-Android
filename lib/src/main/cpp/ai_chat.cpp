@@ -26,6 +26,7 @@ struct Options {
     int context = 2048;
     int batch = 256;
     int gpu_layers = 0;
+    bool prefer_cpu_output = false;
     float temperature = 0.6f;
 } options;
 llama_model *model = nullptr;
@@ -467,11 +468,11 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_init(JNIEnv *env, jobject, jstr
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_arm_aichat_internal_InferenceEngineImpl_configureNative(JNIEnv *env, jobject, jint threads, jint ctx, jint bs, jint layers, jfloat temp) {
+Java_com_arm_aichat_internal_InferenceEngineImpl_configureNative(JNIEnv *env, jobject, jint threads, jint ctx, jint bs, jint layers, jboolean preferCpuOutput, jfloat temp) {
     if (model || threads < 1 || threads > 32 || ctx < 512 || ctx > 32768 || bs < 32 || bs > 1024 || bs > ctx || layers < 0 || layers > 256 || !std::isfinite(temp) || temp < 0 || temp > 2) {
         throw_io(env, "Invalid inference configuration or model still loaded"); return;
     }
-    options = {threads, ctx, bs, layers, temp};
+    options = {threads, ctx, bs, layers, preferCpuOutput == JNI_TRUE, temp};
     thread_limit.store(threads);
     active_threads = threads;
     fallback.clear();
@@ -513,7 +514,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstr
     }
 
     // Fast path: request the maximum selected offload. llama.cpp clamps this to the model.
-    try { if (load_selected_model_layers(options.gpu_layers)) return 0; }
+    try { if (load_selected_model_layers(options.gpu_layers, options.prefer_cpu_output)) return 0; }
     catch (...) { log_event(ANDROID_LOG_WARN, "Maximum Vulkan offload failed"); }
     if (cancelled.load()) return 3;
     if (model) { llama_model_free(model); model = nullptr; }
@@ -528,7 +529,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstr
     llama_model_free(model); model = nullptr;
 
     const int requested = std::min(options.gpu_layers, model_layers);
-    for (const auto choice : pocketai::fallback_choices(requested, false)) {
+    for (const auto choice : pocketai::fallback_choices(requested, options.prefer_cpu_output)) {
         if (cancelled.load()) return 3;
         if (choice.layers == 0) continue;
         if (reload_model_layers(choice.layers, choice.output_cpu)) {
