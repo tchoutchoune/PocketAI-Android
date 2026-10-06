@@ -25,7 +25,9 @@ class ChatAdapter(
     private val context: Context,
     private val messages: MutableList<ChatMessage>,
     private val onExport: (ChatMessage) -> Unit,
-    private val onCopy: (ChatMessage) -> Unit
+    private val onCopy: (ChatMessage) -> Unit,
+    private val onSpeak: (ChatMessage) -> Unit = {},
+    private val speakingMessageId: () -> String? = { null },
 ) : RecyclerView.Adapter<ChatAdapter.MessageHolder>() {
     private val markdown = Markwon.builder(context).usePlugin(object : AbstractMarkwonPlugin() {
         override fun configureConfiguration(builder: MarkwonConfiguration.Builder) {
@@ -87,14 +89,16 @@ class ChatAdapter(
         val copy = action("Copier")
         val export = action("Enregistrer")
         val share = action("Partager")
+        val speak = action("Lire")
         actions.addView(copy, LinearLayout.LayoutParams(0, dp(48), 1f))
         actions.addView(export, LinearLayout.LayoutParams(0, dp(48), 1f))
         actions.addView(share, LinearLayout.LayoutParams(0, dp(48), 1f))
+        actions.addView(speak, LinearLayout.LayoutParams(0, dp(48), 1f))
         content.addView(heading)
         content.addView(body)
         content.addView(progress)
         content.addView(actions)
-        return MessageHolder(root, card, heading, body, progress, actions, copy, export, share)
+        return MessageHolder(root, card, heading, body, progress, actions, copy, export, share, speak)
     }
 
     override fun onBindViewHolder(holder: MessageHolder, position: Int) {
@@ -141,8 +145,12 @@ class ChatAdapter(
         holder.progress.visibility = if (message.isStreaming) View.VISIBLE else View.GONE
         holder.actions.visibility = if (message.isStreaming || visible.isBlank()) View.GONE else View.VISIBLE
         holder.export.visibility = if (message.isUser) View.GONE else View.VISIBLE
+        holder.speak.visibility = if (message.isUser) View.GONE else View.VISIBLE
+        holder.speak.text = if (speakingMessageId() == message.id) "Stop" else "Lire"
+        holder.speak.contentDescription = if (speakingMessageId() == message.id) "Arrêter la lecture" else "Lire la réponse"
         holder.copy.setOnClickListener { onCopy(message) }
         holder.export.setOnClickListener { onExport(message) }
+        holder.speak.setOnClickListener { onSpeak(message) }
         holder.share.setOnClickListener {
             val shareIntent = Intent(Intent.ACTION_SEND).apply {
                 type = "text/plain"
@@ -189,6 +197,7 @@ class ChatAdapter(
         val actions: LinearLayout,
         val copy: MaterialButton,
         val export: MaterialButton,
-        val share: MaterialButton
+        val share: MaterialButton,
+        val speak: MaterialButton,
     ) : RecyclerView.ViewHolder(view)
 }
