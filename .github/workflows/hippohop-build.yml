@@ -24,18 +24,26 @@ jobs:
         with:
           gradle-version: '8.10.2'
 
+      - name: Rebuild and verify source archive
+        shell: bash
+        run: |
+          echo "1f1bb99aae8108a41aa78ea19de256512a0b36df48c758e4bf215bc9fd1d8005  source.b64.part01" | sha256sum -c -
+          echo "bdf35c4f5e2b16aca5e19e1772e422b620004522e1198e64520fc6585f699d5c  source.b64.part02" | sha256sum -c -
+          echo "683384cb7cc11e144f9583d9ff67c567e71217f5b0c469b355da81de51a1a6b5  source.b64.part03" | sha256sum -c -
+          echo "014f39b648ccef1255393eb8a01bd9984dbb95ea5b84e5e3415e5a75a0809c3b  source.b64.part04" | sha256sum -c -
+          echo "42c95c92d33aee8b9d1ecb954c380fd10a95cbb30b844b6f4fdc3b4e3da5f187  source.b64.part05" | sha256sum -c -
+          cat source.b64.part0* | base64 -d > HippoHop-Android-source.zip
+          echo "300473a3180671292707b97067d8a3ed6da6675bfc878c724695495be238fcfb  HippoHop-Android-source.zip" | sha256sum -c -
+          unzip -t HippoHop-Android-source.zip
+          rm -rf HippoHop
+          unzip -q HippoHop-Android-source.zip
+          test -f HippoHop/app/build.gradle.kts
+
       - name: Ensure Android SDK 35
         shell: bash
         run: |
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager "platforms;android-35" "build-tools;35.0.0"
-
-      - name: Unpack Hippo Hop
-        shell: bash
-        run: |
-          rm -rf HippoHop
-          unzip -q HippoHop-Android-source.zip
-          test -f HippoHop/app/build.gradle.kts
 
       - name: Build debug APK
         working-directory: HippoHop
@@ -47,11 +55,13 @@ jobs:
           APK="HippoHop/app/build/outputs/apk/debug/app-debug.apk"
           test -s "$APK"
           apksigner verify --verbose "$APK"
-          sha256sum "$APK"
+          sha256sum "$APK" | tee HippoHop-debug.apk.sha256
           cp "$APK" HippoHop-debug.apk
 
       - uses: actions/upload-artifact@v4
         with:
           name: HippoHop-debug-apk
-          path: HippoHop-debug.apk
+          path: |
+            HippoHop-debug.apk
+            HippoHop-debug.apk.sha256
           if-no-files-found: error
