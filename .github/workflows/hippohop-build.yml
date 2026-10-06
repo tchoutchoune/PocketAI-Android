@@ -25,13 +25,13 @@ jobs:
         with:
           gradle-version: '8.10.2'
 
-      - uses: android-actions/setup-android@v3
-
       - name: Ensure Android SDK
         shell: bash
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+          SDKMANAGER="/usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0"
 
       - name: Generate Hippo Hop project
         shell: bash
