@@ -50,6 +50,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var sendButton: MaterialButton
     private lateinit var input: TextInputEditText
     private lateinit var webToggle: SwitchMaterial
+    private lateinit var attachmentButton: MaterialButton
     private lateinit var chat: LinearLayout
     private lateinit var modelsPanel: LinearLayout
     private lateinit var creationPanel: LinearLayout
@@ -67,6 +68,9 @@ class MainActivity : AppCompatActivity() {
 
     private val importPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let(model::importModel)
+    }
+    private val attachmentPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let(model::attachDocument)
     }
     private val savePicker = registerForActivityResult(object : ActivityResultContracts.CreateDocument("*/*") {
         override fun createIntent(context: android.content.Context, input: String): Intent =
@@ -161,6 +165,9 @@ class MainActivity : AppCompatActivity() {
                     sendButton.text = if (state.busy) "Arrêter" else "Envoyer"
                     input.isEnabled = !state.busy
                     webToggle.isEnabled = !state.busy
+                    attachmentButton.isEnabled = !state.busy
+                    attachmentButton.text = state.attachment?.let { "📎 " + it.displayName.take(18) } ?: "Joindre"
+                    attachmentButton.contentDescription = state.attachment?.let { "Document joint : ${it.displayName}" } ?: "Joindre un document local"
                     val wasAtBottom = !messageList.canScrollVertically(1)
                     val oldCount = shownMessages.size
                     if (shownMessages != state.messages) {
@@ -195,7 +202,11 @@ class MainActivity : AppCompatActivity() {
                 } else model.settings.webSearchEnabled = checked
             }
         }
-        toggleRow.addView(webToggle, LinearLayout.LayoutParams(-1, -2))
+        toggleRow.addView(webToggle, LinearLayout.LayoutParams(0, -2, 1f))
+        attachmentButton = button("Joindre") { attachmentAction() }.apply {
+            contentDescription = "Joindre un document local"
+        }
+        toggleRow.addView(attachmentButton, LinearLayout.LayoutParams(-2, dp(48)).apply { leftMargin = dp(6) })
         chat.addView(toggleRow)
         adapter = ChatAdapter(this, shownMessages, ::chooseExport) { message ->
             val clipboard = getSystemService(ClipboardManager::class.java)
@@ -223,7 +234,7 @@ class MainActivity : AppCompatActivity() {
         sendButton = button("Envoyer") {
             if (model.state.value.busy) model.stop() else {
                 val prompt = input.text?.toString()?.trim().orEmpty()
-                if (prompt.isNotEmpty()) {
+                if (prompt.isNotEmpty() || model.state.value.attachment != null) {
                     val ready = model.state.value.modelName != null
                     model.send(prompt)
                     if (ready) input.setText("")
@@ -232,6 +243,21 @@ class MainActivity : AppCompatActivity() {
         }.apply { contentDescription = "Envoyer la question ou arrêter la génération" }
         compose.addView(sendButton, LinearLayout.LayoutParams(-2, dp(58)).apply { leftMargin = dp(8) })
         chat.addView(compose)
+    }
+
+    private fun attachmentAction() {
+        val attachment = model.state.value.attachment
+        if (attachment == null) {
+            attachmentPicker.launch(arrayOf("*/*"))
+            return
+        }
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Document local joint")
+            .setMessage("${attachment.displayName}\n${attachment.sourceBytes / 1024} Ko · ${attachment.mimeType}\n\nLe contenu sera envoyé uniquement au modèle local pour le prochain message.")
+            .setNegativeButton("Fermer", null)
+            .setNeutralButton("Retirer") { _, _ -> model.clearAttachment() }
+            .setPositiveButton("Remplacer") { _, _ -> attachmentPicker.launch(arrayOf("*/*")) }
+            .show()
     }
 
     private fun renderModels() {
