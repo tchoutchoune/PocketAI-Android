@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - build/hippohop-apk
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
