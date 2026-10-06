@@ -53,8 +53,8 @@ test_libs = verify_native_apk(test_apk, 'ENGINE-TEST-NATIVE-LIBS.txt')
 )
 
 badging=(out/'PACKAGE.txt').read_text()
-assert "name='com.pocketai.app.vulkanvalidation'" in badging
-assert "versionCode='40202'" in badging
+assert "name='com.pocketai.app.integration'" in badging
+assert "versionCode='40300'" in badging
 
 test_badging=(out/'ENGINE-TEST-PACKAGE.txt').read_text()
 assert "name='com.arm.aichat.test'" in test_badging, test_badging
@@ -67,17 +67,17 @@ assert 'com.arm.aichat.test' in test_manifest, test_manifest
 print(f'Validated UI ({app_libs} libs) and instrumentation ({test_libs} libs) APKs, including runner metadata, Vulkan and 16 KB alignment')
 PY
 
-cp "$TASK_APK" "$TASK_REPO/out/PocketAI-4.2.2-arm64-vulkan-test.apk"
-cp "$TASK_TEST_APK" "$TASK_REPO/out/PocketAI-4.2.2-engine-androidTest.apk"
+cp "$TASK_APK" "$TASK_REPO/out/PocketAI-4.3.0-integration.apk"
+cp "$TASK_TEST_APK" "$TASK_REPO/out/PocketAI-4.3.0-engine-androidTest.apk"
 cp "$TASK_REPO/scripts/device-smoke.sh" "$TASK_REPO/out/DEVICE-SMOKE.sh"
 cp "$TASK_REPO/docs/ADRENO-840-VALIDATION.md" "$TASK_REPO/out/ADRENO-840-VALIDATION.md"
 
 cd "$TASK_REPO/out"
-sha256sum PocketAI-4.2.2-arm64-vulkan-test.apk PocketAI-4.2.2-engine-androidTest.apk > SHA256.txt
+sha256sum PocketAI-4.3.0-integration.apk PocketAI-4.3.0-engine-androidTest.apk > SHA256.txt
 if [[ ! "${POCKETAI_SOURCE_REVISION:-}" =~ ^[0-9a-f]{40}$ ]]; then
     echo "POCKETAI_SOURCE_REVISION is missing or invalid during artifact verification" >&2
     exit 1
 fi
 printf '%s\n' "$POCKETAI_SOURCE_REVISION" > SOURCE-COMMIT.txt
 printf '%s\n' "Revision embedded in APK: $POCKETAI_SOURCE_REVISION" > BUILD-IDENTITY.txt
-printf '%s\n'     'Manual UI APK: PocketAI-4.2.2-arm64-vulkan-test.apk'     'Engine instrumentation APK: PocketAI-4.2.2-engine-androidTest.apk'     'Real-device helper: bash DEVICE-SMOKE.sh --local-model /path/to/Qwen2.5-3B-Instruct-Q4_K_M.gguf'     'Add --require-vulkan to reject a reliability pass obtained only through CPU fallback.'     > DEVICE-TEST.txt
+printf '%s\n'     'Manual UI APK: PocketAI-4.3.0-integration.apk'     'Engine instrumentation APK: PocketAI-4.3.0-engine-androidTest.apk'     'Real-device helper: bash DEVICE-SMOKE.sh --local-model /path/to/Qwen2.5-3B-Instruct-Q4_K_M.gguf'     'Add --require-vulkan to reject a reliability pass obtained only through CPU fallback.'     > DEVICE-TEST.txt
